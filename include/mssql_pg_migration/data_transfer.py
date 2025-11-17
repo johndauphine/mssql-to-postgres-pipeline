@@ -303,6 +303,14 @@ class DataTransfer:
                 # Replace inf/-inf with None
                 processed_df[column] = processed_df[column].replace([np.inf, -np.inf], None)
 
+                # Convert float columns that are actually integers (pandas promotes int to float when NaN present)
+                if pd.api.types.is_float_dtype(dtype):
+                    # Check if all non-null values are whole numbers
+                    non_null_vals = processed_df[column].dropna()
+                    if len(non_null_vals) > 0 and (non_null_vals == non_null_vals.astype(int)).all():
+                        # Convert to nullable integer type to avoid "3.0" becoming "3.0" in CSV
+                        processed_df[column] = processed_df[column].astype('Int64')
+
         return processed_df
 
     def _write_chunk(
@@ -324,29 +332,39 @@ class DataTransfer:
         Returns:
             Number of rows written
         """
+        import csv
         # Use COPY for efficient bulk insert
         with self.postgres_hook.get_conn() as conn:
             with conn.cursor() as cursor:
-                # Create a CSV buffer
+                # Create a CSV buffer with proper quoting for multiline text
                 buffer = StringIO()
-                df.to_csv(
+                # Replace NaN/None with empty string - we'll use the CSV standard where empty = NULL
+                # Note: Int64 columns (nullable integers) need special handling
+                df_copy = df.copy()
+                for col in df_copy.columns:
+                    if pd.api.types.is_extension_array_dtype(df_copy[col].dtype):
+                        # For nullable integer types (Int64), convert to object first then fill NA
+                        df_copy[col] = df_copy[col].astype(object).fillna('')
+                    else:
+                        df_copy[col] = df_copy[col].fillna('')
+                df_copy.to_csv(
                     buffer,
                     index=False,
                     header=False,
                     sep='\t',
-                    na_rep='\\N',
-                    escapechar='\\',
-                    quoting=3  # QUOTE_NONE
+                    quoting=csv.QUOTE_MINIMAL,  # Quote fields with special chars (newlines, tabs, quotes)
+                    doublequote=True,  # Escape quotes by doubling them
                 )
                 buffer.seek(0)
 
                 # Use unquoted column names (PostgreSQL lowercases them for case insensitivity)
                 column_list = ', '.join(columns)
 
-                # Use COPY FROM for bulk insert (use unquoted names for case insensitivity)
+                # Use COPY FROM for bulk insert with CSV format that handles quoted fields
+                # Use FORCE_NULL to convert empty strings to NULL for all columns
                 cursor.copy_expert(
                     f"COPY {schema_name}.{table_name} ({column_list}) "
-                    f"FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', NULL '\\N', ESCAPE E'\\\\')",
+                    f"FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', FORCE_NULL ({column_list}))",
                     buffer
                 )
 
