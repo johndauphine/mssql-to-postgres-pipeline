@@ -177,8 +177,8 @@ class DataTransfer:
             query = f"SELECT COUNT(*) FROM [{schema_name}].[{table_name}]"
             count = self.mssql_hook.get_first(query)[0]
         else:
-            # PostgreSQL
-            query = f'SELECT COUNT(*) FROM {schema_name}."{table_name}"'
+            # PostgreSQL - use unquoted names (PostgreSQL lowercases them)
+            query = f'SELECT COUNT(*) FROM {schema_name}.{table_name}'
             count = self.postgres_hook.get_first(query)[0]
 
         return count or 0
@@ -191,7 +191,7 @@ class DataTransfer:
             schema_name: Schema name
             table_name: Table name
         """
-        query = f'TRUNCATE TABLE {schema_name}."{table_name}" CASCADE'
+        query = f'TRUNCATE TABLE {schema_name}.{table_name} CASCADE'
         self.postgres_hook.run(query)
 
     def _get_table_columns(self, schema_name: str, table_name: str) -> List[str]:
@@ -333,20 +333,20 @@ class DataTransfer:
                     buffer,
                     index=False,
                     header=False,
-                    sep='\\t',
-                    na_rep='\\\\N',
-                    escapechar='\\\\',
+                    sep='\t',
+                    na_rep='\\N',
+                    escapechar='\\',
                     quoting=3  # QUOTE_NONE
                 )
                 buffer.seek(0)
 
-                # Quote column names for PostgreSQL
-                quoted_columns = ', '.join([f'"{col}"' for col in columns])
+                # Use unquoted column names (PostgreSQL lowercases them for case insensitivity)
+                column_list = ', '.join(columns)
 
-                # Use COPY FROM for bulk insert
+                # Use COPY FROM for bulk insert (use unquoted names for case insensitivity)
                 cursor.copy_expert(
-                    f"COPY {schema_name}.\"{table_name}\" ({quoted_columns}) "
-                    f"FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\\\t', NULL '\\\\N', ESCAPE E'\\\\\\\\')",
+                    f"COPY {schema_name}.{table_name} ({column_list}) "
+                    f"FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', NULL '\\N', ESCAPE E'\\\\')",
                     buffer
                 )
 

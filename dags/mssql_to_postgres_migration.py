@@ -35,12 +35,13 @@ logger = logging.getLogger(__name__)
     schedule=None,  # Run manually or trigger via API
     catchup=False,
     max_active_runs=1,
+    is_paused_upon_creation=False,
     doc_md=__doc__,
     default_args={
         "owner": "data-team",
         "retries": 3,
-        "retry_delay": timedelta(minutes=5),
-        "retry_exponential_backoff": True,
+        "retry_delay": timedelta(seconds=30),
+        "retry_exponential_backoff": False,
         "max_retry_delay": timedelta(minutes=30),
     },
     params={

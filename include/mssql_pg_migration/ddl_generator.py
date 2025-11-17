@@ -60,15 +60,20 @@ class DDLGenerator:
         # Add primary key constraint if exists and include_constraints is True
         if include_constraints and mapped_schema.get('primary_key'):
             pk = mapped_schema['primary_key']
-            pk_columns = ', '.join([self._quote_identifier(col) for col in pk])
+            # Handle both dict format (from schema extractor) and list format
+            if isinstance(pk, dict):
+                pk_column_list = pk.get('columns', [])
+            else:
+                pk_column_list = pk
+            pk_columns = ', '.join([self._quote_identifier(col) for col in pk_column_list])
             pk_constraint = f"CONSTRAINT {self._quote_identifier(f'pk_{table_name}')} PRIMARY KEY ({pk_columns})"
             column_definitions.append(pk_constraint)
 
         # Join all definitions
-        ddl_parts.append(',\\n    '.join(column_definitions))
+        ddl_parts.append(',\n    '.join(column_definitions))
         ddl_parts.append(')')
 
-        return '\\n'.join(ddl_parts)
+        return '\n'.join(ddl_parts)
 
     def generate_drop_table(self, table_name: str, schema_name: str = 'public', cascade: bool = True) -> str:
         """
@@ -265,10 +270,10 @@ class DDLGenerator:
                         cursor.execute(ddl)
                 conn.commit()
         else:
-            # Execute each statement separately
+            # Execute each statement separately with autocommit
             for ddl in ddl_statements:
                 logger.info(f"Executing DDL: {ddl[:100]}...")
-                self.postgres_hook.run(ddl)
+                self.postgres_hook.run(ddl, autocommit=True)
 
     def _generate_column_definition(self, column: Dict[str, Any]) -> str:
         """

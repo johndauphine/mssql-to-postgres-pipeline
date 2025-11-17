@@ -158,21 +158,27 @@ class SchemaExtractor:
         query = """
         SELECT
             i.name AS constraint_name,
-            STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns
+            STUFF((
+                SELECT ', ' + c2.name
+                FROM sys.index_columns ic2
+                INNER JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+                WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id
+                ORDER BY ic2.key_ordinal
+                FOR XML PATH('')
+            ), 1, 2, '') AS columns
         FROM sys.indexes i
-        INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-        INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
         WHERE i.is_primary_key = 1
           AND i.object_id = %s
-        GROUP BY i.name
         """
 
         result = self.mssql_hook.get_first(query, parameters=[table_object_id])
 
         if result:
+            # Handle bytes from FOR XML PATH
+            columns_str = result[1].decode('utf-8') if isinstance(result[1], bytes) else result[1]
             return {
                 'constraint_name': result[0],
-                'columns': [col.strip() for col in result[1].split(',')]
+                'columns': [col.strip() for col in columns_str.split(',')]
             }
         return None
 
@@ -191,34 +197,41 @@ class SchemaExtractor:
             i.name AS index_name,
             i.is_unique,
             i.type_desc,
-            STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns,
-            STRING_AGG(
-                CASE ic.is_descending_key
-                    WHEN 1 THEN c.name + ' DESC'
-                    ELSE c.name + ' ASC'
-                END,
-                ', '
-            ) WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns_with_order
+            STUFF((
+                SELECT ', ' + c2.name
+                FROM sys.index_columns ic2
+                INNER JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+                WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id AND ic2.is_included_column = 0
+                ORDER BY ic2.key_ordinal
+                FOR XML PATH('')
+            ), 1, 2, '') AS columns,
+            STUFF((
+                SELECT ', ' + c2.name + CASE ic2.is_descending_key WHEN 1 THEN ' DESC' ELSE ' ASC' END
+                FROM sys.index_columns ic2
+                INNER JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+                WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id AND ic2.is_included_column = 0
+                ORDER BY ic2.key_ordinal
+                FOR XML PATH('')
+            ), 1, 2, '') AS columns_with_order
         FROM sys.indexes i
-        INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-        INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
         WHERE i.object_id = %s
           AND i.is_primary_key = 0  -- Exclude primary key
           AND i.type > 0  -- Exclude heap
-          AND ic.is_included_column = 0  -- Only key columns
-        GROUP BY i.name, i.is_unique, i.type_desc
         """
 
         indexes = self.mssql_hook.get_records(query, parameters=[table_object_id])
 
         result = []
         for idx in indexes:
+            # Handle bytes from FOR XML PATH
+            columns_str = idx[3].decode('utf-8') if isinstance(idx[3], bytes) else idx[3]
+            columns_order_str = idx[4].decode('utf-8') if isinstance(idx[4], bytes) else idx[4]
             index_dict = {
                 'index_name': idx[0],
                 'is_unique': bool(idx[1]),
                 'type_desc': idx[2],
-                'columns': [col.strip() for col in idx[3].split(',')],
-                'columns_with_order': idx[4],
+                'columns': [col.strip() for col in columns_str.split(',')] if columns_str else [],
+                'columns_with_order': columns_order_str if columns_order_str else '',
             }
             result.append(index_dict)
 
@@ -237,32 +250,45 @@ class SchemaExtractor:
         query = """
         SELECT
             fk.name AS constraint_name,
-            STRING_AGG(c1.name, ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id) AS columns,
+            STUFF((
+                SELECT ', ' + c1.name
+                FROM sys.foreign_key_columns fkc2
+                INNER JOIN sys.columns c1 ON fkc2.parent_object_id = c1.object_id AND fkc2.parent_column_id = c1.column_id
+                WHERE fkc2.constraint_object_id = fk.object_id
+                ORDER BY fkc2.constraint_column_id
+                FOR XML PATH('')
+            ), 1, 2, '') AS columns,
             OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS referenced_schema,
             OBJECT_NAME(fk.referenced_object_id) AS referenced_table,
-            STRING_AGG(c2.name, ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id) AS referenced_columns,
+            STUFF((
+                SELECT ', ' + c2.name
+                FROM sys.foreign_key_columns fkc2
+                INNER JOIN sys.columns c2 ON fkc2.referenced_object_id = c2.object_id AND fkc2.referenced_column_id = c2.column_id
+                WHERE fkc2.constraint_object_id = fk.object_id
+                ORDER BY fkc2.constraint_column_id
+                FOR XML PATH('')
+            ), 1, 2, '') AS referenced_columns,
             fk.delete_referential_action_desc AS on_delete,
             fk.update_referential_action_desc AS on_update
         FROM sys.foreign_keys fk
-        INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-        INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id AND fkc.parent_column_id = c1.column_id
-        INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id AND fkc.referenced_column_id = c2.column_id
         WHERE fk.parent_object_id = %s
-        GROUP BY fk.name, fk.referenced_object_id, fk.delete_referential_action_desc, fk.update_referential_action_desc
         """
 
         foreign_keys = self.mssql_hook.get_records(query, parameters=[table_object_id])
 
         result = []
         for fk in foreign_keys:
+            # Handle bytes from FOR XML PATH
+            columns_str = fk[1].decode('utf-8') if isinstance(fk[1], bytes) else fk[1]
+            ref_columns_str = fk[4].decode('utf-8') if isinstance(fk[4], bytes) else fk[4]
             fk_dict = {
                 'constraint_name': fk[0],
-                'columns': [col.strip() for col in fk[1].split(',')],
+                'columns': [col.strip() for col in columns_str.split(',')] if columns_str else [],
                 'referenced_schema': fk[2],
                 'referenced_table': fk[3],
-                'referenced_columns': [col.strip() for col in fk[4].split(',')],
-                'on_delete': fk[5].replace('_', ' '),  # Convert NO_ACTION to NO ACTION
-                'on_update': fk[6].replace('_', ' '),
+                'referenced_columns': [col.strip() for col in ref_columns_str.split(',')] if ref_columns_str else [],
+                'on_delete': fk[5].replace('_', ' ') if fk[5] else 'NO ACTION',  # Convert NO_ACTION to NO ACTION
+                'on_update': fk[6].replace('_', ' ') if fk[6] else 'NO ACTION',
             }
             result.append(fk_dict)
 
@@ -370,7 +396,48 @@ class SchemaExtractor:
             result.append(table_schema)
 
         logger.info(f"Extracted schema for {len(result)} tables")
-        return result
+        # Clean any remaining bytes from the result
+        return self._clean_bytes_recursive(result)
+
+    def _clean_bytes_recursive(self, obj):
+        """Recursively convert any bytes objects to strings and sanitize for PostgreSQL JSON storage."""
+        import re
+        import struct
+        if isinstance(obj, bytes):
+            # Try to interpret as little-endian integer first (common for SQL Server identity columns)
+            if len(obj) == 4:
+                try:
+                    # Convert 4-byte little-endian integer
+                    return str(struct.unpack('<i', obj)[0])
+                except Exception:
+                    pass
+            elif len(obj) == 8:
+                try:
+                    # Convert 8-byte little-endian integer
+                    return str(struct.unpack('<q', obj)[0])
+                except Exception:
+                    pass
+            # Try UTF-8 decoding for regular strings
+            try:
+                decoded = obj.decode('utf-8')
+                # Clean any control characters that made it through
+                cleaned = ''.join(c if ord(c) >= 32 or c in '\n\r\t' else '' for c in decoded)
+                return cleaned
+            except Exception:
+                # Fall back to hex representation for binary data
+                return obj.hex()
+        elif isinstance(obj, str):
+            # Replace any control characters (including null bytes)
+            cleaned = ''.join(c if ord(c) >= 32 or c in '\n\r\t' else '' for c in obj)
+            return cleaned
+        elif isinstance(obj, dict):
+            return {k: self._clean_bytes_recursive(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._clean_bytes_recursive(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._clean_bytes_recursive(item) for item in obj)
+        else:
+            return obj
 
     def _matches_pattern(self, name: str, pattern: str) -> bool:
         """
