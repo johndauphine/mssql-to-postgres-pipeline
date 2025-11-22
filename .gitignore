@@ -9,3 +9,6 @@ airflow-webserver.pid
 webserver_config.py
 airflow.cfg
 airflow.db
+
+# Test data (large files)
+stackoverflow_db/
