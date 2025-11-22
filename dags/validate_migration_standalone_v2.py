@@ -38,17 +38,17 @@ logger = logging.getLogger(__name__)
         "retries": 0,  # No retries for debugging
     },
     params={
-        # Direct connection parameters instead of conn_ids
-        "mssql_host": Param(default="mssql-server", type="string"),
-        "mssql_port": Param(default=1433, type="integer"),
-        "mssql_database": Param(default="StackOverflow2010", type="string"),
-        "mssql_username": Param(default="sa", type="string"),
-        "mssql_password": Param(default="YourStrong@Passw0rd", type="string"),
-        "postgres_host": Param(default="postgres-target", type="string"),
-        "postgres_port": Param(default=5432, type="integer"),
-        "postgres_database": Param(default="stackoverflow", type="string"),
-        "postgres_username": Param(default="postgres", type="string"),
-        "postgres_password": Param(default="PostgresPassword123", type="string"),
+        # Connection IDs (will get details from Airflow connections)
+        "source_conn_id": Param(
+            default="mssql_source",
+            type="string",
+            description="SQL Server connection ID"
+        ),
+        "target_conn_id": Param(
+            default="postgres_target",
+            type="string",
+            description="PostgreSQL connection ID"
+        ),
         "source_schema": Param(default="dbo", type="string"),
         "target_schema": Param(default="public", type="string"),
         "exclude_tables": Param(
@@ -74,20 +74,31 @@ def validate_migration_standalone_v2():
         """
         params = context["params"]
 
+        # ===== GET CONNECTION DETAILS FROM AIRFLOW =====
+        from airflow.hooks.base import BaseHook
+
+        # Get connection details from Airflow
+        try:
+            mssql_conn_obj = BaseHook.get_connection(params["source_conn_id"])
+            postgres_conn_obj = BaseHook.get_connection(params["target_conn_id"])
+        except Exception as e:
+            logger.error(f"Failed to get Airflow connections: {e}")
+            return f"Failed to get Airflow connections: {e}"
+
         # ===== CONNECT TO DATABASES DIRECTLY =====
-        logger.info("Connecting to databases using direct connections...")
+        logger.info("Connecting to databases using Airflow connection details...")
 
         try:
             # Connect to SQL Server
             mssql_conn = pymssql.connect(
-                server=params["mssql_host"],
-                port=params["mssql_port"],
-                user=params["mssql_username"],
-                password=params["mssql_password"],
-                database=params["mssql_database"]
+                server=mssql_conn_obj.host,
+                port=mssql_conn_obj.port or 1433,
+                user=mssql_conn_obj.login,
+                password=mssql_conn_obj.password,
+                database=mssql_conn_obj.schema
             )
             mssql_cursor = mssql_conn.cursor()
-            logger.info(f"✓ Connected to SQL Server: {params['mssql_host']}:{params['mssql_port']}/{params['mssql_database']}")
+            logger.info(f"✓ Connected to SQL Server: {mssql_conn_obj.host}:{mssql_conn_obj.port}/{mssql_conn_obj.schema}")
 
         except Exception as e:
             logger.error(f"Failed to connect to SQL Server: {e}")
@@ -96,14 +107,14 @@ def validate_migration_standalone_v2():
         try:
             # Connect to PostgreSQL using pg8000
             postgres_conn = pg8000.connect(
-                host=params["postgres_host"],
-                port=params["postgres_port"],
-                user=params["postgres_username"],
-                password=params["postgres_password"],
-                database=params["postgres_database"]
+                host=postgres_conn_obj.host,
+                port=postgres_conn_obj.port or 5432,
+                user=postgres_conn_obj.login,
+                password=postgres_conn_obj.password,
+                database=postgres_conn_obj.schema
             )
             postgres_cursor = postgres_conn.cursor()
-            logger.info(f"✓ Connected to PostgreSQL: {params['postgres_host']}:{params['postgres_port']}/{params['postgres_database']}")
+            logger.info(f"✓ Connected to PostgreSQL: {postgres_conn_obj.host}:{postgres_conn_obj.port}/{postgres_conn_obj.schema}")
 
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
@@ -209,8 +220,8 @@ def validate_migration_standalone_v2():
             "          MIGRATION VALIDATION REPORT (V2)",
             "=" * 80,
             f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            f"Source: {params['mssql_host']}.{source_schema}",
-            f"Target: {params['postgres_host']}.{target_schema}",
+            f"Source: {params['source_conn_id']}.{source_schema}",
+            f"Target: {params['target_conn_id']}.{target_schema}",
             "-" * 80,
             f"Tables Validated: {len(source_counts)}",
             f"Passed: {passed}",
