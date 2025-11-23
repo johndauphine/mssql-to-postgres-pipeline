@@ -114,7 +114,8 @@ class DataTransfer:
         target_table: str,
         chunk_size: int = 10000,
         truncate_target: bool = True,
-        columns: Optional[List[str]] = None
+        columns: Optional[List[str]] = None,
+        where_clause: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Transfer data from SQL Server table to PostgreSQL table.
@@ -127,6 +128,7 @@ class DataTransfer:
             chunk_size: Number of rows to transfer per batch
             truncate_target: Whether to truncate target table before transfer
             columns: Specific columns to transfer (None for all columns)
+            where_clause: Optional WHERE clause for filtering source data
 
         Returns:
             Transfer result dictionary with statistics
@@ -135,8 +137,8 @@ class DataTransfer:
         logger.info(f"Starting transfer: {source_schema}.{source_table} -> {target_schema}.{target_table}")
 
         # Get source row count
-        source_row_count = self._get_row_count(source_schema, source_table, is_source=True)
-        logger.info(f"Source table has {source_row_count:,} rows")
+        source_row_count = self._get_row_count(source_schema, source_table, is_source=True, where_clause=where_clause)
+        logger.info(f"Source table has {source_row_count:,} rows{' (filtered)' if where_clause else ''}")
 
         # Truncate target if requested
         if truncate_target:
@@ -181,6 +183,7 @@ class DataTransfer:
                         last_key_value,
                         chunk_size,
                         pk_index,
+                        where_clause,
                     )
 
                     if not rows:
@@ -247,7 +250,7 @@ class DataTransfer:
 
         return result
 
-    def _get_row_count(self, schema_name: str, table_name: str, is_source: bool = True) -> int:
+    def _get_row_count(self, schema_name: str, table_name: str, is_source: bool = True, where_clause: Optional[str] = None) -> int:
         """
         Get row count from a table.
 
@@ -255,6 +258,7 @@ class DataTransfer:
             schema_name: Schema name
             table_name: Table name
             is_source: Whether this is the source (SQL Server) or target (PostgreSQL)
+            where_clause: Optional WHERE clause for filtering (only for source)
 
         Returns:
             Row count
@@ -262,6 +266,8 @@ class DataTransfer:
         if is_source:
             # SQL Server
             query = f"SELECT COUNT(*) FROM [{schema_name}].[{table_name}]"
+            if where_clause:
+                query += f" WHERE {where_clause}"
             count = self.mssql_hook.get_first(query)[0]
         else:
             # PostgreSQL - use unquoted names (PostgreSQL lowercases them)
@@ -373,6 +379,7 @@ class DataTransfer:
         last_key_value: Optional[Any],
         limit: int,
         pk_index: int,
+        where_clause: Optional[str] = None,
     ) -> Tuple[List[Tuple[Any, ...]], Optional[Any]]:
         """Read rows using keyset pagination with deterministic ordering."""
 
@@ -383,14 +390,20 @@ class DataTransfer:
         """
         order_by = f"ORDER BY [{pk_column}]"
 
-        if last_key_value is None:
+        # Build WHERE clause combining filter and pagination
+        where_conditions = []
+        if where_clause:
+            where_conditions.append(f"({where_clause})")
+        if last_key_value is not None:
+            where_conditions.append(f"[{pk_column}] > %s")
+
+        if where_conditions:
+            where_part = "WHERE " + " AND ".join(where_conditions)
+            query = f"{base_query}\n{where_part}\n{order_by}"
+            params = (last_key_value,) if last_key_value is not None else None
+        else:
             query = f"{base_query}\n{order_by}"
             params = None
-        else:
-            query = (
-                f"{base_query}\nWHERE [{pk_column}] > %s\n{order_by}"
-            )
-            params = (last_key_value,)
 
         try:
             with conn.cursor() as cursor:
@@ -476,7 +489,8 @@ def transfer_table_data(
     postgres_conn_id: str,
     table_info: Dict[str, Any],
     chunk_size: int = 10000,
-    truncate: bool = True
+    truncate: bool = True,
+    where_clause: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Convenience function to transfer a single table.
@@ -487,6 +501,7 @@ def transfer_table_data(
         table_info: Table information dictionary with schema and table names
         chunk_size: Rows per chunk
         truncate: Whether to truncate target before transfer
+        where_clause: Optional WHERE clause for filtering source data
 
     Returns:
         Transfer result dictionary
@@ -505,7 +520,8 @@ def transfer_table_data(
         target_table=target_table,
         chunk_size=chunk_size,
         truncate_target=truncate,
-        columns=table_info.get('columns')
+        columns=table_info.get('columns'),
+        where_clause=where_clause
     )
 
 

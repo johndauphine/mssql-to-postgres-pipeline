@@ -67,10 +67,10 @@ logger = logging.getLogger(__name__)
             description="Target schema in PostgreSQL"
         ),
         "chunk_size": Param(
-            default=10000,
+            default=100000,
             type="integer",
             minimum=100,
-            maximum=100000,
+            maximum=500000,
             description="Number of rows to transfer per batch"
         ),
         "exclude_tables": Param(
@@ -220,6 +220,68 @@ def mssql_to_postgres_migration():
         return created_tables
 
     @task
+    def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+        """
+        Filter out regular tables (non-Votes tables).
+        """
+        regular_tables = []
+
+        for table_info in created_tables:
+            if not (table_info['table_name'].lower() == 'votes' and table_info.get('row_count', 0) > 5_000_000):
+                regular_tables.append(table_info)
+
+        logger.info(f"Prepared {len(regular_tables)} regular tables for transfer")
+        return regular_tables
+
+    @task
+    def prepare_votes_partitions(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+        """
+        Create partitions for Votes table if it's large enough.
+        """
+        votes_partitions = []
+
+        for table_info in created_tables:
+            if table_info['table_name'].lower() == 'votes' and table_info.get('row_count', 0) > 5_000_000:
+                # Split Votes table into 4 partitions based on VoteTypeId distribution
+                logger.info(f"Splitting Votes table ({table_info['row_count']:,} rows) into 4 partitions")
+
+                partitions = [
+                    {
+                        **table_info,
+                        'partition_name': 'partition_1',
+                        'where_clause': 'VoteTypeId IN (1,2)',
+                        'estimated_rows': table_info['row_count'] // 4,
+                        'truncate_first': True  # First partition truncates the table
+                    },
+                    {
+                        **table_info,
+                        'partition_name': 'partition_2',
+                        'where_clause': 'VoteTypeId IN (3,4,5)',
+                        'estimated_rows': table_info['row_count'] // 4,
+                        'truncate_first': False
+                    },
+                    {
+                        **table_info,
+                        'partition_name': 'partition_3',
+                        'where_clause': 'VoteTypeId IN (6,7,8,9,10)',
+                        'estimated_rows': table_info['row_count'] // 4,
+                        'truncate_first': False
+                    },
+                    {
+                        **table_info,
+                        'partition_name': 'partition_4',
+                        'where_clause': 'VoteTypeId > 10 OR VoteTypeId IS NULL',
+                        'estimated_rows': table_info['row_count'] // 4,
+                        'truncate_first': False
+                    }
+                ]
+                votes_partitions.extend(partitions)
+                break  # Only one Votes table
+
+        logger.info(f"Created {len(votes_partitions)} Votes partitions")
+        return votes_partitions
+
+    @task
     def transfer_table_data(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
         """
         Transfer data for a single table from SQL Server to PostgreSQL.
@@ -261,6 +323,95 @@ def mssql_to_postgres_migration():
             )
 
         return result
+
+    @task
+    def transfer_votes_partition(partition_info: Dict[str, Any], **context) -> Dict[str, Any]:
+        """
+        Transfer a partition of the Votes table in parallel.
+
+        Args:
+            partition_info: Partition information including WHERE clause
+
+        Returns:
+            Transfer result dictionary with statistics
+        """
+        params = context["params"]
+
+        logger.info(
+            f"Starting Votes partition transfer: {partition_info['partition_name']} "
+            f"(estimated {partition_info.get('estimated_rows', 0):,} rows)"
+        )
+
+        # Transfer with WHERE clause for partitioning
+        result = data_transfer.transfer_table_data(
+            mssql_conn_id=params["source_conn_id"],
+            postgres_conn_id=params["target_conn_id"],
+            table_info=partition_info,
+            chunk_size=params["chunk_size"],
+            truncate=partition_info.get('truncate_first', False),  # Only first partition truncates
+            where_clause=partition_info.get('where_clause')
+        )
+
+        # Add partition info to result
+        result["table_name"] = "Votes"
+        result["partition_name"] = partition_info['partition_name']
+
+        if result["success"]:
+            logger.info(
+                f"✓ Votes {partition_info['partition_name']}: Transferred {result['rows_transferred']:,} rows "
+                f"in {result['elapsed_time_seconds']:.2f}s "
+                f"({result['avg_rows_per_second']:,.0f} rows/sec)"
+            )
+        else:
+            logger.error(
+                f"✗ Votes {partition_info['partition_name']}: Transfer failed. "
+                f"Errors: {result.get('errors', [])}"
+            )
+
+        return result
+
+    @task
+    def combine_transfer_results(
+        regular_results: List[Dict[str, Any]],
+        votes_results: List[Dict[str, Any]],
+        **context
+    ) -> List[Dict[str, Any]]:
+        """
+        Combine results from regular tables and Votes partitions.
+
+        Aggregates Votes partition results into a single result.
+        """
+        all_results = regular_results.copy() if regular_results else []
+
+        if votes_results:
+            # Aggregate Votes partition results
+            total_rows = sum(r.get('rows_transferred', 0) for r in votes_results)
+            total_time = sum(r.get('elapsed_time_seconds', 0) for r in votes_results)
+            all_success = all(r.get('success', False) for r in votes_results)
+            all_errors = []
+
+            for r in votes_results:
+                if r.get('errors'):
+                    all_errors.extend(r['errors'])
+
+            votes_combined = {
+                'table_name': 'Votes',
+                'rows_transferred': total_rows,
+                'elapsed_time_seconds': max(r.get('elapsed_time_seconds', 0) for r in votes_results),  # Use max since they run in parallel
+                'avg_rows_per_second': total_rows / max(r.get('elapsed_time_seconds', 1) for r in votes_results),
+                'success': all_success,
+                'errors': all_errors,
+                'partitions_processed': len(votes_results)
+            }
+
+            logger.info(
+                f"Votes table complete: {total_rows:,} rows transferred across "
+                f"{len(votes_results)} partitions in {votes_combined['elapsed_time_seconds']:.2f}s"
+            )
+
+            all_results.append(votes_combined)
+
+        return all_results
 
     @task
     def create_foreign_keys(
@@ -538,9 +689,20 @@ def mssql_to_postgres_migration():
     schema_status = create_target_schema(schema_name="{{ params.target_schema }}")
     created_tables = create_target_tables(schema_data, schema_status)
 
-    # Use dynamic task mapping for parallel table transfers
-    # Each table is transferred independently in parallel
-    transfer_results = transfer_table_data.expand(table_info=created_tables)
+    # Prepare transfer tasks, splitting Votes table if needed
+    regular_tables = prepare_regular_tables(created_tables)
+    votes_partitions = prepare_votes_partitions(created_tables)
+
+    # Transfer regular tables and Votes partitions in parallel
+    regular_transfer_results = transfer_table_data.expand(
+        table_info=regular_tables
+    )
+    votes_transfer_results = transfer_votes_partition.expand(
+        partition_info=votes_partitions
+    )
+
+    # Combine results from regular tables and Votes partitions
+    transfer_results = combine_transfer_results(regular_transfer_results, votes_transfer_results)
 
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)
