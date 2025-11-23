@@ -92,8 +92,8 @@ class DataTransfer:
             if conn and getattr(conn, "autocommit", False) is False:
                 try:
                     conn.rollback()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Exception occurred during PostgreSQL connection rollback")
             self._release_postgres_connection(conn)
 
     @contextlib.contextmanager
