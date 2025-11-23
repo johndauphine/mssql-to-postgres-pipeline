@@ -8,22 +8,29 @@ Uses direct pymssql connections for keyset pagination to avoid issues with
 Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Iterable
 from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from datetime import datetime
-import pandas as pd
-import numpy as np
-from io import StringIO
+from datetime import datetime, date, time as dt_time
+from decimal import Decimal
+from io import StringIO, TextIOBase
+import contextlib
 import logging
+import threading
 import time
+import csv
+import math
 import pymssql
+from psycopg2 import pool as pg_pool
 
 logger = logging.getLogger(__name__)
 
 
 class DataTransfer:
     """Handle data transfer from SQL Server to PostgreSQL."""
+
+    _postgres_pool: Optional[pg_pool.ThreadedConnectionPool] = None
+    _pool_lock = threading.Lock()
 
     def __init__(self, mssql_conn_id: str, postgres_conn_id: str):
         """
@@ -35,6 +42,7 @@ class DataTransfer:
         """
         self.mssql_hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
         self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+        self._postgres_conn_id = postgres_conn_id
 
         # Get direct MSSQL connection parameters for keyset pagination
         # This avoids issues with Airflow hook's get_pandas_df on large datasets
@@ -46,6 +54,55 @@ class DataTransfer:
             'user': mssql_conn.login,
             'password': mssql_conn.password,
         }
+
+        # Initialize shared PostgreSQL connection pool once
+        if DataTransfer._postgres_pool is None:
+            with DataTransfer._pool_lock:
+                if DataTransfer._postgres_pool is None:
+                    pg_conn = self.postgres_hook.get_connection(postgres_conn_id)
+                    DataTransfer._postgres_pool = pg_pool.ThreadedConnectionPool(
+                        minconn=1,
+                        maxconn=8,
+                        host=pg_conn.host,
+                        port=pg_conn.port or 5432,
+                        database=pg_conn.schema or pg_conn.login,
+                        user=pg_conn.login,
+                        password=pg_conn.password,
+                    )
+
+    def _acquire_postgres_connection(self):
+        if DataTransfer._postgres_pool:
+            return DataTransfer._postgres_pool.getconn()
+        return self.postgres_hook.get_conn()
+
+    def _release_postgres_connection(self, conn) -> None:
+        if conn is None:
+            return
+        if DataTransfer._postgres_pool:
+            DataTransfer._postgres_pool.putconn(conn)
+        else:
+            conn.close()
+
+    @contextlib.contextmanager
+    def _postgres_connection(self):
+        conn = self._acquire_postgres_connection()
+        try:
+            yield conn
+        finally:
+            if conn and getattr(conn, "autocommit", False) is False:
+                try:
+                    conn.rollback()
+                except Exception as e:
+                    logger.exception("Exception occurred during PostgreSQL connection rollback")
+            self._release_postgres_connection(conn)
+
+    @contextlib.contextmanager
+    def _mssql_connection(self):
+        conn = pymssql.connect(**self._mssql_config)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def transfer_table(
         self,
@@ -89,59 +146,65 @@ class DataTransfer:
             columns = self._get_table_columns(source_schema, source_table)
             logger.info(f"Transferring {len(columns)} columns")
 
-        # Transfer data in chunks using keyset pagination
+        # Right-size chunk size for given table
+        optimal_chunk_size = self._calculate_optimal_chunk_size(source_row_count, chunk_size)
+        if optimal_chunk_size != chunk_size:
+            logger.info(
+                "Adjusted chunk size from %s to %s rows based on table volume",
+                chunk_size,
+                optimal_chunk_size,
+            )
+            chunk_size = optimal_chunk_size
+
         rows_transferred = 0
         chunks_processed = 0
         errors = []
 
-        # Get primary key column for keyset pagination (prefer 'Id' if available)
         pk_column = self._get_primary_key_column(source_schema, source_table, columns)
         logger.info(f"Using '{pk_column}' for keyset pagination")
+        pk_index = columns.index(pk_column) if pk_column in columns else 0
 
         try:
-            # Use keyset pagination for efficient large table transfers
-            last_key_value = None
-            while rows_transferred < source_row_count:
-                chunk_start = time.time()
+            with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
+                last_key_value = None
+                while rows_transferred < source_row_count:
+                    chunk_start = time.time()
 
-                # Read chunk from SQL Server using keyset pagination
-                chunk_df = self._read_chunk_keyset(
-                    source_schema,
-                    source_table,
-                    columns,
-                    pk_column,
-                    last_key_value,
-                    chunk_size
-                )
+                    rows, last_key_value = self._read_chunk_keyset(
+                        mssql_conn,
+                        source_schema,
+                        source_table,
+                        columns,
+                        pk_column,
+                        last_key_value,
+                        chunk_size,
+                        pk_index,
+                    )
 
-                if chunk_df.empty:
-                    break  # No more data
+                    if not rows:
+                        break
 
-                # Track the last key value for next iteration
-                last_key_value = chunk_df[pk_column].max()
+                    rows_written = self._write_chunk(
+                        rows,
+                        target_schema,
+                        target_table,
+                        columns,
+                        postgres_conn
+                    )
 
-                # Process data types for PostgreSQL compatibility
-                chunk_df = self._process_dataframe(chunk_df)
+                    rows_transferred += rows_written
+                    chunks_processed += 1
 
-                # Write chunk to PostgreSQL
-                rows_written = self._write_chunk(
-                    chunk_df,
-                    target_schema,
-                    target_table,
-                    columns
-                )
+                    chunk_time = time.time() - chunk_start
+                    rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
 
-                rows_transferred += rows_written
-                chunks_processed += 1
+                    logger.info(
+                        f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
+                        f"({rows_transferred:,}/{source_row_count:,} total) "
+                        f"at {rows_per_second:,.0f} rows/sec"
+                    )
 
-                chunk_time = time.time() - chunk_start
-                rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
-
-                logger.info(
-                    f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
-                    f"({rows_transferred:,}/{source_row_count:,} total) "
-                    f"at {rows_per_second:,.0f} rows/sec"
-                )
+                    postgres_conn.commit()
 
         except Exception as e:
             error_msg = f"Error transferring data: {str(e)}"
@@ -282,227 +345,128 @@ class DataTransfer:
         # Fallback to first column
         return columns[0] if columns else 'Id'
 
+    def _calculate_optimal_chunk_size(self, row_count: int, requested_chunk: int) -> int:
+        """Determine an appropriate chunk size based on table volume."""
+        if row_count <= 0:
+            return requested_chunk
+
+        if row_count < 100_000:
+            target = min(requested_chunk, 10_000)
+        elif row_count < 1_000_000:
+            target = max(requested_chunk, 20_000)
+        elif row_count < 5_000_000:
+            target = max(requested_chunk, 50_000)
+        else:
+            target = max(requested_chunk, 100_000)
+
+        return min(max(target, 5_000), 200_000)
+
     def _read_chunk_keyset(
         self,
+        conn,
         schema_name: str,
         table_name: str,
         columns: List[str],
         pk_column: str,
         last_key_value: Optional[Any],
-        limit: int
-    ) -> pd.DataFrame:
-        """
-        Read a chunk of data using keyset pagination (more efficient for large tables).
+        limit: int,
+        pk_index: int,
+    ) -> Tuple[List[Tuple[Any, ...]], Optional[Any]]:
+        """Read rows using keyset pagination with deterministic ordering."""
 
-        Uses direct pymssql connection instead of Airflow hook to avoid issues with
-        get_pandas_df on large datasets.
-
-        Args:
-            schema_name: Schema name
-            table_name: Table name
-            columns: List of columns to read
-            pk_column: Primary key column for pagination
-            last_key_value: Last key value from previous chunk (None for first chunk)
-            limit: Maximum rows to read
-
-        Returns:
-            DataFrame with the chunk data
-        """
-        # Quote column names for SQL Server
         quoted_columns = ', '.join([f'[{col}]' for col in columns])
+        base_query = f"""
+        SELECT TOP {limit} {quoted_columns}
+        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        """
+        order_by = f"ORDER BY [{pk_column}]"
 
         if last_key_value is None:
-            # First chunk - no WHERE clause needed
-            query = f"""
-            SELECT TOP {limit} {quoted_columns}
-            FROM [{schema_name}].[{table_name}]
-            ORDER BY [{pk_column}]
-            """
+            query = f"{base_query}\n{order_by}"
+            params = None
         else:
-            # Subsequent chunks - use keyset pagination
-            query = f"""
-            SELECT TOP {limit} {quoted_columns}
-            FROM [{schema_name}].[{table_name}]
-            WHERE [{pk_column}] > {last_key_value}
-            ORDER BY [{pk_column}]
-            """
+            query = (
+                f"{base_query}\nWHERE [{pk_column}] > %s\n{order_by}"
+            )
+            params = (last_key_value,)
 
         try:
-            # Use direct pymssql connection for reliable large dataset transfers
-            conn = pymssql.connect(**self._mssql_config)
             cursor = conn.cursor()
-            cursor.execute(query)
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
             rows = cursor.fetchall()
-            conn.close()
 
             if not rows:
-                return pd.DataFrame(columns=columns)
+                return [], last_key_value
 
-            # Convert to DataFrame with original column names
-            df = pd.DataFrame(rows, columns=columns)
-            return df
+            next_key = rows[-1][pk_index]
+            return rows, next_key
         except Exception as e:
             logger.error(f"Error reading chunk after key {last_key_value}: {str(e)}")
             raise
 
-    def _read_chunk(
+    def _write_chunk(
         self,
+        rows: List[Tuple[Any, ...]],
         schema_name: str,
         table_name: str,
         columns: List[str],
-        offset: int,
-        limit: int
-    ) -> pd.DataFrame:
-        """
-        Read a chunk of data from SQL Server.
-
-        Args:
-            schema_name: Schema name
-            table_name: Table name
-            columns: List of columns to read
-            offset: Row offset
-            limit: Maximum rows to read
-
-        Returns:
-            DataFrame with the chunk data
-        """
-        # Quote column names for SQL Server
-        quoted_columns = ', '.join([f'[{col}]' for col in columns])
-
-        # Use deterministic ordering to ensure consistent results
-        # Try to order by primary key or first column for stable pagination
-        order_column = columns[0] if columns else '1'
-
-        query = f"""
-        SELECT {quoted_columns}
-        FROM [{schema_name}].[{table_name}]
-        ORDER BY [{order_column}]
-        OFFSET {offset} ROWS
-        FETCH NEXT {limit} ROWS ONLY
-        """
-
-        try:
-            df = self.mssql_hook.get_pandas_df(query)
-            return df
-        except Exception as e:
-            logger.error(f"Error reading chunk at offset {offset}: {str(e)}")
-            raise
-
-    def _process_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Process DataFrame for PostgreSQL compatibility.
-
-        Args:
-            df: Input DataFrame
-
-        Returns:
-            Processed DataFrame
-        """
-        # Create a copy to avoid modifying the original
-        processed_df = df.copy()
-
-        for column in processed_df.columns:
-            dtype = processed_df[column].dtype
-
-            # Handle datetime columns
-            if pd.api.types.is_datetime64_any_dtype(dtype):
-                # Replace NaT with None for PostgreSQL NULL
-                processed_df[column] = processed_df[column].where(pd.notnull(processed_df[column]), None)
-
-            # Handle boolean columns
-            elif dtype == 'bool':
-                # Ensure proper boolean values
-                processed_df[column] = processed_df[column].astype(bool)
-
-            # Handle object columns (strings, etc.)
-            elif dtype == 'object':
-                # Replace NaN with None for PostgreSQL NULL
-                processed_df[column] = processed_df[column].where(pd.notnull(processed_df[column]), None)
-
-                # Handle potential encoding issues
-                if processed_df[column].dtype == 'object':
-                    try:
-                        # Attempt to clean string data
-                        mask = processed_df[column].notna()
-                        processed_df.loc[mask, column] = processed_df.loc[mask, column].apply(
-                            lambda x: x.encode('utf-8', 'ignore').decode('utf-8') if isinstance(x, str) else x
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not process column {column}: {str(e)}")
-
-            # Handle numeric columns with infinity values
-            elif pd.api.types.is_numeric_dtype(dtype):
-                # Replace inf/-inf with None
-                processed_df[column] = processed_df[column].replace([np.inf, -np.inf], None)
-
-                # Convert float columns that are actually integers (pandas promotes int to float when NaN present)
-                if pd.api.types.is_float_dtype(dtype):
-                    # Check if all non-null values are whole numbers
-                    non_null_vals = processed_df[column].dropna()
-                    if len(non_null_vals) > 0 and (non_null_vals == non_null_vals.astype(int)).all():
-                        # Convert to nullable integer type to avoid "3.0" becoming "3.0" in CSV
-                        processed_df[column] = processed_df[column].astype('Int64')
-
-        return processed_df
-
-    def _write_chunk(
-        self,
-        df: pd.DataFrame,
-        schema_name: str,
-        table_name: str,
-        columns: List[str]
+        postgres_conn
     ) -> int:
         """
-        Write a chunk of data to PostgreSQL using COPY.
+        Stream rows to PostgreSQL using COPY.
 
         Args:
-            df: DataFrame to write
+            rows: Sequence of rows to write
             schema_name: Target schema name
             table_name: Target table name
             columns: List of column names
+            postgres_conn: Active PostgreSQL connection
 
         Returns:
             Number of rows written
         """
-        import csv
-        # Use COPY for efficient bulk insert
-        with self.postgres_hook.get_conn() as conn:
-            with conn.cursor() as cursor:
-                # Create a CSV buffer with proper quoting for multiline text
-                buffer = StringIO()
-                # Replace NaN/None with empty string - we'll use the CSV standard where empty = NULL
-                # Note: Int64 columns (nullable integers) need special handling
-                df_copy = df.copy()
-                for col in df_copy.columns:
-                    if pd.api.types.is_extension_array_dtype(df_copy[col].dtype):
-                        # For nullable integer types (Int64), convert to object first then fill NA
-                        df_copy[col] = df_copy[col].astype(object).fillna('')
-                    else:
-                        df_copy[col] = df_copy[col].fillna('')
-                df_copy.to_csv(
-                    buffer,
-                    index=False,
-                    header=False,
-                    sep='\t',
-                    quoting=csv.QUOTE_MINIMAL,  # Quote fields with special chars (newlines, tabs, quotes)
-                    doublequote=True,  # Escape quotes by doubling them
-                )
-                buffer.seek(0)
+        if not rows:
+            return 0
 
-                # Use unquoted column names (PostgreSQL lowercases them for case insensitivity)
-                column_list = ', '.join(columns)
+        column_list = ', '.join(columns)
+        copy_sql = (
+            f"COPY {schema_name}.{table_name} ({column_list}) "
+            "FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '')"
+        )
 
-                # Use COPY FROM for bulk insert with CSV format that handles quoted fields
-                # Use FORCE_NULL to convert empty strings to NULL for all columns
-                cursor.copy_expert(
-                    f"COPY {schema_name}.{table_name} ({column_list}) "
-                    f"FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', FORCE_NULL ({column_list}))",
-                    buffer
-                )
+        stream = _CSVRowStream(rows, self._normalize_value)
+        with postgres_conn.cursor() as cursor:
+            cursor.copy_expert(copy_sql, stream)
 
-            conn.commit()
+        return len(rows)
 
-        return len(df)
+    def _normalize_value(self, value: Any) -> Any:
+        """Normalize Python values for COPY consumption."""
+        if value is None:
+            return ''
+
+        if isinstance(value, datetime):
+            return value.isoformat(sep=' ')
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, dt_time):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, bool):
+            return 't' if value else 'f'
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                return bytes(value).decode('utf-8', 'ignore')
+            except Exception:
+                return ''
+        if isinstance(value, float) and not math.isfinite(value):
+            return ''
+
+        return value
 
 
 def transfer_table_data(
@@ -575,3 +539,45 @@ def parallel_transfer_tables(
         results.append(result)
 
     return results
+
+
+class _CSVRowStream(TextIOBase):
+    """Lazy text stream that feeds COPY FROM without large buffers."""
+
+    def __init__(self, rows: Iterable[Tuple[Any, ...]], normalizer):
+        self._iterator = iter(rows)
+        self._normalizer = normalizer
+        self._buffer = ''
+        self._exhausted = False
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> str:
+        while (size < 0 or len(self._buffer) < size) and not self._exhausted:
+            try:
+                row = next(self._iterator)
+            except StopIteration:
+                self._exhausted = True
+                break
+            self._buffer += self._format_row(row)
+
+        if size < 0:
+            data = self._buffer
+            self._buffer = ''
+            return data
+
+        data = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return data
+
+    def _format_row(self, row: Tuple[Any, ...]) -> str:
+        buffer = StringIO()
+        writer = csv.writer(
+            buffer,
+            delimiter='\t',
+            quoting=csv.QUOTE_MINIMAL,
+            lineterminator='\n',
+        )
+        writer.writerow([self._normalizer(value) for value in row])
+        return buffer.getvalue()

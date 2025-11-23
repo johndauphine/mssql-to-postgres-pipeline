@@ -1,5 +1,48 @@
 # Migration Performance Report
 
+## Run: 2025-11-23T17:18:15Z
+
+**Run ID:** `manual__2025-11-23T17:18:15.048851+00:00`
+**Final Status:** Success (validation DAG triggered and passed)
+**Total Duration:** 00:02:33.58 (153.58s)
+
+### Migration Timeline (UTC)
+
+| Phase | Start | End | Duration |
+|-------|-------|-----|----------|
+| DAG Start | 17:18:15.233 | 17:20:48.816 | 00:02:33.58 |
+| extract_source_schema | 17:18:15.290 | 17:18:17.522 | 00:00:02.23 |
+| create_target_schema | 17:18:15.290 | 17:18:16.159 | 00:00:00.87 |
+| create_target_tables | 17:18:18.375 | 17:18:18.624 | 00:00:00.25 |
+| transfer_table_data (parallel) | 17:18:19.156 | 17:20:14.652 | 00:01:55.50 |
+| create_foreign_keys | 17:20:15.658 | 17:20:15.812 | 00:00:00.15 |
+| trigger_validation_dag | 17:20:16.741 | 17:20:46.847 | 00:00:30.11 |
+| generate_migration_summary | 17:20:47.756 | 17:20:47.863 | 00:00:00.11 |
+| validate_migration_env DAG | 17:20:17.786 | 17:20:19.389 | 00:00:01.60 |
+
+### Table Transfer Performance (Run 2025-11-23)
+
+| Table (map idx) | Start | End | Duration | Rows | Rows/sec |
+|-----------------|-------|-----|----------|------|----------|
+| Users (0) | 17:18:19.156 | 17:18:27.195 | 00:00:08.04 | 299,398 | 37,242 |
+| Posts (1) | 17:18:19.156 | 17:19:07.117 | 00:00:47.96 | 3,729,195 | 77,755 |
+| LinkTypes (2) | 17:18:19.189 | 17:18:19.626 | 00:00:00.44 | 2 | 5 |
+| PostLinks (3) | 17:18:19.189 | 17:18:20.790 | 00:00:01.60 | 161,519 | 100,873 |
+| Votes (4) | 17:18:19.221 | 17:20:14.652 | 00:01:55.43 | 10,143,364 | 87,874 |
+| PostTypes (5) | 17:18:19.637 | 17:18:19.789 | 00:00:00.15 | 8 | 53 |
+| Badges (6) | 17:18:19.799 | 17:18:29.995 | 00:00:10.20 | 1,102,019 | 108,086 |
+| Comments (7) | 17:18:20.310 | 17:19:19.985 | 00:00:59.68 | 3,875,183 | 64,938 |
+| VoteTypes (8) | 17:18:20.805 | 17:18:21.661 | 00:00:00.86 | 15 | 18 |
+
+**Total Rows Migrated:** ~19.3M (≈125,700 rows/sec overall)
+
+Key observations:
+- Streaming COPY kept memory flat while allowing adaptive chunks (no retries observed).
+- Map idx 4 (Votes) remains the dominant critical path at ~115s; all other tables completed in <60s.
+- Validation DAG (`validate_migration_env`) succeeded in 1.6s immediately after the transfer phase, confirming row-count parity.
+
+---
+
 **Run Date:** 2025-11-22
 **Run ID:** `manual__2025-11-22T22:33:42.629105+00:00`
 **Final Status:** Failed (validation task - data transfer successful)

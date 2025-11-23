@@ -29,7 +29,8 @@ class DDLGenerator:
         self,
         table_schema: Dict[str, Any],
         target_schema: str = 'public',
-        include_constraints: bool = True
+        include_constraints: bool = True,
+        unlogged: bool = False
     ) -> str:
         """
         Generate CREATE TABLE statement for PostgreSQL.
@@ -38,6 +39,7 @@ class DDLGenerator:
             table_schema: Table schema information from SQL Server
             target_schema: Target PostgreSQL schema name
             include_constraints: Whether to include constraints in the DDL
+            unlogged: Whether to create table as UNLOGGED (faster bulk loads, no WAL)
 
         Returns:
             CREATE TABLE DDL statement
@@ -49,7 +51,8 @@ class DDLGenerator:
         table_name = mapped_schema['table_name']
         qualified_name = f"{target_schema}.{self._quote_identifier(table_name)}"
 
-        ddl_parts = [f"CREATE TABLE {qualified_name} ("]
+        unlogged_clause = "UNLOGGED " if unlogged else ""
+        ddl_parts = [f"CREATE {unlogged_clause}TABLE {qualified_name} ("]
         column_definitions = []
 
         # Add column definitions
@@ -202,13 +205,65 @@ class DDLGenerator:
 
         return check_statements
 
+    def generate_set_logged(self, table_name: str, schema_name: str = 'public') -> str:
+        """
+        Generate ALTER TABLE SET LOGGED statement.
+
+        Use this after bulk loading data into UNLOGGED tables to convert them
+        back to regular logged tables for durability.
+
+        Args:
+            table_name: Table name to convert
+            schema_name: Schema name
+
+        Returns:
+            ALTER TABLE SET LOGGED DDL statement
+        """
+        qualified_name = f"{schema_name}.{self._quote_identifier(table_name)}"
+        return f"ALTER TABLE {qualified_name} SET LOGGED"
+
+    def generate_primary_key(self, table_schema: Dict[str, Any], target_schema: str = 'public') -> Optional[str]:
+        """
+        Generate ALTER TABLE ADD PRIMARY KEY statement.
+
+        Use this after bulk loading data to add the primary key constraint.
+        Building PK index after data load is faster than maintaining it during inserts.
+
+        Args:
+            table_schema: Table schema information
+            target_schema: Target PostgreSQL schema name
+
+        Returns:
+            ALTER TABLE ADD PRIMARY KEY DDL statement, or None if no PK defined
+        """
+        mapped_schema = map_table_schema(table_schema)
+        table_name = mapped_schema['table_name']
+        qualified_name = f"{target_schema}.{self._quote_identifier(table_name)}"
+
+        pk = mapped_schema.get('primary_key')
+        if not pk:
+            return None
+
+        # Handle both dict format (from schema extractor) and list format
+        if isinstance(pk, dict):
+            pk_column_list = pk.get('columns', [])
+        else:
+            pk_column_list = pk
+
+        if not pk_column_list:
+            return None
+
+        pk_columns = ', '.join([self._quote_identifier(col) for col in pk_column_list])
+        return f"ALTER TABLE {qualified_name} ADD CONSTRAINT {self._quote_identifier(f'pk_{table_name}')} PRIMARY KEY ({pk_columns})"
+
     def generate_complete_ddl(
         self,
         table_schema: Dict[str, Any],
         target_schema: str = 'public',
         drop_if_exists: bool = True,
         create_indexes: bool = True,
-        create_foreign_keys: bool = False  # Usually done after all tables are created
+        create_foreign_keys: bool = False,  # Usually done after all tables are created
+        unlogged: bool = False  # Create as UNLOGGED for faster bulk loads
     ) -> List[str]:
         """
         Generate complete DDL for a table including all objects.
@@ -219,6 +274,7 @@ class DDLGenerator:
             drop_if_exists: Whether to include DROP TABLE statement
             create_indexes: Whether to include CREATE INDEX statements
             create_foreign_keys: Whether to include foreign key constraints
+            unlogged: Whether to create table as UNLOGGED (faster bulk loads)
 
         Returns:
             List of DDL statements in execution order
@@ -233,11 +289,12 @@ class DDLGenerator:
                 cascade=True
             ))
 
-        # Create table
+        # Create table (optionally as UNLOGGED for faster bulk loads)
         ddl_statements.append(self.generate_create_table(
             table_schema,
             target_schema,
-            include_constraints=True  # Include primary key
+            include_constraints=True,  # Include primary key
+            unlogged=unlogged
         ))
 
         # Create indexes
