@@ -14,6 +14,7 @@ The DAG is designed to be generic and reusable for any SQL Server database migra
 
 from airflow.sdk import Asset, dag, task
 from airflow.models.param import Param
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any
@@ -233,7 +234,7 @@ def mssql_to_postgres_migration():
             postgres_conn_id=params["target_conn_id"],
             table_info=table_info,
             chunk_size=params["chunk_size"],
-            truncate=False  # Tables were already dropped and recreated
+            truncate=True  # Ensure tables are truncated before transfer
         )
 
         # Add table name to result for tracking
@@ -302,6 +303,8 @@ def mssql_to_postgres_migration():
         logger.info(f"Created {fk_count} foreign key constraints")
         return f"Created {fk_count} foreign keys"
 
+    """
+    # Commented out - replaced with TriggerDagRunOperator to avoid XCom bug
     @task(
         outlets=[Asset("migration_validated")]
     )
@@ -310,7 +313,7 @@ def mssql_to_postgres_migration():
         transfer_results: List[Dict[str, Any]],
         **context
     ) -> Dict[str, Any]:
-        """
+        '''
         Validate the migration by comparing row counts and optionally sample data.
 
         Args:
@@ -319,7 +322,7 @@ def mssql_to_postgres_migration():
 
         Returns:
             Validation results with report
-        """
+        '''
         params = context["params"]
 
         logger.info("Starting migration validation")
@@ -354,10 +357,13 @@ def mssql_to_postgres_migration():
             )
 
         return validation_results
+    """
 
+    """
+    # Commented out - replaced with simplified version
     @task
     def generate_final_report(validation_results: Dict[str, Any], **context) -> str:
-        """
+        '''
         Generate and output the final migration report.
 
         Args:
@@ -365,7 +371,7 @@ def mssql_to_postgres_migration():
 
         Returns:
             Final status message
-        """
+        '''
         report = validation_results.get("report", "No report generated")
 
         # Save report to a file if needed
@@ -385,6 +391,7 @@ def mssql_to_postgres_migration():
         context["ti"].xcom_push(key="final_status", value=status)
 
         return status
+    """
 
     # Define the task flow
     schema_data = extract_source_schema()
@@ -398,11 +405,31 @@ def mssql_to_postgres_migration():
     # Create foreign keys after all data is transferred
     fk_status = create_foreign_keys(schema_data, transfer_results)
 
-    # Validate the migration
-    validation_results = validate_migration(created_tables, transfer_results)
+    # Trigger validation DAG instead of internal validation (avoids XCom bug)
+    trigger_validation = TriggerDagRunOperator(
+        task_id="trigger_validation_dag",
+        trigger_dag_id="validate_migration_env",
+        wait_for_completion=True,
+        poke_interval=30,
+        conf={
+            "source_schema": "{{ params.source_schema }}",
+            "target_schema": "{{ params.target_schema }}",
+        },
+    )
 
-    # Generate final report
-    final_status = generate_final_report(validation_results)
+    # Set task dependencies: trigger validation after foreign keys are created
+    fk_status >> trigger_validation
+
+    # Generate final report (simplified version without validation results)
+    @task
+    def generate_migration_summary(**context):
+        """Generate a summary of the migration."""
+        logger.info("Migration completed successfully!")
+        logger.info("Validation DAG has been triggered to verify data integrity.")
+        return "Migration complete. Check validation DAG for results."
+
+    final_status = generate_migration_summary()
+    trigger_validation >> final_status
 
     # Define task dependencies
     # The task flow is already defined through function calls above
