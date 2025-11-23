@@ -57,14 +57,14 @@ Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parall
 The pipeline uses a streaming architecture optimized for large datasets:
 
 - **Keyset Pagination**: Uses primary key ordering instead of OFFSET/FETCH for efficient chunking of large tables
-- **Direct Database Connections**: Uses pymssql and pg8000 directly to avoid Airflow hook limitations with large datasets
+- **Direct Database Connections**: Uses pymssql and psycopg2 directly to avoid Airflow hook limitations with large datasets
 - **PostgreSQL COPY Protocol**: Bulk loads data for maximum throughput
 - **Server-Side Cursors**: Streams rows without loading entire result sets into memory
 
 ### Validation DAG
 
 A standalone `validate_migration_env` DAG handles validation separately to avoid XCom serialization issues with large result sets. This DAG:
-- Uses direct database connections (pg8000, pymssql)
+- Uses direct database connections (psycopg2, pymssql)
 - Compares row counts between source and target for all tables
 - Can be triggered independently for ad-hoc validation
 
