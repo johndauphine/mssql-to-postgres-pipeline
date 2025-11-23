@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class DataTransfer:
     """Handle data transfer from SQL Server to PostgreSQL."""
 
-    _postgres_pool: Optional[pg_pool.ThreadedConnectionPool] = None
+    _postgres_pools: Dict[str, pg_pool.ThreadedConnectionPool] = {}
     _pool_lock = threading.Lock()
 
     def __init__(self, mssql_conn_id: str, postgres_conn_id: str):
@@ -55,12 +55,12 @@ class DataTransfer:
             'password': mssql_conn.password,
         }
 
-        # Initialize shared PostgreSQL connection pool once
-        if DataTransfer._postgres_pool is None:
+        # Initialize shared PostgreSQL connection pool for this connection ID
+        if postgres_conn_id not in DataTransfer._postgres_pools:
             with DataTransfer._pool_lock:
-                if DataTransfer._postgres_pool is None:
+                if postgres_conn_id not in DataTransfer._postgres_pools:
                     pg_conn = self.postgres_hook.get_connection(postgres_conn_id)
-                    DataTransfer._postgres_pool = pg_pool.ThreadedConnectionPool(
+                    DataTransfer._postgres_pools[postgres_conn_id] = pg_pool.ThreadedConnectionPool(
                         minconn=1,
                         maxconn=8,
                         host=pg_conn.host,
@@ -71,15 +71,17 @@ class DataTransfer:
                     )
 
     def _acquire_postgres_connection(self):
-        if DataTransfer._postgres_pool:
-            return DataTransfer._postgres_pool.getconn()
+        pool = DataTransfer._postgres_pools.get(self._postgres_conn_id)
+        if pool:
+            return pool.getconn()
         return self.postgres_hook.get_conn()
 
     def _release_postgres_connection(self, conn) -> None:
         if conn is None:
             return
-        if DataTransfer._postgres_pool:
-            DataTransfer._postgres_pool.putconn(conn)
+        pool = DataTransfer._postgres_pools.get(self._postgres_conn_id)
+        if pool:
+            pool.putconn(conn)
         else:
             conn.close()
 
