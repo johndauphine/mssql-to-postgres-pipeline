@@ -391,18 +391,18 @@ class DataTransfer:
             params = (last_key_value,)
 
         try:
-            cursor = conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            rows = cursor.fetchall()
+            with conn.cursor() as cursor:
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                rows = cursor.fetchall()
 
-            if not rows:
-                return [], last_key_value
+                if not rows:
+                    return [], last_key_value
 
-            next_key = rows[-1][pk_index]
-            return rows, next_key
+                next_key = rows[-1][pk_index]
+                return rows, next_key
         except Exception as e:
             logger.error(f"Error reading chunk after key {last_key_value}: {str(e)}")
             raise
