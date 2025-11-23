@@ -457,7 +457,7 @@ class DataTransfer:
         if isinstance(value, Decimal):
             return format(value, 'f')
         if isinstance(value, bool):
-            return 'true' if value else 'false'
+            return 't' if value else 'f'
         if isinstance(value, (bytes, bytearray, memoryview)):
             try:
                 return bytes(value).decode('utf-8', 'ignore')
