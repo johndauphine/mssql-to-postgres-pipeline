@@ -17,7 +17,7 @@ from airflow.models.param import Param
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
 from datetime import timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 
 # Import our custom migration modules
@@ -372,8 +372,8 @@ def mssql_to_postgres_migration():
 
     @task
     def combine_transfer_results(
-        regular_results: List[Dict[str, Any]],
-        votes_results: List[Dict[str, Any]],
+        regular_results: Optional[List[Dict[str, Any]]],
+        votes_results: Optional[List[Dict[str, Any]]],
         **context
     ) -> List[Dict[str, Any]]:
         """
@@ -381,37 +381,56 @@ def mssql_to_postgres_migration():
 
         Aggregates Votes partition results into a single result.
         """
-        all_results = regular_results.copy() if regular_results else []
+        # Handle None or empty inputs
+        all_results = []
 
+        # Add regular table results if present
+        if regular_results:
+            if isinstance(regular_results, list):
+                all_results.extend([r for r in regular_results if r is not None])
+            elif regular_results is not None:
+                all_results.append(regular_results)
+
+        # Process and aggregate Votes partition results if present
         if votes_results:
-            # Aggregate Votes partition results
-            total_rows = sum(r.get('rows_transferred', 0) for r in votes_results)
-            total_time = sum(r.get('elapsed_time_seconds', 0) for r in votes_results)
-            all_success = all(r.get('success', False) for r in votes_results)
-            all_errors = []
+            valid_votes_results = []
+            if isinstance(votes_results, list):
+                valid_votes_results = [r for r in votes_results if r is not None]
+            elif votes_results is not None:
+                valid_votes_results = [votes_results]
 
-            for r in votes_results:
-                if r.get('errors'):
-                    all_errors.extend(r['errors'])
+            if valid_votes_results:
+                # Aggregate Votes partition results
+                total_rows = sum(r.get('rows_transferred', 0) for r in valid_votes_results)
+                all_success = all(r.get('success', False) for r in valid_votes_results)
+                all_errors = []
 
-            votes_combined = {
-                'table_name': 'Votes',
-                'rows_transferred': total_rows,
-                'elapsed_time_seconds': max(r.get('elapsed_time_seconds', 0) for r in votes_results),  # Use max since they run in parallel
-                'avg_rows_per_second': total_rows / max(r.get('elapsed_time_seconds', 1) for r in votes_results),
-                'success': all_success,
-                'errors': all_errors,
-                'partitions_processed': len(votes_results)
-            }
+                for r in valid_votes_results:
+                    if r.get('errors'):
+                        all_errors.extend(r['errors'])
 
-            logger.info(
-                f"Votes table complete: {total_rows:,} rows transferred across "
-                f"{len(votes_results)} partitions in {votes_combined['elapsed_time_seconds']:.2f}s"
-            )
+                # Calculate elapsed time (max since they run in parallel)
+                max_time = max((r.get('elapsed_time_seconds', 0) for r in valid_votes_results), default=0)
 
-            all_results.append(votes_combined)
+                votes_combined = {
+                    'table_name': 'Votes',
+                    'rows_transferred': total_rows,
+                    'elapsed_time_seconds': max_time,
+                    'avg_rows_per_second': total_rows / max(max_time, 1) if max_time > 0 else 0,
+                    'success': all_success,
+                    'errors': all_errors,
+                    'partitions_processed': len(valid_votes_results)
+                }
 
-        return all_results
+                logger.info(
+                    f"Votes table complete: {total_rows:,} rows transferred across "
+                    f"{len(valid_votes_results)} partitions in {max_time:.2f}s"
+                )
+
+                all_results.append(votes_combined)
+
+        logger.info(f"Combined results for {len(all_results)} tables")
+        return all_results if all_results else []
 
     @task
     def create_foreign_keys(
