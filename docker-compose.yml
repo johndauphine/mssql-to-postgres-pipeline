@@ -61,5 +61,5 @@ volumes:
 
 networks:
   migration_network:
-    name: stackoverflow-replication-pipeline_bcd2dd_airflow
+    name: mssql-to-postgres-pipeline_9be67b_airflow
     external: true

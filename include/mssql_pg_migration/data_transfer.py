@@ -3,6 +3,9 @@ Data Transfer Module
 
 This module handles the actual data migration from SQL Server to PostgreSQL,
 including chunked reading, bulk loading, and progress tracking.
+
+Uses direct pymssql connections for keyset pagination to avoid issues with
+Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
 from typing import Dict, Any, Optional, List, Tuple
@@ -14,6 +17,7 @@ import numpy as np
 from io import StringIO
 import logging
 import time
+import pymssql
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,17 @@ class DataTransfer:
         """
         self.mssql_hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
         self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+
+        # Get direct MSSQL connection parameters for keyset pagination
+        # This avoids issues with Airflow hook's get_pandas_df on large datasets
+        mssql_conn = self.mssql_hook.get_connection(mssql_conn_id)
+        self._mssql_config = {
+            'server': mssql_conn.host,
+            'port': mssql_conn.port or 1433,
+            'database': mssql_conn.schema,
+            'user': mssql_conn.login,
+            'password': mssql_conn.password,
+        }
 
     def transfer_table(
         self,
@@ -74,28 +89,36 @@ class DataTransfer:
             columns = self._get_table_columns(source_schema, source_table)
             logger.info(f"Transferring {len(columns)} columns")
 
-        # Transfer data in chunks
+        # Transfer data in chunks using keyset pagination
         rows_transferred = 0
         chunks_processed = 0
         errors = []
 
+        # Get primary key column for keyset pagination (prefer 'Id' if available)
+        pk_column = self._get_primary_key_column(source_schema, source_table, columns)
+        logger.info(f"Using '{pk_column}' for keyset pagination")
+
         try:
-            # Use server-side cursor for memory efficiency
-            offset = 0
-            while offset < source_row_count:
+            # Use keyset pagination for efficient large table transfers
+            last_key_value = None
+            while rows_transferred < source_row_count:
                 chunk_start = time.time()
 
-                # Read chunk from SQL Server
-                chunk_df = self._read_chunk(
+                # Read chunk from SQL Server using keyset pagination
+                chunk_df = self._read_chunk_keyset(
                     source_schema,
                     source_table,
                     columns,
-                    offset,
+                    pk_column,
+                    last_key_value,
                     chunk_size
                 )
 
                 if chunk_df.empty:
                     break  # No more data
+
+                # Track the last key value for next iteration
+                last_key_value = chunk_df[pk_column].max()
 
                 # Process data types for PostgreSQL compatibility
                 chunk_df = self._process_dataframe(chunk_df)
@@ -110,7 +133,6 @@ class DataTransfer:
 
                 rows_transferred += rows_written
                 chunks_processed += 1
-                offset += chunk_size
 
                 chunk_time = time.time() - chunk_start
                 rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
@@ -216,6 +238,113 @@ class DataTransfer:
         columns = self.mssql_hook.get_records(query, parameters=[schema_name, table_name])
         return [col[0] for col in columns]
 
+    def _get_primary_key_column(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: List[str]
+    ) -> str:
+        """
+        Get the primary key column for keyset pagination.
+        Prefers 'Id' column if available, otherwise uses the first column.
+
+        Args:
+            schema_name: Schema name
+            table_name: Table name
+            columns: List of available columns
+
+        Returns:
+            Column name to use for keyset pagination
+        """
+        # Prefer 'Id' column if it exists (case-insensitive)
+        for col in columns:
+            if col.lower() == 'id':
+                return col
+
+        # Try to get actual primary key from database
+        query = """
+        SELECT c.name
+        FROM sys.index_columns ic
+        INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+        INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+        INNER JOIN sys.tables t ON i.object_id = t.object_id
+        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE s.name = %s AND t.name = %s AND i.is_primary_key = 1
+        ORDER BY ic.key_ordinal
+        """
+        try:
+            pk_cols = self.mssql_hook.get_records(query, parameters=[schema_name, table_name])
+            if pk_cols:
+                return pk_cols[0][0]
+        except Exception:
+            pass
+
+        # Fallback to first column
+        return columns[0] if columns else 'Id'
+
+    def _read_chunk_keyset(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        pk_column: str,
+        last_key_value: Optional[Any],
+        limit: int
+    ) -> pd.DataFrame:
+        """
+        Read a chunk of data using keyset pagination (more efficient for large tables).
+
+        Uses direct pymssql connection instead of Airflow hook to avoid issues with
+        get_pandas_df on large datasets.
+
+        Args:
+            schema_name: Schema name
+            table_name: Table name
+            columns: List of columns to read
+            pk_column: Primary key column for pagination
+            last_key_value: Last key value from previous chunk (None for first chunk)
+            limit: Maximum rows to read
+
+        Returns:
+            DataFrame with the chunk data
+        """
+        # Quote column names for SQL Server
+        quoted_columns = ', '.join([f'[{col}]' for col in columns])
+
+        if last_key_value is None:
+            # First chunk - no WHERE clause needed
+            query = f"""
+            SELECT TOP {limit} {quoted_columns}
+            FROM [{schema_name}].[{table_name}]
+            ORDER BY [{pk_column}]
+            """
+        else:
+            # Subsequent chunks - use keyset pagination
+            query = f"""
+            SELECT TOP {limit} {quoted_columns}
+            FROM [{schema_name}].[{table_name}]
+            WHERE [{pk_column}] > {last_key_value}
+            ORDER BY [{pk_column}]
+            """
+
+        try:
+            # Use direct pymssql connection for reliable large dataset transfers
+            conn = pymssql.connect(**self._mssql_config)
+            cursor = conn.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                return pd.DataFrame(columns=columns)
+
+            # Convert to DataFrame with original column names
+            df = pd.DataFrame(rows, columns=columns)
+            return df
+        except Exception as e:
+            logger.error(f"Error reading chunk after key {last_key_value}: {str(e)}")
+            raise
+
     def _read_chunk(
         self,
         schema_name: str,
@@ -240,11 +369,14 @@ class DataTransfer:
         # Quote column names for SQL Server
         quoted_columns = ', '.join([f'[{col}]' for col in columns])
 
-        # Use ORDER BY (SELECT NULL) for consistent but efficient ordering
+        # Use deterministic ordering to ensure consistent results
+        # Try to order by primary key or first column for stable pagination
+        order_column = columns[0] if columns else '1'
+
         query = f"""
         SELECT {quoted_columns}
         FROM [{schema_name}].[{table_name}]
-        ORDER BY (SELECT NULL)
+        ORDER BY [{order_column}]
         OFFSET {offset} ROWS
         FETCH NEXT {limit} ROWS ONLY
         """
