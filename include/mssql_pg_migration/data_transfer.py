@@ -455,7 +455,7 @@ class DataTransfer:
         if isinstance(value, dt_time):
             return value.isoformat()
         if isinstance(value, Decimal):
-            return format(value, 'f')
+            return str(value)
         if isinstance(value, bool):
             return 't' if value else 'f'
         if isinstance(value, (bytes, bytearray, memoryview)):
