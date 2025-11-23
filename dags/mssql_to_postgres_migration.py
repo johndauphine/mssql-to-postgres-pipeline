@@ -88,6 +88,11 @@ logger = logging.getLogger(__name__)
             type="boolean",
             description="Whether to create foreign key constraints"
         ),
+        "use_unlogged_tables": Param(
+            default=True,
+            type="boolean",
+            description="Create tables as UNLOGGED during load for faster bulk inserts (converts to LOGGED after)"
+        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
@@ -170,23 +175,36 @@ def mssql_to_postgres_migration():
         """
         params = context["params"]
         target_schema = params["target_schema"]
+        use_unlogged = params.get("use_unlogged_tables", True)
 
         generator = ddl_generator.DDLGenerator(params["target_conn_id"])
         created_tables = []
 
         for table_schema in tables_schema:
             table_name = table_schema["table_name"]
-            logger.info(f"Creating table {target_schema}.{table_name}")
+            unlogged_msg = " (UNLOGGED)" if use_unlogged else ""
+            logger.info(f"Creating table {target_schema}.{table_name}{unlogged_msg}")
 
             try:
-                # Generate DDL statements
+                # Generate DDL statements (optionally as UNLOGGED for faster bulk loads)
+                # Skip indexes and PK here - they will be created after data load for better performance
                 ddl_statements = generator.generate_complete_ddl(
                     table_schema,
                     target_schema,
                     drop_if_exists=True,
-                    create_indexes=True,
-                    create_foreign_keys=False  # Will be done after all tables are created
+                    create_indexes=False,  # Indexes created after data load for performance
+                    create_foreign_keys=False,  # Will be done after all tables are created
+                    unlogged=use_unlogged
                 )
+                # Remove PK constraint from CREATE TABLE - will be added after data load
+                # This is done by setting include_constraints=False in generate_create_table
+                ddl_statements = [generator.generate_drop_table(table_name, target_schema, cascade=True)]
+                ddl_statements.append(generator.generate_create_table(
+                    table_schema,
+                    target_schema,
+                    include_constraints=False,  # Skip PK - added after data load
+                    unlogged=use_unlogged
+                ))
 
                 # Execute DDL
                 generator.execute_ddl(ddl_statements, transaction=False)
@@ -303,6 +321,138 @@ def mssql_to_postgres_migration():
         logger.info(f"Created {fk_count} foreign key constraints")
         return f"Created {fk_count} foreign keys"
 
+    @task
+    def convert_tables_to_logged(
+        transfer_results: List[Dict[str, Any]],
+        **context
+    ) -> str:
+        """
+        Convert UNLOGGED tables to LOGGED after data transfer.
+
+        This ensures data durability after bulk loading is complete.
+
+        Args:
+            transfer_results: Results from data transfers
+
+        Returns:
+            Status message
+        """
+        params = context["params"]
+
+        if not params.get("use_unlogged_tables", True):
+            logger.info("Tables were created as LOGGED, no conversion needed")
+            return "Tables already logged"
+
+        target_schema = params["target_schema"]
+        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+
+        # Convert successfully transferred tables to LOGGED
+        successful_tables = [r["table_name"] for r in transfer_results if r.get("success", False)]
+        converted_count = 0
+
+        for table_name in successful_tables:
+            try:
+                set_logged_ddl = generator.generate_set_logged(table_name, target_schema)
+                generator.execute_ddl([set_logged_ddl], transaction=False)
+                converted_count += 1
+                logger.info(f"✓ Converted {table_name} to LOGGED")
+            except Exception as e:
+                logger.warning(f"Could not convert {table_name} to LOGGED: {str(e)}")
+
+        logger.info(f"Converted {converted_count} tables to LOGGED for durability")
+        return f"Converted {converted_count} tables to LOGGED"
+
+    @task
+    def create_indexes(
+        tables_schema: List[Dict[str, Any]],
+        transfer_results: List[Dict[str, Any]],
+        **context
+    ) -> str:
+        """
+        Create indexes after data transfer for better performance.
+
+        Building indexes after bulk data load is much faster than maintaining
+        indexes during inserts.
+
+        Args:
+            tables_schema: Original table schemas with index definitions
+            transfer_results: Results from data transfers
+
+        Returns:
+            Status message
+        """
+        params = context["params"]
+        target_schema = params["target_schema"]
+
+        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+
+        # Only create indexes for successfully transferred tables
+        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
+        index_count = 0
+
+        for table_schema in tables_schema:
+            table_name = table_schema["table_name"]
+            if table_name not in successful_tables:
+                continue
+
+            index_statements = generator.generate_indexes(table_schema, target_schema)
+
+            for index_ddl in index_statements:
+                try:
+                    generator.execute_ddl([index_ddl], transaction=False)
+                    index_count += 1
+                    logger.info(f"✓ Created index for {table_name}")
+                except Exception as e:
+                    logger.warning(f"Could not create index: {str(e)}")
+
+        logger.info(f"Created {index_count} indexes")
+        return f"Created {index_count} indexes"
+
+    @task
+    def create_primary_keys(
+        tables_schema: List[Dict[str, Any]],
+        transfer_results: List[Dict[str, Any]],
+        **context
+    ) -> str:
+        """
+        Create primary key constraints after data transfer for better performance.
+
+        Building PK indexes after bulk data load is much faster than maintaining
+        them during inserts.
+
+        Args:
+            tables_schema: Original table schemas with PK definitions
+            transfer_results: Results from data transfers
+
+        Returns:
+            Status message
+        """
+        params = context["params"]
+        target_schema = params["target_schema"]
+
+        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+
+        # Only create PKs for successfully transferred tables
+        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
+        pk_count = 0
+
+        for table_schema in tables_schema:
+            table_name = table_schema["table_name"]
+            if table_name not in successful_tables:
+                continue
+
+            pk_ddl = generator.generate_primary_key(table_schema, target_schema)
+            if pk_ddl:
+                try:
+                    generator.execute_ddl([pk_ddl], transaction=False)
+                    pk_count += 1
+                    logger.info(f"✓ Created primary key for {table_name}")
+                except Exception as e:
+                    logger.warning(f"Could not create primary key for {table_name}: {str(e)}")
+
+        logger.info(f"Created {pk_count} primary key constraints")
+        return f"Created {pk_count} primary keys"
+
     """
     # Commented out - replaced with TriggerDagRunOperator to avoid XCom bug
     @task(
@@ -402,8 +552,20 @@ def mssql_to_postgres_migration():
     # Each table is transferred independently in parallel
     transfer_results = transfer_table_data.expand(table_info=created_tables)
 
-    # Create foreign keys after all data is transferred
+    # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
+    logged_status = convert_tables_to_logged(transfer_results)
+
+    # Create primary keys after data load (much faster than during inserts)
+    pk_status = create_primary_keys(schema_data, transfer_results)
+
+    # Create secondary indexes after PKs
+    index_status = create_indexes(schema_data, transfer_results)
+
+    # Create foreign keys after indexes are created
     fk_status = create_foreign_keys(schema_data, transfer_results)
+
+    # Task order: convert_to_logged -> create_primary_keys -> create_indexes -> create_foreign_keys
+    logged_status >> pk_status >> index_status >> fk_status
 
     # Trigger validation DAG instead of internal validation (avoids XCom bug)
     trigger_validation = TriggerDagRunOperator(
