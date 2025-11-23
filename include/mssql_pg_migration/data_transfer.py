@@ -55,7 +55,7 @@ class DataTransfer:
             'password': mssql_conn.password,
         }
 
-        # Initialize PostgreSQL connection pool for this connection ID if not exists
+        # Initialize shared PostgreSQL connection pool for this connection ID
         if postgres_conn_id not in DataTransfer._postgres_pools:
             with DataTransfer._pool_lock:
                 if postgres_conn_id not in DataTransfer._postgres_pools:
@@ -94,8 +94,8 @@ class DataTransfer:
             if conn and getattr(conn, "autocommit", False) is False:
                 try:
                     conn.rollback()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Exception occurred during PostgreSQL connection rollback")
             self._release_postgres_connection(conn)
 
     @contextlib.contextmanager
@@ -393,18 +393,18 @@ class DataTransfer:
             params = (last_key_value,)
 
         try:
-            cursor = conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            rows = cursor.fetchall()
+            with conn.cursor() as cursor:
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                rows = cursor.fetchall()
 
-            if not rows:
-                return [], last_key_value
+                if not rows:
+                    return [], last_key_value
 
-            next_key = rows[-1][pk_index]
-            return rows, next_key
+                next_key = rows[-1][pk_index]
+                return rows, next_key
         except Exception as e:
             logger.error(f"Error reading chunk after key {last_key_value}: {str(e)}")
             raise
@@ -457,9 +457,9 @@ class DataTransfer:
         if isinstance(value, dt_time):
             return value.isoformat()
         if isinstance(value, Decimal):
-            return format(value, 'f')
+            return str(value)
         if isinstance(value, bool):
-            return 'true' if value else 'false'
+            return 't' if value else 'f'
         if isinstance(value, (bytes, bytearray, memoryview)):
             try:
                 return bytes(value).decode('utf-8', 'ignore')
