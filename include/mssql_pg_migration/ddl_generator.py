@@ -291,7 +291,9 @@ class DDLGenerator:
         ]
 
         # Add NOT NULL constraint
-        if not column.get('is_nullable', True):
+        # Skip NOT NULL for TEXT columns as source data may have integrity issues
+        # (e.g., SQL Server nvarchar(max) columns with NULL values despite NOT NULL constraint)
+        if not column.get('is_nullable', True) and column['data_type'].upper() != 'TEXT':
             parts.append('NOT NULL')
 
         # Add default value if present

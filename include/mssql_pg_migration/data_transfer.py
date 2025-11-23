@@ -3,6 +3,9 @@ Data Transfer Module
 
 This module handles the actual data migration from SQL Server to PostgreSQL,
 including chunked reading, bulk loading, and progress tracking.
+
+Uses direct pymssql connections for keyset pagination to avoid issues with
+Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
 from typing import Dict, Any, Optional, List, Tuple
@@ -14,6 +17,7 @@ import numpy as np
 from io import StringIO
 import logging
 import time
+import pymssql
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,17 @@ class DataTransfer:
         """
         self.mssql_hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
         self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+
+        # Get direct MSSQL connection parameters for keyset pagination
+        # This avoids issues with Airflow hook's get_pandas_df on large datasets
+        mssql_conn = self.mssql_hook.get_connection(mssql_conn_id)
+        self._mssql_config = {
+            'server': mssql_conn.host,
+            'port': mssql_conn.port or 1433,
+            'database': mssql_conn.schema,
+            'user': mssql_conn.login,
+            'password': mssql_conn.password,
+        }
 
     def transfer_table(
         self,
@@ -279,6 +294,9 @@ class DataTransfer:
         """
         Read a chunk of data using keyset pagination (more efficient for large tables).
 
+        Uses direct pymssql connection instead of Airflow hook to avoid issues with
+        get_pandas_df on large datasets.
+
         Args:
             schema_name: Schema name
             table_name: Table name
@@ -310,7 +328,18 @@ class DataTransfer:
             """
 
         try:
-            df = self.mssql_hook.get_pandas_df(query)
+            # Use direct pymssql connection for reliable large dataset transfers
+            conn = pymssql.connect(**self._mssql_config)
+            cursor = conn.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                return pd.DataFrame(columns=columns)
+
+            # Convert to DataFrame with original column names
+            df = pd.DataFrame(rows, columns=columns)
             return df
         except Exception as e:
             logger.error(f"Error reading chunk after key {last_key_value}: {str(e)}")
