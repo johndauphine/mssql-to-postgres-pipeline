@@ -186,16 +186,6 @@ def mssql_to_postgres_migration():
             logger.info(f"Creating table {target_schema}.{table_name}{unlogged_msg}")
 
             try:
-                # Generate DDL statements (optionally as UNLOGGED for faster bulk loads)
-                # Skip indexes and PK here - they will be created after data load for better performance
-                ddl_statements = generator.generate_complete_ddl(
-                    table_schema,
-                    target_schema,
-                    drop_if_exists=True,
-                    create_indexes=False,  # Indexes created after data load for performance
-                    create_foreign_keys=False,  # Will be done after all tables are created
-                    unlogged=use_unlogged
-                )
                 # Remove PK constraint from CREATE TABLE - will be added after data load
                 # This is done by setting include_constraints=False in generate_create_table
                 ddl_statements = [generator.generate_drop_table(table_name, target_schema, cascade=True)]
