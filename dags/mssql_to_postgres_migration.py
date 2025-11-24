@@ -345,9 +345,9 @@ def mssql_to_postgres_migration():
 
             min_id, max_id = min_max[0], min_max[1]
             
-            # Validate that min_id and max_id are numeric to prevent SQL injection
-            if not isinstance(min_id, (int, float)) or not isinstance(max_id, (int, float)):
-                logger.error(f"Primary key range for {safe_table_name} is not numeric: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
+            # Validate that min_id and max_id are integers to prevent SQL injection and precision issues
+            if not isinstance(min_id, int) or not isinstance(max_id, int):
+                logger.error(f"Primary key range for {safe_table_name} must be integer: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
                 continue
             
             if max_id < min_id:
