@@ -291,6 +291,9 @@ def mssql_to_postgres_migration():
                 continue
 
             min_id, max_id = min_max[0], min_max[1]
+            if max_id < min_id:
+                logger.warning(f"Invalid PK range for {table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
+                continue
             id_range = max_id - min_id + 1
             chunk_size = id_range // PARTITION_COUNT
 
