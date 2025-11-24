@@ -352,9 +352,10 @@ def mssql_to_postgres_migration():
             where_clause=partition_info.get('where_clause')
         )
 
-        # Add partition info to result
+        # Add table name to result (same as regular tables for compatibility)
         result["table_name"] = "Votes"
         result["partition_name"] = partition_info['partition_name']
+        result["is_partition"] = True  # Mark this as a partition for downstream processing
 
         if result["success"]:
             logger.info(
@@ -370,67 +371,6 @@ def mssql_to_postgres_migration():
 
         return result
 
-    @task
-    def combine_transfer_results(
-        regular_results: Optional[List[Dict[str, Any]]],
-        votes_results: Optional[List[Dict[str, Any]]],
-        **context
-    ) -> List[Dict[str, Any]]:
-        """
-        Combine results from regular tables and Votes partitions.
-
-        Aggregates Votes partition results into a single result.
-        """
-        # Handle None or empty inputs
-        all_results = []
-
-        # Add regular table results if present
-        if regular_results:
-            if isinstance(regular_results, list):
-                all_results.extend([r for r in regular_results if r is not None])
-            elif regular_results is not None:
-                all_results.append(regular_results)
-
-        # Process and aggregate Votes partition results if present
-        if votes_results:
-            valid_votes_results = []
-            if isinstance(votes_results, list):
-                valid_votes_results = [r for r in votes_results if r is not None]
-            elif votes_results is not None:
-                valid_votes_results = [votes_results]
-
-            if valid_votes_results:
-                # Aggregate Votes partition results
-                total_rows = sum(r.get('rows_transferred', 0) for r in valid_votes_results)
-                all_success = all(r.get('success', False) for r in valid_votes_results)
-                all_errors = []
-
-                for r in valid_votes_results:
-                    if r.get('errors'):
-                        all_errors.extend(r['errors'])
-
-                # Calculate elapsed time (max since they run in parallel)
-                max_time = max((r.get('elapsed_time_seconds', 0) for r in valid_votes_results), default=0)
-
-                votes_combined = {
-                    'table_name': 'Votes',
-                    'rows_transferred': total_rows,
-                    'elapsed_time_seconds': max_time,
-                    'avg_rows_per_second': total_rows / max(max_time, 1) if max_time > 0 else 0,
-                    'success': all_success,
-                    'errors': all_errors,
-                    'partitions_processed': len(valid_votes_results)
-                }
-
-                logger.info(
-                    f"Votes table complete: {total_rows:,} rows transferred across "
-                    f"{len(valid_votes_results)} partitions in {max_time:.2f}s"
-                )
-
-                all_results.append(votes_combined)
-
-        logger.info(f"Combined results for {len(all_results)} tables")
-        return all_results if all_results else []
 
     @task
     def create_foreign_keys(
@@ -720,8 +660,49 @@ def mssql_to_postgres_migration():
         partition_info=votes_partitions
     )
 
-    # Combine results from regular tables and Votes partitions
-    transfer_results = combine_transfer_results(regular_transfer_results, votes_transfer_results)
+    # Collect all transfer results (both regular tables and Votes partitions)
+    @task(trigger_rule="all_done")
+    def collect_all_results(**context) -> List[Dict[str, Any]]:
+        """Collect results from all transfer tasks."""
+        ti = context['ti']
+        all_results = []
+
+        # Get regular table results
+        try:
+            regular = ti.xcom_pull(task_ids='transfer_table_data', map_indexes=None)
+            if regular:
+                if isinstance(regular, list):
+                    all_results.extend(regular)
+                else:
+                    all_results.append(regular)
+        except:
+            pass
+
+        # Get votes partition results - aggregate them into one Votes result
+        try:
+            votes = ti.xcom_pull(task_ids='transfer_votes_partition', map_indexes=None)
+            if votes:
+                if not isinstance(votes, list):
+                    votes = [votes]
+
+                # Aggregate all Votes partitions into a single result
+                if votes:
+                    total_rows = sum(v.get('rows_transferred', 0) for v in votes if v)
+                    success = all(v.get('success', False) for v in votes if v)
+
+                    all_results.append({
+                        'table_name': 'Votes',
+                        'rows_transferred': total_rows,
+                        'success': success
+                    })
+        except:
+            pass
+
+        return all_results
+
+    # Collect all results
+    transfer_results = collect_all_results()
+    [regular_transfer_results, votes_transfer_results] >> transfer_results
 
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)
