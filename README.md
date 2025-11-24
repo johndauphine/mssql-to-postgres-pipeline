@@ -9,6 +9,7 @@ An Apache Airflow pipeline for automated, full-refresh migrations from Microsoft
 - **Streaming Data Transfer**: Move data efficiently using server-side cursors, keyset pagination, and PostgreSQL's COPY protocol
 - **Validation**: Standalone validation DAG verifies migration success through row count comparisons
 - **Parallelization**: Transfer multiple tables concurrently using Airflow's dynamic task mapping
+- **Large Table Partitioning**: Automatically partitions tables >5M rows into parallel chunks by primary key range
 
 ## Performance
 
@@ -18,8 +19,17 @@ Tested against the StackOverflow 2010 dataset:
 |--------|-------|
 | Total Rows Migrated | 19.3 million |
 | Tables | 9 |
-| Migration Time | ~3 minutes |
+| Migration Time | ~2.5 minutes |
+| Throughput | ~125,000 rows/sec |
 | Validation Success | 100% (9/9 tables) |
+
+### Performance Optimizations
+
+- **100k chunk size**: 10x larger batches reduce overhead
+- **Parallel partitioning**: Large tables split into 4 parallel partitions by PK range
+- **Connection pooling**: Reuses PostgreSQL connections across operations
+
+See [docs/PARALLEL_PARTITIONING.md](docs/PARALLEL_PARTITIONING.md) for details on large table partitioning.
 
 ### Tables Migrated
 
