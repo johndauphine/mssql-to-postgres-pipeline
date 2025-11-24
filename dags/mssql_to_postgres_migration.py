@@ -17,7 +17,7 @@ from airflow.models.param import Param
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
 from datetime import timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import logging
 
 # Import our custom migration modules
