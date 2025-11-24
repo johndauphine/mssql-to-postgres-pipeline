@@ -306,7 +306,8 @@ def mssql_to_postgres_migration():
                 safe_table_name = validate_sql_identifier(table_name, "table name")
                 safe_source_schema = validate_sql_identifier(source_schema, "schema name")
             except ValueError as e:
-                logger.error(f"Invalid SQL identifier for table {table_name}: {e}")
+                # Don't log the potentially malicious identifier value directly
+                logger.error(f"Invalid SQL identifier during table validation: {e}")
                 continue
 
             # Find primary key column
@@ -328,28 +329,29 @@ def mssql_to_postgres_migration():
             try:
                 safe_pk_column = validate_sql_identifier(pk_column, "primary key column")
             except ValueError as e:
-                logger.error(f"Invalid primary key column '{pk_column}' for table {table_name}: {e}")
+                # Use safe_table_name since it's already validated
+                logger.error(f"Invalid primary key column for table {safe_table_name}: {e}")
                 continue
 
-            logger.info(f"Partitioning {table_name} by [{pk_column}] ({row_count:,} rows)")
+            logger.info(f"Partitioning {safe_table_name} by [{safe_pk_column}] ({row_count:,} rows)")
 
             # Get min/max values for the primary key
             range_query = f"SELECT MIN([{safe_pk_column}]), MAX([{safe_pk_column}]) FROM [{safe_source_schema}].[{safe_table_name}]"
             min_max = mssql_hook.get_first(range_query)
 
             if not min_max or min_max[0] is None:
-                logger.warning(f"Could not get PK range for {table_name}, skipping partitioning")
+                logger.warning(f"Could not get PK range for {safe_table_name}, skipping partitioning")
                 continue
 
             min_id, max_id = min_max[0], min_max[1]
             
             # Validate that min_id and max_id are numeric to prevent SQL injection
             if not isinstance(min_id, (int, float)) or not isinstance(max_id, (int, float)):
-                logger.error(f"Primary key range for {table_name} is not numeric: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
+                logger.error(f"Primary key range for {safe_table_name} is not numeric: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
                 continue
             
             if max_id < min_id:
-                logger.warning(f"Invalid PK range for {table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
+                logger.warning(f"Invalid PK range for {safe_table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
                 continue
             id_range = max_id - min_id + 1
             chunk_size = id_range // PARTITION_COUNT
@@ -378,7 +380,7 @@ def mssql_to_postgres_migration():
                 }
                 partitions.append(partition_info)
 
-            logger.info(f"  Created {PARTITION_COUNT} partitions for {table_name}")
+            logger.info(f"  Created {PARTITION_COUNT} partitions for {safe_table_name}")
 
         logger.info(f"Total: {len(partitions)} partitions across {len(partitions) // PARTITION_COUNT if partitions else 0} large tables")
         return partitions
