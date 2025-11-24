@@ -832,8 +832,8 @@ def mssql_to_postgres_migration():
                     all_results.extend([r for r in regular if r])
                 else:
                     all_results.append(regular)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to retrieve regular table results: {e}")
 
         # Get partition results from both first and remaining partitions and aggregate by table name
         from collections import defaultdict
