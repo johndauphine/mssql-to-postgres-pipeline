@@ -19,6 +19,7 @@ from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any, Optional
 import logging
+import re
 
 # Import our custom migration modules
 from include.mssql_pg_migration import (
@@ -50,8 +51,6 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
     Raises:
         ValueError: If the identifier is invalid or potentially unsafe
     """
-    import re
-    
     if not identifier:
         raise ValueError(f"Invalid {identifier_type}: cannot be empty")
     
@@ -322,7 +321,7 @@ def mssql_to_postgres_migration():
                     AND TABLE_NAME = %s
                     ORDER BY ORDINAL_POSITION
                 """
-                pk_result = mssql_hook.get_first(pk_query, parameters=[source_schema, table_name])
+                pk_result = mssql_hook.get_first(pk_query, parameters=[safe_source_schema, safe_table_name])
                 pk_column = pk_result[0] if pk_result else 'Id'
 
             # Validate primary key column name
