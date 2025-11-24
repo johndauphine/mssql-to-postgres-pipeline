@@ -780,20 +780,21 @@ def mssql_to_postgres_migration():
         from collections import defaultdict
         table_partitions = defaultdict(list)
         
-        # Collect all partition results (both first and remaining)
-        for task_id in ['transfer_partition']:
-            try:
-                partitions = ti.xcom_pull(task_ids=task_id, map_indexes=None)
-                if partitions:
-                    if not isinstance(partitions, list):
-                        partitions = [partitions]
+        # Collect all partition results from transfer_partition task
+        # Note: Both first_partition_results and remaining_partition_results expand the same
+        # transfer_partition task, so pulling from 'transfer_partition' gets all map instances
+        try:
+            partitions = ti.xcom_pull(task_ids='transfer_partition', map_indexes=None)
+            if partitions:
+                if not isinstance(partitions, list):
+                    partitions = [partitions]
 
-                    # Group partitions by table name
-                    for p in partitions:
-                        if p:
-                            table_partitions[p.get('table_name', 'Unknown')].append(p)
-            except:
-                pass
+                # Group partitions by table name
+                for p in partitions:
+                    if p:
+                        table_partitions[p.get('table_name', 'Unknown')].append(p)
+        except:
+            pass
 
         # Aggregate each table's partitions into a single result
         for table_name, parts in table_partitions.items():
