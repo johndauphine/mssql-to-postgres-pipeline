@@ -342,6 +342,12 @@ def mssql_to_postgres_migration():
                 continue
 
             min_id, max_id = min_max[0], min_max[1]
+            
+            # Validate that min_id and max_id are numeric to prevent SQL injection
+            if not isinstance(min_id, (int, float)) or not isinstance(max_id, (int, float)):
+                logger.error(f"Primary key range for {table_name} is not numeric: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
+                continue
+            
             if max_id < min_id:
                 logger.warning(f"Invalid PK range for {table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
                 continue
@@ -366,7 +372,7 @@ def mssql_to_postgres_migration():
                     'partition_name': f'partition_{i + 1}',
                     'partition_index': i,
                     'where_clause': where_clause,
-                    'pk_column': pk_column,
+                    'pk_column': safe_pk_column,
                     'estimated_rows': row_count // PARTITION_COUNT,
                     'truncate_first': i == 0  # Only first partition truncates
                 }
