@@ -19,6 +19,7 @@ from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any
 import logging
+import re
 
 # Import our custom migration modules
 from include.mssql_pg_migration import (
@@ -29,6 +30,41 @@ from include.mssql_pg_migration import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_sql_identifier(identifier: str, identifier_type: str = "identifier") -> str:
+    """
+    Validate and sanitize SQL identifiers to prevent SQL injection.
+    
+    SQL identifiers (table names, column names, schema names) must:
+    - Start with a letter or underscore
+    - Contain only alphanumeric characters and underscores
+    - Be 128 characters or less (SQL Server limit)
+    
+    Args:
+        identifier: The SQL identifier to validate
+        identifier_type: Type of identifier (for error messages)
+    
+    Returns:
+        The validated identifier
+        
+    Raises:
+        ValueError: If the identifier is invalid or potentially unsafe
+    """
+    if not identifier:
+        raise ValueError(f"Invalid {identifier_type}: cannot be empty")
+    
+    if len(identifier) > 128:
+        raise ValueError(f"Invalid {identifier_type}: exceeds maximum length of 128 characters")
+    
+    # SQL identifiers must start with letter or underscore, contain only alphanumeric and underscore
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        raise ValueError(
+            f"Invalid {identifier_type} '{identifier}': must start with letter or underscore "
+            "and contain only alphanumeric characters and underscores"
+        )
+    
+    return identifier
 
 
 @dag(
@@ -67,10 +103,10 @@ logger = logging.getLogger(__name__)
             description="Target schema in PostgreSQL"
         ),
         "chunk_size": Param(
-            default=10000,
+            default=100000,
             type="integer",
             minimum=100,
-            maximum=100000,
+            maximum=500000,
             description="Number of rows to transfer per batch"
         ),
         "exclude_tables": Param(
@@ -219,6 +255,136 @@ def mssql_to_postgres_migration():
         logger.info(f"Successfully created {len(created_tables)} tables")
         return created_tables
 
+    # Threshold for partitioning large tables (rows)
+    LARGE_TABLE_THRESHOLD = 5_000_000
+    PARTITION_COUNT = 4
+
+    @task
+    def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+        """
+        Filter out tables that are small enough to transfer without partitioning.
+        Large tables (>5M rows) will be handled by partition transfer.
+        """
+        regular_tables = []
+
+        for table_info in created_tables:
+            row_count = table_info.get('row_count', 0)
+            if row_count < LARGE_TABLE_THRESHOLD:
+                regular_tables.append(table_info)
+            else:
+                logger.info(f"Table {table_info['table_name']} ({row_count:,} rows) will be partitioned")
+
+        logger.info(f"Prepared {len(regular_tables)} regular tables for transfer")
+        return regular_tables
+
+    @task
+    def prepare_large_table_partitions(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+        """
+        Create partitions for any large table (>5M rows) using primary key ranges.
+
+        Partitions tables by their primary key column, dividing the ID range
+        into equal chunks for parallel processing.
+        """
+        params = context["params"]
+        partitions = []
+
+        # Get MSSQL connection for querying PK ranges
+        from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+        mssql_hook = MsSqlHook(mssql_conn_id=params["source_conn_id"])
+
+        for table_info in created_tables:
+            row_count = table_info.get('row_count', 0)
+
+            if row_count < LARGE_TABLE_THRESHOLD:
+                continue
+
+            table_name = table_info['table_name']
+            source_schema = table_info.get('source_schema', params.get('source_schema', 'dbo'))
+
+            # Validate SQL identifiers to prevent SQL injection
+            try:
+                safe_table_name = validate_sql_identifier(table_name, "table name")
+                safe_source_schema = validate_sql_identifier(source_schema, "schema name")
+            except ValueError as e:
+                # Don't log the potentially malicious identifier value directly
+                logger.error(f"Invalid SQL identifier during table validation: {e}")
+                continue
+
+            # Find primary key column
+            pk_column = table_info.get('primary_key')
+            if not pk_column:
+                # Query for primary key column
+                pk_query = """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                    WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+                    AND TABLE_SCHEMA = %s
+                    AND TABLE_NAME = %s
+                    ORDER BY ORDINAL_POSITION
+                """
+                pk_result = mssql_hook.get_first(pk_query, parameters=[safe_source_schema, safe_table_name])
+                pk_column = pk_result[0] if pk_result else 'Id'
+
+            # Validate primary key column name
+            try:
+                safe_pk_column = validate_sql_identifier(pk_column, "primary key column")
+            except ValueError as e:
+                # Use safe_table_name since it's already validated
+                logger.error(f"Invalid primary key column for table {safe_table_name}: {e}")
+                continue
+
+            logger.info(f"Partitioning {safe_table_name} by [{safe_pk_column}] ({row_count:,} rows)")
+
+            # Get min/max values for the primary key
+            range_query = f"SELECT MIN([{safe_pk_column}]), MAX([{safe_pk_column}]) FROM [{safe_source_schema}].[{safe_table_name}]"
+            min_max = mssql_hook.get_first(range_query)
+
+            if not min_max or min_max[0] is None:
+                logger.warning(f"Could not get PK range for {safe_table_name}, skipping partitioning")
+                continue
+
+            min_id, max_id = min_max[0], min_max[1]
+            
+            # Validate that min_id and max_id are integers to prevent SQL injection and precision issues
+            if not isinstance(min_id, int) or not isinstance(max_id, int):
+                logger.error(f"Primary key range for {safe_table_name} must be integer: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
+                continue
+            
+            if max_id < min_id:
+                logger.warning(f"Invalid PK range for {safe_table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
+                continue
+            id_range = max_id - min_id + 1
+            chunk_size = id_range // PARTITION_COUNT
+
+            logger.info(f"  PK range: {min_id:,} to {max_id:,} (chunk size: {chunk_size:,})")
+
+            # Create partitions based on PK ranges
+            for i in range(PARTITION_COUNT):
+                start_id = min_id + (i * chunk_size)
+
+                if i == PARTITION_COUNT - 1:
+                    # Last partition gets everything remaining
+                    where_clause = f"[{safe_pk_column}] >= {start_id}"
+                else:
+                    end_id = min_id + ((i + 1) * chunk_size) - 1
+                    where_clause = f"[{safe_pk_column}] >= {start_id} AND [{safe_pk_column}] <= {end_id}"
+
+                partition_info = {
+                    **table_info,
+                    'partition_name': f'partition_{i + 1}',
+                    'partition_index': i,
+                    'where_clause': where_clause,
+                    'pk_column': safe_pk_column,
+                    'estimated_rows': row_count // PARTITION_COUNT,
+                    'truncate_first': i == 0  # Only first partition truncates
+                }
+                partitions.append(partition_info)
+
+            logger.info(f"  Created {PARTITION_COUNT} partitions for {safe_table_name}")
+
+        logger.info(f"Total: {len(partitions)} partitions across {len(partitions) // PARTITION_COUNT if partitions else 0} large tables")
+        return partitions
+
     @task
     def transfer_table_data(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
         """
@@ -261,6 +427,58 @@ def mssql_to_postgres_migration():
             )
 
         return result
+
+    @task
+    def transfer_partition(partition_info: Dict[str, Any], **context) -> Dict[str, Any]:
+        """
+        Transfer a partition of a large table in parallel.
+
+        Works with any table that has been partitioned by primary key range.
+
+        Args:
+            partition_info: Partition information including WHERE clause and table details
+
+        Returns:
+            Transfer result dictionary with statistics
+        """
+        params = context["params"]
+        table_name = partition_info['table_name']
+        partition_name = partition_info['partition_name']
+
+        logger.info(
+            f"Starting {table_name} {partition_name} transfer "
+            f"(estimated {partition_info.get('estimated_rows', 0):,} rows)"
+        )
+
+        # Transfer with WHERE clause for partitioning
+        result = data_transfer.transfer_table_data(
+            mssql_conn_id=params["source_conn_id"],
+            postgres_conn_id=params["target_conn_id"],
+            table_info=partition_info,
+            chunk_size=params["chunk_size"],
+            truncate=partition_info.get('truncate_first', False),  # Only first partition truncates
+            where_clause=partition_info.get('where_clause')
+        )
+
+        # Add metadata to result for downstream processing
+        result["table_name"] = table_name
+        result["partition_name"] = partition_name
+        result["is_partition"] = True
+
+        if result["success"]:
+            logger.info(
+                f"✓ {table_name} {partition_name}: Transferred {result['rows_transferred']:,} rows "
+                f"in {result['elapsed_time_seconds']:.2f}s "
+                f"({result['avg_rows_per_second']:,.0f} rows/sec)"
+            )
+        else:
+            logger.error(
+                f"✗ {table_name} {partition_name}: Transfer failed. "
+                f"Errors: {result.get('errors', [])}"
+            )
+
+        return result
+
 
     @task
     def create_foreign_keys(
@@ -538,9 +756,124 @@ def mssql_to_postgres_migration():
     schema_status = create_target_schema(schema_name="{{ params.target_schema }}")
     created_tables = create_target_tables(schema_data, schema_status)
 
-    # Use dynamic task mapping for parallel table transfers
-    # Each table is transferred independently in parallel
-    transfer_results = transfer_table_data.expand(table_info=created_tables)
+    # Prepare transfer tasks - partition any large tables (>5M rows)
+    regular_tables = prepare_regular_tables(created_tables)
+    large_table_partitions = prepare_large_table_partitions(created_tables)
+
+    # Split partitions into first (truncates) and remaining (no truncate)
+    @task
+    def split_partitions(partitions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Split partitions into first partitions (that truncate) and remaining partitions.
+        This prevents race conditions where non-truncating partitions might insert
+        data before truncating partitions complete.
+        """
+        first_partitions = []
+        remaining_partitions = []
+        
+        for partition in partitions:
+            if partition.get('truncate_first', False):
+                first_partitions.append(partition)
+            else:
+                remaining_partitions.append(partition)
+        
+        logger.info(f"Split {len(partitions)} partitions: {len(first_partitions)} first, {len(remaining_partitions)} remaining")
+        return {
+            'first': first_partitions,
+            'remaining': remaining_partitions
+        }
+    
+    partition_groups = split_partitions(large_table_partitions)
+
+    # Transfer regular tables in parallel
+    regular_transfer_results = transfer_table_data.expand(
+        table_info=regular_tables
+    )
+    
+    # Transfer first partitions (with truncate) - must complete before remaining partitions
+    @task
+    def get_first_partitions(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract first partitions from partition groups."""
+        return groups.get('first', [])
+    
+    @task
+    def get_remaining_partitions(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract remaining partitions from partition groups."""
+        return groups.get('remaining', [])
+    
+    first_partitions_list = get_first_partitions(partition_groups)
+    remaining_partitions_list = get_remaining_partitions(partition_groups)
+    
+    # Transfer first partitions (these do the truncate operation)
+    first_partition_results = transfer_partition.expand(
+        partition_info=first_partitions_list
+    )
+    
+    # Transfer remaining partitions AFTER first partitions complete (prevents race condition)
+    remaining_partition_results = transfer_partition.expand(
+        partition_info=remaining_partitions_list
+    )
+    
+    # Ensure first partitions complete before remaining partitions start
+    first_partition_results >> remaining_partition_results
+
+    # Collect all transfer results (both regular tables and partitioned large tables)
+    @task(trigger_rule="all_done")
+    def collect_all_results(**context) -> List[Dict[str, Any]]:
+        """Collect and aggregate results from all transfer tasks."""
+        ti = context['ti']
+        all_results = []
+
+        # Get regular table results
+        try:
+            regular = ti.xcom_pull(task_ids='transfer_table_data', map_indexes=None)
+            if regular:
+                if isinstance(regular, list):
+                    all_results.extend([r for r in regular if r])
+                else:
+                    all_results.append(regular)
+        except Exception as e:
+            logger.warning(f"Failed to retrieve regular table results: {e}")
+
+        # Get partition results from both first and remaining partitions and aggregate by table name
+        from collections import defaultdict
+        table_partitions = defaultdict(list)
+        
+        # Collect all partition results from transfer_partition task
+        # Note: Both first_partition_results and remaining_partition_results expand the same
+        # transfer_partition task, so pulling from 'transfer_partition' gets all map instances
+        try:
+            partitions = ti.xcom_pull(task_ids='transfer_partition', map_indexes=None)
+            if partitions:
+                if not isinstance(partitions, list):
+                    partitions = [partitions]
+
+                # Group partitions by table name
+                for p in partitions:
+                    if p:
+                        table_partitions[p.get('table_name', 'Unknown')].append(p)
+        except:
+            pass
+
+        # Aggregate each table's partitions into a single result
+        for table_name, parts in table_partitions.items():
+            total_rows = sum(p.get('rows_transferred', 0) for p in parts)
+            success = all(p.get('success', False) for p in parts)
+
+            all_results.append({
+                'table_name': table_name,
+                'rows_transferred': total_rows,
+                'success': success,
+                'partitions_processed': len(parts)
+            })
+            logger.info(f"Aggregated {len(parts)} partitions for {table_name}: {total_rows:,} total rows")
+
+        logger.info(f"Collected results for {len(all_results)} tables")
+        return all_results
+
+    # Collect all results
+    transfer_results = collect_all_results()
+    [regular_transfer_results, first_partition_results, remaining_partition_results] >> transfer_results
 
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)
