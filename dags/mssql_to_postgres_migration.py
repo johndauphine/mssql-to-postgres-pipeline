@@ -721,8 +721,8 @@ def mssql_to_postgres_migration():
                     all_results.extend([r for r in regular if r])
                 else:
                     all_results.append(regular)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to retrieve regular table results: {e}")
 
         # Get partition results and aggregate by table name
         try:
@@ -750,8 +750,8 @@ def mssql_to_postgres_migration():
                         'partitions_processed': len(parts)
                     })
                     logger.info(f"Aggregated {len(parts)} partitions for {table_name}: {total_rows:,} total rows")
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to retrieve or aggregate partition results: {e}")
 
         logger.info(f"Collected results for {len(all_results)} tables")
         return all_results
