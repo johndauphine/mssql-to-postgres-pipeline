@@ -31,6 +31,43 @@ from include.mssql_pg_migration import (
 logger = logging.getLogger(__name__)
 
 
+def validate_sql_identifier(identifier: str, identifier_type: str = "identifier") -> str:
+    """
+    Validate and sanitize SQL identifiers to prevent SQL injection.
+    
+    SQL identifiers (table names, column names, schema names) must:
+    - Start with a letter or underscore
+    - Contain only alphanumeric characters and underscores
+    - Be 128 characters or less (SQL Server limit)
+    
+    Args:
+        identifier: The SQL identifier to validate
+        identifier_type: Type of identifier (for error messages)
+    
+    Returns:
+        The validated identifier
+        
+    Raises:
+        ValueError: If the identifier is invalid or potentially unsafe
+    """
+    import re
+    
+    if not identifier:
+        raise ValueError(f"Invalid {identifier_type}: cannot be empty")
+    
+    if len(identifier) > 128:
+        raise ValueError(f"Invalid {identifier_type}: exceeds maximum length of 128 characters")
+    
+    # SQL identifiers must start with letter or underscore, contain only alphanumeric and underscore
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        raise ValueError(
+            f"Invalid {identifier_type} '{identifier}': must start with letter or underscore "
+            "and contain only alphanumeric characters and underscores"
+        )
+    
+    return identifier
+
+
 @dag(
     start_date=datetime(2025, 1, 1),
     schedule=None,  # Run manually or trigger via API
@@ -265,6 +302,14 @@ def mssql_to_postgres_migration():
             table_name = table_info['table_name']
             source_schema = table_info.get('source_schema', params.get('source_schema', 'dbo'))
 
+            # Validate SQL identifiers to prevent SQL injection
+            try:
+                safe_table_name = validate_sql_identifier(table_name, "table name")
+                safe_source_schema = validate_sql_identifier(source_schema, "schema name")
+            except ValueError as e:
+                logger.error(f"Invalid SQL identifier for table {table_name}: {e}")
+                continue
+
             # Find primary key column
             pk_column = table_info.get('primary_key')
             if not pk_column:
@@ -280,10 +325,17 @@ def mssql_to_postgres_migration():
                 pk_result = mssql_hook.get_first(pk_query, parameters=[source_schema, table_name])
                 pk_column = pk_result[0] if pk_result else 'Id'
 
+            # Validate primary key column name
+            try:
+                safe_pk_column = validate_sql_identifier(pk_column, "primary key column")
+            except ValueError as e:
+                logger.error(f"Invalid primary key column '{pk_column}' for table {table_name}: {e}")
+                continue
+
             logger.info(f"Partitioning {table_name} by [{pk_column}] ({row_count:,} rows)")
 
             # Get min/max values for the primary key
-            range_query = f"SELECT MIN([{pk_column}]), MAX([{pk_column}]) FROM [{source_schema}].[{table_name}]"
+            range_query = f"SELECT MIN([{safe_pk_column}]), MAX([{safe_pk_column}]) FROM [{safe_source_schema}].[{safe_table_name}]"
             min_max = mssql_hook.get_first(range_query)
 
             if not min_max or min_max[0] is None:
@@ -305,10 +357,10 @@ def mssql_to_postgres_migration():
 
                 if i == PARTITION_COUNT - 1:
                     # Last partition gets everything remaining
-                    where_clause = f"[{pk_column}] >= {start_id}"
+                    where_clause = f"[{safe_pk_column}] >= {start_id}"
                 else:
                     end_id = min_id + ((i + 1) * chunk_size) - 1
-                    where_clause = f"[{pk_column}] >= {start_id} AND [{pk_column}] <= {end_id}"
+                    where_clause = f"[{safe_pk_column}] >= {start_id} AND [{safe_pk_column}] <= {end_id}"
 
                 partition_info = {
                     **table_info,
