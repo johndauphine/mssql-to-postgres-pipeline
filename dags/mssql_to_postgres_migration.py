@@ -219,67 +219,109 @@ def mssql_to_postgres_migration():
         logger.info(f"Successfully created {len(created_tables)} tables")
         return created_tables
 
+    # Threshold for partitioning large tables (rows)
+    LARGE_TABLE_THRESHOLD = 5_000_000
+    PARTITION_COUNT = 4
+
     @task
     def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
         """
-        Filter out regular tables (non-Votes tables).
+        Filter out tables that are small enough to transfer without partitioning.
+        Large tables (>5M rows) will be handled by partition transfer.
         """
         regular_tables = []
 
         for table_info in created_tables:
-            if not (table_info['table_name'].lower() == 'votes' and table_info.get('row_count', 0) > 5_000_000):
+            row_count = table_info.get('row_count', 0)
+            if row_count < LARGE_TABLE_THRESHOLD:
                 regular_tables.append(table_info)
+            else:
+                logger.info(f"Table {table_info['table_name']} ({row_count:,} rows) will be partitioned")
 
         logger.info(f"Prepared {len(regular_tables)} regular tables for transfer")
         return regular_tables
 
     @task
-    def prepare_votes_partitions(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+    def prepare_large_table_partitions(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
         """
-        Create partitions for Votes table if it's large enough.
+        Create partitions for any large table (>5M rows) using primary key ranges.
+
+        Partitions tables by their primary key column, dividing the ID range
+        into equal chunks for parallel processing.
         """
-        votes_partitions = []
+        params = context["params"]
+        partitions = []
+
+        # Get MSSQL connection for querying PK ranges
+        from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+        mssql_hook = MsSqlHook(mssql_conn_id=params["source_conn_id"])
 
         for table_info in created_tables:
-            if table_info['table_name'].lower() == 'votes' and table_info.get('row_count', 0) > 5_000_000:
-                # Split Votes table into 4 partitions based on VoteTypeId distribution
-                logger.info(f"Splitting Votes table ({table_info['row_count']:,} rows) into 4 partitions")
+            row_count = table_info.get('row_count', 0)
 
-                partitions = [
-                    {
-                        **table_info,
-                        'partition_name': 'partition_1',
-                        'where_clause': 'VoteTypeId IN (1,2)',
-                        'estimated_rows': table_info['row_count'] // 4,
-                        'truncate_first': True  # First partition truncates the table
-                    },
-                    {
-                        **table_info,
-                        'partition_name': 'partition_2',
-                        'where_clause': 'VoteTypeId IN (3,4,5)',
-                        'estimated_rows': table_info['row_count'] // 4,
-                        'truncate_first': False
-                    },
-                    {
-                        **table_info,
-                        'partition_name': 'partition_3',
-                        'where_clause': 'VoteTypeId IN (6,7,8,9,10)',
-                        'estimated_rows': table_info['row_count'] // 4,
-                        'truncate_first': False
-                    },
-                    {
-                        **table_info,
-                        'partition_name': 'partition_4',
-                        'where_clause': 'VoteTypeId > 10 OR VoteTypeId IS NULL',
-                        'estimated_rows': table_info['row_count'] // 4,
-                        'truncate_first': False
-                    }
-                ]
-                votes_partitions.extend(partitions)
-                break  # Only one Votes table
+            if row_count < LARGE_TABLE_THRESHOLD:
+                continue
 
-        logger.info(f"Created {len(votes_partitions)} Votes partitions")
-        return votes_partitions
+            table_name = table_info['table_name']
+            source_schema = table_info.get('source_schema', params.get('source_schema', 'dbo'))
+
+            # Find primary key column
+            pk_column = table_info.get('primary_key')
+            if not pk_column:
+                # Query for primary key column
+                pk_query = f"""
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                    WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+                    AND TABLE_SCHEMA = '{source_schema}'
+                    AND TABLE_NAME = '{table_name}'
+                    ORDER BY ORDINAL_POSITION
+                """
+                pk_result = mssql_hook.get_first(pk_query)
+                pk_column = pk_result[0] if pk_result else 'Id'
+
+            logger.info(f"Partitioning {table_name} by [{pk_column}] ({row_count:,} rows)")
+
+            # Get min/max values for the primary key
+            range_query = f"SELECT MIN([{pk_column}]), MAX([{pk_column}]) FROM [{source_schema}].[{table_name}]"
+            min_max = mssql_hook.get_first(range_query)
+
+            if not min_max or min_max[0] is None:
+                logger.warning(f"Could not get PK range for {table_name}, skipping partitioning")
+                continue
+
+            min_id, max_id = min_max[0], min_max[1]
+            id_range = max_id - min_id + 1
+            chunk_size = id_range // PARTITION_COUNT
+
+            logger.info(f"  PK range: {min_id:,} to {max_id:,} (chunk size: {chunk_size:,})")
+
+            # Create partitions based on PK ranges
+            for i in range(PARTITION_COUNT):
+                start_id = min_id + (i * chunk_size)
+
+                if i == PARTITION_COUNT - 1:
+                    # Last partition gets everything remaining
+                    where_clause = f"[{pk_column}] >= {start_id}"
+                else:
+                    end_id = min_id + ((i + 1) * chunk_size) - 1
+                    where_clause = f"[{pk_column}] >= {start_id} AND [{pk_column}] <= {end_id}"
+
+                partition_info = {
+                    **table_info,
+                    'partition_name': f'partition_{i + 1}',
+                    'partition_index': i,
+                    'where_clause': where_clause,
+                    'pk_column': pk_column,
+                    'estimated_rows': row_count // PARTITION_COUNT,
+                    'truncate_first': i == 0  # Only first partition truncates
+                }
+                partitions.append(partition_info)
+
+            logger.info(f"  Created {PARTITION_COUNT} partitions for {table_name}")
+
+        logger.info(f"Total: {len(partitions)} partitions across {len(partitions) // PARTITION_COUNT if partitions else 0} large tables")
+        return partitions
 
     @task
     def transfer_table_data(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
@@ -325,20 +367,24 @@ def mssql_to_postgres_migration():
         return result
 
     @task
-    def transfer_votes_partition(partition_info: Dict[str, Any], **context) -> Dict[str, Any]:
+    def transfer_partition(partition_info: Dict[str, Any], **context) -> Dict[str, Any]:
         """
-        Transfer a partition of the Votes table in parallel.
+        Transfer a partition of a large table in parallel.
+
+        Works with any table that has been partitioned by primary key range.
 
         Args:
-            partition_info: Partition information including WHERE clause
+            partition_info: Partition information including WHERE clause and table details
 
         Returns:
             Transfer result dictionary with statistics
         """
         params = context["params"]
+        table_name = partition_info['table_name']
+        partition_name = partition_info['partition_name']
 
         logger.info(
-            f"Starting Votes partition transfer: {partition_info['partition_name']} "
+            f"Starting {table_name} {partition_name} transfer "
             f"(estimated {partition_info.get('estimated_rows', 0):,} rows)"
         )
 
@@ -352,20 +398,20 @@ def mssql_to_postgres_migration():
             where_clause=partition_info.get('where_clause')
         )
 
-        # Add table name to result (same as regular tables for compatibility)
-        result["table_name"] = "Votes"
-        result["partition_name"] = partition_info['partition_name']
-        result["is_partition"] = True  # Mark this as a partition for downstream processing
+        # Add metadata to result for downstream processing
+        result["table_name"] = table_name
+        result["partition_name"] = partition_name
+        result["is_partition"] = True
 
         if result["success"]:
             logger.info(
-                f"✓ Votes {partition_info['partition_name']}: Transferred {result['rows_transferred']:,} rows "
+                f"✓ {table_name} {partition_name}: Transferred {result['rows_transferred']:,} rows "
                 f"in {result['elapsed_time_seconds']:.2f}s "
                 f"({result['avg_rows_per_second']:,.0f} rows/sec)"
             )
         else:
             logger.error(
-                f"✗ Votes {partition_info['partition_name']}: Transfer failed. "
+                f"✗ {table_name} {partition_name}: Transfer failed. "
                 f"Errors: {result.get('errors', [])}"
             )
 
@@ -648,22 +694,22 @@ def mssql_to_postgres_migration():
     schema_status = create_target_schema(schema_name="{{ params.target_schema }}")
     created_tables = create_target_tables(schema_data, schema_status)
 
-    # Prepare transfer tasks, splitting Votes table if needed
+    # Prepare transfer tasks - partition any large tables (>5M rows)
     regular_tables = prepare_regular_tables(created_tables)
-    votes_partitions = prepare_votes_partitions(created_tables)
+    large_table_partitions = prepare_large_table_partitions(created_tables)
 
-    # Transfer regular tables and Votes partitions in parallel
+    # Transfer regular tables and large table partitions in parallel
     regular_transfer_results = transfer_table_data.expand(
         table_info=regular_tables
     )
-    votes_transfer_results = transfer_votes_partition.expand(
-        partition_info=votes_partitions
+    partition_transfer_results = transfer_partition.expand(
+        partition_info=large_table_partitions
     )
 
-    # Collect all transfer results (both regular tables and Votes partitions)
+    # Collect all transfer results (both regular tables and partitioned large tables)
     @task(trigger_rule="all_done")
     def collect_all_results(**context) -> List[Dict[str, Any]]:
-        """Collect results from all transfer tasks."""
+        """Collect and aggregate results from all transfer tasks."""
         ti = context['ti']
         all_results = []
 
@@ -672,37 +718,47 @@ def mssql_to_postgres_migration():
             regular = ti.xcom_pull(task_ids='transfer_table_data', map_indexes=None)
             if regular:
                 if isinstance(regular, list):
-                    all_results.extend(regular)
+                    all_results.extend([r for r in regular if r])
                 else:
                     all_results.append(regular)
         except:
             pass
 
-        # Get votes partition results - aggregate them into one Votes result
+        # Get partition results and aggregate by table name
         try:
-            votes = ti.xcom_pull(task_ids='transfer_votes_partition', map_indexes=None)
-            if votes:
-                if not isinstance(votes, list):
-                    votes = [votes]
+            partitions = ti.xcom_pull(task_ids='transfer_partition', map_indexes=None)
+            if partitions:
+                if not isinstance(partitions, list):
+                    partitions = [partitions]
 
-                # Aggregate all Votes partitions into a single result
-                if votes:
-                    total_rows = sum(v.get('rows_transferred', 0) for v in votes if v)
-                    success = all(v.get('success', False) for v in votes if v)
+                # Group partitions by table name
+                from collections import defaultdict
+                table_partitions = defaultdict(list)
+                for p in partitions:
+                    if p:
+                        table_partitions[p.get('table_name', 'Unknown')].append(p)
+
+                # Aggregate each table's partitions into a single result
+                for table_name, parts in table_partitions.items():
+                    total_rows = sum(p.get('rows_transferred', 0) for p in parts)
+                    success = all(p.get('success', False) for p in parts)
 
                     all_results.append({
-                        'table_name': 'Votes',
+                        'table_name': table_name,
                         'rows_transferred': total_rows,
-                        'success': success
+                        'success': success,
+                        'partitions_processed': len(parts)
                     })
+                    logger.info(f"Aggregated {len(parts)} partitions for {table_name}: {total_rows:,} total rows")
         except:
             pass
 
+        logger.info(f"Collected results for {len(all_results)} tables")
         return all_results
 
     # Collect all results
     transfer_results = collect_all_results()
-    [regular_transfer_results, votes_transfer_results] >> transfer_results
+    [regular_transfer_results, partition_transfer_results] >> transfer_results
 
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)
