@@ -269,15 +269,15 @@ def mssql_to_postgres_migration():
             pk_column = table_info.get('primary_key')
             if not pk_column:
                 # Query for primary key column
-                pk_query = f"""
+                pk_query = """
                     SELECT COLUMN_NAME
                     FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
                     WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
-                    AND TABLE_SCHEMA = '{source_schema}'
-                    AND TABLE_NAME = '{table_name}'
+                    AND TABLE_SCHEMA = %s
+                    AND TABLE_NAME = %s
                     ORDER BY ORDINAL_POSITION
                 """
-                pk_result = mssql_hook.get_first(pk_query)
+                pk_result = mssql_hook.get_first(pk_query, parameters=[source_schema, table_name])
                 pk_column = pk_result[0] if pk_result else 'Id'
 
             logger.info(f"Partitioning {table_name} by [{pk_column}] ({row_count:,} rows)")
