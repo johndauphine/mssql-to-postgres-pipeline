@@ -19,6 +19,7 @@ from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any
 import logging
+import re
 
 # Import our custom migration modules
 from include.mssql_pg_migration import (
@@ -29,6 +30,41 @@ from include.mssql_pg_migration import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_sql_identifier(identifier: str, identifier_type: str = "identifier") -> str:
+    """
+    Validate and sanitize SQL identifiers to prevent SQL injection.
+    
+    SQL identifiers (table names, column names, schema names) must:
+    - Start with a letter or underscore
+    - Contain only alphanumeric characters and underscores
+    - Be 128 characters or less (SQL Server limit)
+    
+    Args:
+        identifier: The SQL identifier to validate
+        identifier_type: Type of identifier (for error messages)
+    
+    Returns:
+        The validated identifier
+        
+    Raises:
+        ValueError: If the identifier is invalid or potentially unsafe
+    """
+    if not identifier:
+        raise ValueError(f"Invalid {identifier_type}: cannot be empty")
+    
+    if len(identifier) > 128:
+        raise ValueError(f"Invalid {identifier_type}: exceeds maximum length of 128 characters")
+    
+    # SQL identifiers must start with letter or underscore, contain only alphanumeric and underscore
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        raise ValueError(
+            f"Invalid {identifier_type} '{identifier}': must start with letter or underscore "
+            "and contain only alphanumeric characters and underscores"
+        )
+    
+    return identifier
 
 
 @dag(
@@ -265,6 +301,15 @@ def mssql_to_postgres_migration():
             table_name = table_info['table_name']
             source_schema = table_info.get('source_schema', params.get('source_schema', 'dbo'))
 
+            # Validate SQL identifiers to prevent SQL injection
+            try:
+                safe_table_name = validate_sql_identifier(table_name, "table name")
+                safe_source_schema = validate_sql_identifier(source_schema, "schema name")
+            except ValueError as e:
+                # Don't log the potentially malicious identifier value directly
+                logger.error(f"Invalid SQL identifier during table validation: {e}")
+                continue
+
             # Find primary key column
             pk_column = table_info.get('primary_key')
             if not pk_column:
@@ -277,22 +322,36 @@ def mssql_to_postgres_migration():
                     AND TABLE_NAME = %s
                     ORDER BY ORDINAL_POSITION
                 """
-                pk_result = mssql_hook.get_first(pk_query, parameters=[source_schema, table_name])
+                pk_result = mssql_hook.get_first(pk_query, parameters=[safe_source_schema, safe_table_name])
                 pk_column = pk_result[0] if pk_result else 'Id'
 
-            logger.info(f"Partitioning {table_name} by [{pk_column}] ({row_count:,} rows)")
+            # Validate primary key column name
+            try:
+                safe_pk_column = validate_sql_identifier(pk_column, "primary key column")
+            except ValueError as e:
+                # Use safe_table_name since it's already validated
+                logger.error(f"Invalid primary key column for table {safe_table_name}: {e}")
+                continue
+
+            logger.info(f"Partitioning {safe_table_name} by [{safe_pk_column}] ({row_count:,} rows)")
 
             # Get min/max values for the primary key
-            range_query = f"SELECT MIN([{pk_column}]), MAX([{pk_column}]) FROM [{source_schema}].[{table_name}]"
+            range_query = f"SELECT MIN([{safe_pk_column}]), MAX([{safe_pk_column}]) FROM [{safe_source_schema}].[{safe_table_name}]"
             min_max = mssql_hook.get_first(range_query)
 
             if not min_max or min_max[0] is None:
-                logger.warning(f"Could not get PK range for {table_name}, skipping partitioning")
+                logger.warning(f"Could not get PK range for {safe_table_name}, skipping partitioning")
                 continue
 
             min_id, max_id = min_max[0], min_max[1]
+            
+            # Validate that min_id and max_id are integers to prevent SQL injection and precision issues
+            if not isinstance(min_id, int) or not isinstance(max_id, int):
+                logger.error(f"Primary key range for {safe_table_name} must be integer: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
+                continue
+            
             if max_id < min_id:
-                logger.warning(f"Invalid PK range for {table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
+                logger.warning(f"Invalid PK range for {safe_table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
                 continue
             id_range = max_id - min_id + 1
             chunk_size = id_range // PARTITION_COUNT
@@ -305,23 +364,23 @@ def mssql_to_postgres_migration():
 
                 if i == PARTITION_COUNT - 1:
                     # Last partition gets everything remaining
-                    where_clause = f"[{pk_column}] >= {start_id}"
+                    where_clause = f"[{safe_pk_column}] >= {start_id}"
                 else:
                     end_id = min_id + ((i + 1) * chunk_size) - 1
-                    where_clause = f"[{pk_column}] >= {start_id} AND [{pk_column}] <= {end_id}"
+                    where_clause = f"[{safe_pk_column}] >= {start_id} AND [{safe_pk_column}] <= {end_id}"
 
                 partition_info = {
                     **table_info,
                     'partition_name': f'partition_{i + 1}',
                     'partition_index': i,
                     'where_clause': where_clause,
-                    'pk_column': pk_column,
+                    'pk_column': safe_pk_column,
                     'estimated_rows': row_count // PARTITION_COUNT,
                     'truncate_first': i == 0  # Only first partition truncates
                 }
                 partitions.append(partition_info)
 
-            logger.info(f"  Created {PARTITION_COUNT} partitions for {table_name}")
+            logger.info(f"  Created {PARTITION_COUNT} partitions for {safe_table_name}")
 
         logger.info(f"Total: {len(partitions)} partitions across {len(partitions) // PARTITION_COUNT if partitions else 0} large tables")
         return partitions
