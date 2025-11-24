@@ -701,13 +701,62 @@ def mssql_to_postgres_migration():
     regular_tables = prepare_regular_tables(created_tables)
     large_table_partitions = prepare_large_table_partitions(created_tables)
 
-    # Transfer regular tables and large table partitions in parallel
+    # Split partitions into first (truncates) and remaining (no truncate)
+    @task
+    def split_partitions(partitions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Split partitions into first partitions (that truncate) and remaining partitions.
+        This prevents race conditions where non-truncating partitions might insert
+        data before truncating partitions complete.
+        """
+        first_partitions = []
+        remaining_partitions = []
+        
+        for partition in partitions:
+            if partition.get('truncate_first', False):
+                first_partitions.append(partition)
+            else:
+                remaining_partitions.append(partition)
+        
+        logger.info(f"Split {len(partitions)} partitions: {len(first_partitions)} first, {len(remaining_partitions)} remaining")
+        return {
+            'first': first_partitions,
+            'remaining': remaining_partitions
+        }
+    
+    partition_groups = split_partitions(large_table_partitions)
+
+    # Transfer regular tables in parallel
     regular_transfer_results = transfer_table_data.expand(
         table_info=regular_tables
     )
-    partition_transfer_results = transfer_partition.expand(
-        partition_info=large_table_partitions
+    
+    # Transfer first partitions (with truncate) - must complete before remaining partitions
+    @task
+    def get_first_partitions(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract first partitions from partition groups."""
+        return groups.get('first', [])
+    
+    @task
+    def get_remaining_partitions(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract remaining partitions from partition groups."""
+        return groups.get('remaining', [])
+    
+    first_partitions_list = get_first_partitions(partition_groups)
+    remaining_partitions_list = get_remaining_partitions(partition_groups)
+    
+    # Transfer first partitions (these do the truncate operation)
+    first_partition_results = transfer_partition.expand(
+        partition_info=first_partitions_list
     )
+    
+    # Transfer remaining partitions AFTER first partitions complete (prevents race condition)
+    remaining_partition_results = transfer_partition.expand(
+        partition_info=remaining_partitions_list
+    )
+    
+    # Ensure first partitions complete before remaining partitions start
+    first_partition_results >> remaining_partition_results
 
     # Collect all transfer results (both regular tables and partitioned large tables)
     @task(trigger_rule="all_done")
@@ -727,41 +776,44 @@ def mssql_to_postgres_migration():
         except:
             pass
 
-        # Get partition results and aggregate by table name
-        try:
-            partitions = ti.xcom_pull(task_ids='transfer_partition', map_indexes=None)
-            if partitions:
-                if not isinstance(partitions, list):
-                    partitions = [partitions]
+        # Get partition results from both first and remaining partitions and aggregate by table name
+        from collections import defaultdict
+        table_partitions = defaultdict(list)
+        
+        # Collect all partition results (both first and remaining)
+        for task_id in ['transfer_partition']:
+            try:
+                partitions = ti.xcom_pull(task_ids=task_id, map_indexes=None)
+                if partitions:
+                    if not isinstance(partitions, list):
+                        partitions = [partitions]
 
-                # Group partitions by table name
-                from collections import defaultdict
-                table_partitions = defaultdict(list)
-                for p in partitions:
-                    if p:
-                        table_partitions[p.get('table_name', 'Unknown')].append(p)
+                    # Group partitions by table name
+                    for p in partitions:
+                        if p:
+                            table_partitions[p.get('table_name', 'Unknown')].append(p)
+            except:
+                pass
 
-                # Aggregate each table's partitions into a single result
-                for table_name, parts in table_partitions.items():
-                    total_rows = sum(p.get('rows_transferred', 0) for p in parts)
-                    success = all(p.get('success', False) for p in parts)
+        # Aggregate each table's partitions into a single result
+        for table_name, parts in table_partitions.items():
+            total_rows = sum(p.get('rows_transferred', 0) for p in parts)
+            success = all(p.get('success', False) for p in parts)
 
-                    all_results.append({
-                        'table_name': table_name,
-                        'rows_transferred': total_rows,
-                        'success': success,
-                        'partitions_processed': len(parts)
-                    })
-                    logger.info(f"Aggregated {len(parts)} partitions for {table_name}: {total_rows:,} total rows")
-        except:
-            pass
+            all_results.append({
+                'table_name': table_name,
+                'rows_transferred': total_rows,
+                'success': success,
+                'partitions_processed': len(parts)
+            })
+            logger.info(f"Aggregated {len(parts)} partitions for {table_name}: {total_rows:,} total rows")
 
         logger.info(f"Collected results for {len(all_results)} tables")
         return all_results
 
     # Collect all results
     transfer_results = collect_all_results()
-    [regular_transfer_results, partition_transfer_results] >> transfer_results
+    [regular_transfer_results, first_partition_results, remaining_partition_results] >> transfer_results
 
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)
