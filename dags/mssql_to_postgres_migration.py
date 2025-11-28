@@ -841,18 +841,22 @@ def mssql_to_postgres_migration():
     remaining_partitions_list = get_remaining_partitions(partition_groups)
     
     # Transfer first partitions (these do the truncate operation)
+    # All first partitions from different tables run in parallel with each other
     first_partition_results = transfer_partition.expand(
         partition_info=first_partitions_list
     )
-    
-    # Transfer remaining partitions AFTER first partitions complete (prevents race condition)
+
+    # Transfer remaining partitions AFTER first partitions complete
+    # All remaining partitions run in parallel with each other, but wait for ALL
+    # first partitions to complete to prevent race conditions with truncate operations
     remaining_partition_results = transfer_partition.expand(
         partition_info=remaining_partitions_list
     )
-    
-    # Allow all partitions to run in parallel for better performance
-    # The truncate_first flag in partition_info handles preventing race conditions
-    # first_partition_results >> remaining_partition_results  # Removed: was forcing sequential execution
+
+    # IMPORTANT: First partitions MUST complete before remaining partitions start
+    # This prevents a race condition where the truncate operation in first partitions
+    # would delete data already written by other partitions
+    first_partition_results >> remaining_partition_results
 
     # Collect all transfer results (both regular tables and partitioned large tables)
     @task(trigger_rule="all_done")
