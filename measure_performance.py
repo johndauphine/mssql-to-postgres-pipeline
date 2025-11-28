@@ -6,7 +6,6 @@ Compares single-threaded vs partitioned transfer.
 
 import time
 import pymssql
-import pg8000.native
 from datetime import datetime
 
 def measure_single_transfer():
