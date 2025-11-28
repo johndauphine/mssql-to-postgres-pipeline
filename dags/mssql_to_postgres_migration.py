@@ -850,8 +850,9 @@ def mssql_to_postgres_migration():
         partition_info=remaining_partitions_list
     )
     
-    # Ensure first partitions complete before remaining partitions start
-    first_partition_results >> remaining_partition_results
+    # Allow all partitions to run in parallel for better performance
+    # The truncate_first flag in partition_info handles preventing race conditions
+    # first_partition_results >> remaining_partition_results  # Removed: was forcing sequential execution
 
     # Collect all transfer results (both regular tables and partitioned large tables)
     @task(trigger_rule="all_done")
