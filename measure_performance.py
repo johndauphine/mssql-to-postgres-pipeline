@@ -110,10 +110,10 @@ def measure_partitioned_transfer():
     # Estimate total time with parallelization
     avg_partition_time = sum(partition_times) / len(partition_times)
 
-    # With our fix: first 4 partitions (truncate), then 8 remaining in parallel
-    # Assuming pool size of 12, all can run in parallel within each group
-    estimated_time_first_group = avg_partition_time  # 4 partitions in parallel
-    estimated_time_second_group = avg_partition_time  # 8 partitions in parallel
+    # Estimate total time as two rounds of parallel execution (e.g., if pool size < partition count),
+    # each round taking approximately the average partition time measured above.
+    estimated_time_first_group = avg_partition_time
+    estimated_time_second_group = avg_partition_time
     estimated_total_time = estimated_time_first_group + estimated_time_second_group
 
     print(f"\nEstimated total time with parallelization: {estimated_total_time:.2f} seconds")
