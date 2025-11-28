@@ -80,10 +80,18 @@ echo ""
 echo "2. CHECKING CONTAINERS"
 echo "======================"
 
+# Detect the container prefix dynamically
+CONTAINER_PREFIX=$(docker ps --format "{{.Names}}" | grep "mssql-to-postgres-pipeline.*-scheduler-1" | head -1 | sed 's/-scheduler-1//')
+if [ -z "$CONTAINER_PREFIX" ]; then
+    echo -e "${RED}✗ Could not find Airflow containers${NC}"
+    echo "Please run 'astro dev start' first"
+    exit 1
+fi
+
 # Check Airflow containers
-check_container "mssql-to-postgres-pipeline_9be67b-scheduler-1"
-check_container "mssql-to-postgres-pipeline_9be67b-api-server-1"
-check_container "mssql-to-postgres-pipeline_9be67b-dag-processor-1"
+check_container "${CONTAINER_PREFIX}-scheduler-1"
+check_container "${CONTAINER_PREFIX}-api-server-1"
+check_container "${CONTAINER_PREFIX}-dag-processor-1"
 
 # Check database containers
 check_container "mssql-server"
@@ -106,7 +114,7 @@ echo "4. DATABASE CONNECTIVITY"
 echo "========================"
 
 # Test SQL Server connection
-run_test "SQL Server Connection" "docker exec mssql-to-postgres-pipeline_9be67b-scheduler-1 python -c \"
+run_test "SQL Server Connection" "docker exec ${CONTAINER_PREFIX}-scheduler-1 python -c \"
 import pymssql
 conn = pymssql.connect(server='mssql-server', port=1433, database='StackOverflow2010', user='sa', password='YourStrong@Passw0rd')
 cursor = conn.cursor()
@@ -117,7 +125,7 @@ conn.close()
 \""
 
 # Test PostgreSQL connection
-run_test "PostgreSQL Connection" "docker exec mssql-to-postgres-pipeline_9be67b-scheduler-1 python -c \"
+run_test "PostgreSQL Connection" "docker exec ${CONTAINER_PREFIX}-scheduler-1 python -c \"
 import pg8000
 conn = pg8000.connect(host='postgres-target', port=5432, database='stackoverflow', user='postgres', password='PostgresPassword123')
 cursor = conn.cursor()
@@ -167,7 +175,7 @@ echo "=================="
 
 # Run detailed validation check
 echo "Running detailed validation..."
-docker exec mssql-to-postgres-pipeline_9be67b-scheduler-1 python -c "
+docker exec ${CONTAINER_PREFIX}-scheduler-1 python -c "
 import pymssql
 import pg8000
 

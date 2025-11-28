@@ -256,25 +256,49 @@ def mssql_to_postgres_migration():
         return created_tables
 
     # Threshold for partitioning large tables (rows)
-    LARGE_TABLE_THRESHOLD = 5_000_000
-    PARTITION_COUNT = 4
+    # Lowered from 5M to 1M to catch more tables for better parallelization
+    LARGE_TABLE_THRESHOLD = 1_000_000
+
+    def get_partition_count(row_count: int) -> int:
+        """
+        Calculate optimal partition count based on table size.
+
+        Dynamically scales partitions to ensure optimal performance:
+        - Small tables (1-2M): 2 partitions
+        - Medium tables (2-5M): 4 partitions
+        - Large tables (5-10M): 8 partitions
+        - Very large tables (10M+): 12 partitions
+        """
+        if row_count < 2_000_000:
+            return 2
+        elif row_count < 5_000_000:
+            return 4
+        elif row_count < 10_000_000:
+            return 8
+        else:
+            return 12
 
     @task
     def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
         """
         Filter out tables that are small enough to transfer without partitioning.
-        Large tables (>5M rows) will be handled by partition transfer.
+        Large tables (>1M rows) will be handled by partition transfer.
         """
         regular_tables = []
 
+        logger.info(f"Categorizing {len(created_tables)} tables for transfer strategy...")
+
         for table_info in created_tables:
             row_count = table_info.get('row_count', 0)
+            table_name = table_info['table_name']
+
             if row_count < LARGE_TABLE_THRESHOLD:
                 regular_tables.append(table_info)
+                logger.info(f"  {table_name} ({row_count:,} rows) → regular transfer")
             else:
-                logger.info(f"Table {table_info['table_name']} ({row_count:,} rows) will be partitioned")
+                logger.info(f"  {table_name} ({row_count:,} rows) → will be partitioned")
 
-        logger.info(f"Prepared {len(regular_tables)} regular tables for transfer")
+        logger.info(f"Summary: {len(regular_tables)} regular tables, {len(created_tables) - len(regular_tables)} to be partitioned")
         return regular_tables
 
     @task
@@ -294,11 +318,17 @@ def mssql_to_postgres_migration():
 
         for table_info in created_tables:
             row_count = table_info.get('row_count', 0)
+            table_name = table_info['table_name']
+
+            # Defensive logging to track partitioning decisions
+            logger.info(f"Evaluating {table_name}: {row_count:,} rows (threshold: {LARGE_TABLE_THRESHOLD:,})")
 
             if row_count < LARGE_TABLE_THRESHOLD:
+                logger.info(f"  → {table_name} will use regular transfer (below threshold)")
                 continue
 
-            table_name = table_info['table_name']
+            logger.info(f"  → {table_name} will be partitioned (above threshold)")
+
             source_schema = table_info.get('source_schema', params.get('source_schema', 'dbo'))
 
             # Validate SQL identifiers to prevent SQL injection
@@ -354,15 +384,19 @@ def mssql_to_postgres_migration():
                 logger.warning(f"Invalid PK range for {safe_table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
                 continue
             id_range = max_id - min_id + 1
-            chunk_size = id_range // PARTITION_COUNT
 
-            logger.info(f"  PK range: {min_id:,} to {max_id:,} (chunk size: {chunk_size:,})")
+            # Use dynamic partition count based on table size
+            partition_count = get_partition_count(row_count)
+            chunk_size = id_range // partition_count
+
+            logger.info(f"  PK range: {min_id:,} to {max_id:,}")
+            logger.info(f"  Using {partition_count} partitions (chunk size: {chunk_size:,} IDs)")
 
             # Create partitions based on PK ranges
-            for i in range(PARTITION_COUNT):
+            for i in range(partition_count):
                 start_id = min_id + (i * chunk_size)
 
-                if i == PARTITION_COUNT - 1:
+                if i == partition_count - 1:
                     # Last partition gets everything remaining
                     where_clause = f"[{safe_pk_column}] >= {start_id}"
                 else:
@@ -375,14 +409,16 @@ def mssql_to_postgres_migration():
                     'partition_index': i,
                     'where_clause': where_clause,
                     'pk_column': safe_pk_column,
-                    'estimated_rows': row_count // PARTITION_COUNT,
+                    'estimated_rows': row_count // partition_count,
                     'truncate_first': i == 0  # Only first partition truncates
                 }
                 partitions.append(partition_info)
 
-            logger.info(f"  Created {PARTITION_COUNT} partitions for {safe_table_name}")
+            logger.info(f"  Created {partition_count} partitions for {safe_table_name}")
 
-        logger.info(f"Total: {len(partitions)} partitions across {len(partitions) // PARTITION_COUNT if partitions else 0} large tables")
+        # Calculate total number of partitioned tables
+        partitioned_tables = len(set(p['table_name'] for p in partitions)) if partitions else 0
+        logger.info(f"Total: {len(partitions)} partitions across {partitioned_tables} large tables")
         return partitions
 
     @task
