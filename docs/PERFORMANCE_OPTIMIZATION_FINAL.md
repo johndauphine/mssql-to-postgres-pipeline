@@ -95,7 +95,7 @@ Through systematic performance testing and optimization, we achieved a **26% imp
 - Multiple parallel reads/writes saturate disk subsystem
 - Cannot optimize further without native filesystem access
 
-### 3. Airflow Configuration (Resolved)
+### 3. Airflow Configuration (Optimized but Not Bottleneck)
 
 **Initial Issue:**
 - 22 partition tasks but only 16 max concurrent tasks
@@ -104,7 +104,14 @@ Through systematic performance testing and optimization, we achieved a **26% imp
 **Solution:**
 - Increased `max_active_tasks_per_dag` from 16 to 32
 - All partitions can now run in parallel
-- Did not improve overall time (disk I/O bound)
+
+**Result:**
+- **No performance improvement** (141s before and after)
+- Confirms disk I/O is the bottleneck, not task queuing
+- **Kept as defensive optimization** - provides headroom for:
+  - Future workloads with more partitions
+  - Additional parallel DAGs
+  - Prevents re-optimization if data volume increases
 
 ---
 
@@ -141,25 +148,30 @@ ENV AIRFLOW__CELERY__WORKER_CONCURRENCY=32
 
 ## Optimal Configuration
 
-Based on testing, the **sweet spot** for this workload is:
+Based on testing, the **truly optimal** configuration for this workload is:
 
 ```yaml
 SQL Server:
-  cpus: 8
-  memory: 4GB
+  cpus: 8              # Provides maximum benefit before I/O bottleneck
+  memory: 4GB          # Sufficient (only uses ~3GB)
 
 PostgreSQL:
-  cpus: 6
-  memory: 4GB
+  cpus: 6              # Handles parallel writes efficiently
+  memory: 4GB          # More than enough (only uses ~700MB)
 
 Airflow:
-  max_active_tasks_per_dag: 32
+  max_active_tasks_per_dag: 32  # Defensive optimization (16 would work)
 ```
 
-**Justification:**
-- 8 CPUs provide maximum benefit before disk I/O bottleneck
-- Additional CPU/memory beyond this shows diminishing returns
-- Higher settings retained for future workloads but not critical for current data volume
+**What Actually Improved Performance:**
+- ✅ CPU increase (2→8): **12% improvement** (160s → 141s)
+- ❌ CPU beyond 8: No benefit (disk I/O bound)
+- ❌ Memory increase: No benefit (not memory-constrained)
+- ❌ Airflow parallelism: No benefit (not task-queue bound)
+
+**What We Kept Anyway:**
+- Airflow 32 max tasks: Provides headroom for growth, no downside
+- Higher CPU settings available but not utilized due to I/O ceiling
 
 ---
 
