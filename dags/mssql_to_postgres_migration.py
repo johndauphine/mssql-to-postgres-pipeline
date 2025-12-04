@@ -72,6 +72,7 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
     schedule=None,  # Run manually or trigger via API
     catchup=False,
     max_active_runs=1,
+    max_active_tasks=64,  # Allow up to 64 concurrent tasks within this DAG
     is_paused_upon_creation=False,
     doc_md=__doc__,
     default_args={
@@ -80,6 +81,7 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
         "retry_delay": timedelta(seconds=30),
         "retry_exponential_backoff": False,
         "max_retry_delay": timedelta(minutes=30),
+        "pool": "default_pool",  # Use default pool for all tasks
     },
     params={
         "source_conn_id": Param(
@@ -266,17 +268,14 @@ def mssql_to_postgres_migration():
         Dynamically scales partitions to ensure optimal performance:
         - Small tables (1-2M): 2 partitions
         - Medium tables (2-5M): 4 partitions
-        - Large tables (5-10M): 8 partitions
-        - Very large tables (10M+): 12 partitions
+        - Large tables (5M+): 8 partitions (max)
         """
         if row_count < 2_000_000:
             return 2
         elif row_count < 5_000_000:
             return 4
-        elif row_count < 10_000_000:
-            return 8
         else:
-            return 12
+            return 8
 
     @task
     def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
