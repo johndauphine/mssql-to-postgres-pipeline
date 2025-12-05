@@ -7,3 +7,9 @@ logs/
 airflow.db
 airflow.cfg
 stackoverflow_db/
+StackOverflow2013_data/
+*.7z
+*.bak
+*.mdf
+*.ndf
+*.ldf

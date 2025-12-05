@@ -18,9 +18,9 @@ services:
       - ./stackoverflow_db:/tmp/stackoverflow_db
     networks:
       - migration_network
-    mem_limit: 4g
-    mem_reservation: 2g
-    cpus: 8
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 4
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P YourStrong@Passw0rd -Q 'SELECT 1' -C || exit 1"]
       interval: 30s
@@ -44,26 +44,26 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - migration_network
-    mem_limit: 4g
-    mem_reservation: 2g
-    cpus: 6
-    # Performance tuning for high parallelism
+    mem_limit: 1536m
+    mem_reservation: 768m
+    cpus: 3
+    # Performance tuning for constrained memory (16GB host)
     command:
       - "postgres"
       - "-c"
-      - "max_connections=200"
+      - "max_connections=100"
       - "-c"
-      - "shared_buffers=1GB"
+      - "shared_buffers=256MB"
       - "-c"
-      - "effective_cache_size=2GB"
+      - "effective_cache_size=512MB"
       - "-c"
-      - "maintenance_work_mem=256MB"
+      - "maintenance_work_mem=64MB"
       - "-c"
       - "checkpoint_completion_target=0.9"
       - "-c"
-      - "wal_buffers=64MB"
+      - "wal_buffers=16MB"
       - "-c"
-      - "max_wal_size=4GB"
+      - "max_wal_size=1GB"
       - "-c"
       - "synchronous_commit=off"
     healthcheck:
@@ -81,5 +81,5 @@ volumes:
 
 networks:
   migration_network:
-    name: mssql-to-postgres-pipeline_9be67b_airflow
+    name: mssql-to-postgres-pipeline_f4fd8c_airflow
     external: true

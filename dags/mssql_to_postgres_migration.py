@@ -72,7 +72,7 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
     schedule=None,  # Run manually or trigger via API
     catchup=False,
     max_active_runs=1,
-    max_active_tasks=64,  # Allow up to 64 concurrent tasks within this DAG
+    max_active_tasks=16,  # Reduced for 16GB RAM systems (was 64)
     is_paused_upon_creation=False,
     doc_md=__doc__,
     default_args={
@@ -265,17 +265,12 @@ def mssql_to_postgres_migration():
         """
         Calculate optimal partition count based on table size.
 
-        Dynamically scales partitions to ensure optimal performance:
-        - Small tables (1-2M): 2 partitions
-        - Medium tables (2-5M): 4 partitions
-        - Large tables (5M+): 8 partitions (max)
+        Caps at 4 partitions max for constrained memory systems (16GB RAM).
         """
         if row_count < 2_000_000:
             return 2
-        elif row_count < 5_000_000:
-            return 4
         else:
-            return 8
+            return 4  # Reduced from 8 for memory-constrained systems
 
     @task
     def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
