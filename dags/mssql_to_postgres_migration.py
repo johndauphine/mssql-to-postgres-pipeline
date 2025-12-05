@@ -265,12 +265,18 @@ def mssql_to_postgres_migration():
         """
         Calculate optimal partition count based on table size.
 
-        Caps at 4 partitions max for constrained memory systems (16GB RAM).
+        Reads MAX_PARTITIONS from environment (default: 8 for 32GB systems).
+        Set MAX_PARTITIONS=4 for 16GB systems.
         """
+        import os
+        max_partitions = int(os.environ.get('MAX_PARTITIONS', '8'))
+
         if row_count < 2_000_000:
-            return 2
+            return min(2, max_partitions)
+        elif row_count < 5_000_000:
+            return min(4, max_partitions)
         else:
-            return 4  # Reduced from 8 for memory-constrained systems
+            return max_partitions
 
     @task
     def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:

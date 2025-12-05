@@ -18,9 +18,9 @@ services:
       - ./stackoverflow_db:/tmp/stackoverflow_db
     networks:
       - migration_network
-    mem_limit: 2g
-    mem_reservation: 1g
-    cpus: 4
+    mem_limit: ${MSSQL_MEM_LIMIT:-4g}
+    mem_reservation: ${MSSQL_MEM_RESERVATION:-2g}
+    cpus: ${MSSQL_CPUS:-4}
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P YourStrong@Passw0rd -Q 'SELECT 1' -C || exit 1"]
       interval: 30s
@@ -44,20 +44,19 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - migration_network
-    mem_limit: 1536m
-    mem_reservation: 768m
-    cpus: 3
-    # Performance tuning for constrained memory (16GB host)
+    mem_limit: ${PG_MEM_LIMIT:-3g}
+    mem_reservation: ${PG_MEM_RESERVATION:-1536m}
+    cpus: ${PG_CPUS:-4}
     command:
       - "postgres"
       - "-c"
       - "max_connections=100"
       - "-c"
-      - "shared_buffers=256MB"
+      - "shared_buffers=${PG_SHARED_BUFFERS:-512MB}"
       - "-c"
-      - "effective_cache_size=512MB"
+      - "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}"
       - "-c"
-      - "maintenance_work_mem=64MB"
+      - "maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}"
       - "-c"
       - "checkpoint_completion_target=0.9"
       - "-c"
