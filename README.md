@@ -90,12 +90,33 @@ A standalone `validate_migration_env` DAG handles validation separately to avoid
 | Date/Time | `date`, `time`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset` | `DATE`, `TIME`, `TIMESTAMP` |
 | Other | `uniqueidentifier`, `xml`, `geography`, `geometry` | `UUID`, `XML`, `GEOGRAPHY`, `GEOMETRY` |
 
+## Quick Start
+
+Migrate any SQL Server database to PostgreSQL in 3 steps:
+
+```bash
+# 1. Configure your databases
+cp .env.example .env
+# Edit .env with your source/target database details
+
+# 2. Start the stack
+astro dev start                    # With Astronomer
+# OR
+docker-compose up -d               # Standalone Docker
+
+# 3. Setup connections and run migration
+./scripts/setup_connections.sh     # Creates Airflow connections from .env
+airflow dags trigger mssql_to_postgres_migration
+```
+
+See [Configuration](#configuration) for details on connecting to remote databases.
+
 ## Getting Started
 
 ### Prerequisites
 
 - Docker Desktop (4GB+ RAM recommended per database container)
-- [Astronomer CLI](https://www.astronomer.io/docs/astro/cli/install-cli)
+- [Astronomer CLI](https://www.astronomer.io/docs/astro/cli/install-cli) (optional - can use standalone Docker)
 - Access to source SQL Server and target PostgreSQL databases
 
 ### Installation
@@ -106,61 +127,79 @@ A standalone `validate_migration_env` DAG handles validation separately to avoid
    cd mssql-to-postgres-pipeline
    ```
 
-2. Start Airflow locally:
+2. Configure your environment:
+   ```bash
+   cp .env.example .env
+   # Edit .env with your database connection details
+   ```
+
+3. Start Airflow locally:
    ```bash
    astro dev start
    ```
 
-3. Access the Airflow UI at http://localhost:8080
+4. Setup database connections:
+   ```bash
+   # Run inside the scheduler container
+   ./scripts/setup_connections.sh
+   ```
 
-### Configure Database Connections
+5. Access the Airflow UI at http://localhost:8080
 
-Add connections via the Airflow CLI or UI:
+## Configuration
+
+All configuration is done through the `.env` file. Copy `.env.example` to `.env` and edit:
+
+### Database Connections
 
 ```bash
-# SQL Server source
-docker exec <scheduler-container> airflow connections add mssql_source \
-  --conn-type mssql \
-  --conn-host your-sqlserver-host \
-  --conn-schema your_database \
-  --conn-login username \
-  --conn-password 'password' \
-  --conn-port 1433
+# =============================================================================
+# SOURCE DATABASE (MSSQL)
+# =============================================================================
+# Host can be: Docker container name, IP, hostname, or cloud endpoint
+MSSQL_HOST=mssql-server              # Local Docker
+# MSSQL_HOST=192.168.1.100           # Remote IP
+# MSSQL_HOST=myserver.database.windows.net  # Azure SQL
 
-# PostgreSQL target
-docker exec <scheduler-container> airflow connections add postgres_target \
-  --conn-type postgres \
-  --conn-host your-postgres-host \
-  --conn-schema target_database \
-  --conn-login username \
-  --conn-password 'password' \
-  --conn-port 5432
+MSSQL_PORT=1433
+MSSQL_USER=sa
+MSSQL_PASSWORD=YourStrong@Passw0rd
+MSSQL_DATABASE=StackOverflow2013
+
+# =============================================================================
+# TARGET DATABASE (PostgreSQL)
+# =============================================================================
+PG_HOST=postgres-target              # Local Docker
+# PG_HOST=mydb.abc123.rds.amazonaws.com  # AWS RDS
+
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=PostgresPassword123
+PG_DATABASE=stackoverflow
 ```
 
-Or configure in `airflow_settings.yaml`:
+### Resource Settings
 
-```yaml
-connections:
-  - conn_id: mssql_source
-    conn_type: mssql
-    conn_host: your-sqlserver-host
-    conn_schema: your_database
-    conn_login: username
-    conn_password: password
-    conn_port: 1433
+The `.env` file also contains resource presets for different machine sizes:
 
-  - conn_id: postgres_target
-    conn_type: postgres
-    conn_host: your-postgres-host
-    conn_schema: target_database
-    conn_login: username
-    conn_password: password
-    conn_port: 5432
-```
+| RAM | Preset |
+|-----|--------|
+| 16GB | Conservative settings for laptops |
+| 32GB | Default balanced settings |
+| 64GB+ | High performance settings |
 
-Then restart Airflow to load the connections:
+Uncomment the appropriate preset section for your machine.
+
+### Applying Connection Changes
+
+After editing `.env`, recreate the Airflow connections:
+
 ```bash
-astro dev restart
+# Inside the scheduler container
+./scripts/setup_connections.sh
+
+# Or via docker exec
+docker exec <scheduler-container> /usr/local/airflow/scripts/setup_connections.sh
 ```
 
 ## Usage
