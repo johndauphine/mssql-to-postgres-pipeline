@@ -1,0 +1,48 @@
+# Airflow Settings - Loaded automatically on startup
+#
+# Configure your database connections here. Edit the values below
+# to match your source and target databases.
+#
+# For Astronomer: This file is loaded automatically on `astro dev start`
+# For vanilla Airflow: Import connections via `airflow connections import`
+
+airflow:
+  connections:
+    # ==========================================================================
+    # SOURCE DATABASE (SQL Server)
+    # ==========================================================================
+    # Host can be: Docker container name, IP address, hostname, or cloud endpoint
+    # Examples:
+    #   - mssql-server (Docker container)
+    #   - 192.168.1.100 (remote IP)
+    #   - sqlserver.company.com (hostname)
+    #   - myserver.database.windows.net (Azure SQL)
+    - conn_id: mssql_source
+      conn_type: mssql
+      conn_host: mssql-server
+      conn_port: 1433
+      conn_login: sa
+      conn_password: YourStrong@Passw0rd
+      conn_schema: StackOverflow2013
+
+    # ==========================================================================
+    # TARGET DATABASE (PostgreSQL)
+    # ==========================================================================
+    # Host can be: Docker container name, IP address, hostname, or cloud endpoint
+    # Examples:
+    #   - postgres-target (Docker container)
+    #   - 192.168.1.101 (remote IP)
+    #   - postgres.company.com (hostname)
+    #   - mydb.abc123.us-east-1.rds.amazonaws.com (AWS RDS)
+    - conn_id: postgres_target
+      conn_type: postgres
+      conn_host: postgres-target
+      conn_port: 5432
+      conn_login: postgres
+      conn_password: PostgresPassword123
+      conn_schema: stackoverflow
+
+  # Variables can be defined here too if needed
+  # variables:
+  #   - variable_name: my_var
+  #     variable_value: my_value

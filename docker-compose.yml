@@ -8,7 +8,7 @@ services:
     user: "0:0"  # Run as root to access existing volume
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=YourStrong@Passw0rd
+      - MSSQL_SA_PASSWORD=${MSSQL_PASSWORD:-YourStrong@Passw0rd}
       - MSSQL_PID=Developer
       - TZ=UTC
     ports:
@@ -22,7 +22,7 @@ services:
     mem_reservation: ${MSSQL_MEM_RESERVATION:-2g}
     cpus: ${MSSQL_CPUS:-4}
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P YourStrong@Passw0rd -Q 'SELECT 1' -C || exit 1"]
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -Q 'SELECT 1' -C || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
@@ -34,9 +34,9 @@ services:
     image: postgres:16-alpine
     container_name: postgres-target
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=PostgresPassword123
-      - POSTGRES_DB=stackoverflow
+      - POSTGRES_USER=${PG_USER:-postgres}
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-PostgresPassword123}
+      - POSTGRES_DB=${PG_DATABASE:-stackoverflow}
       - PGDATA=/var/lib/postgresql/data/pgdata
     ports:
       - "5433:5432"

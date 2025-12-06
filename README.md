@@ -90,12 +90,31 @@ A standalone `validate_migration_env` DAG handles validation separately to avoid
 | Date/Time | `date`, `time`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset` | `DATE`, `TIME`, `TIMESTAMP` |
 | Other | `uniqueidentifier`, `xml`, `geography`, `geometry` | `UUID`, `XML`, `GEOGRAPHY`, `GEOMETRY` |
 
+## Quick Start
+
+Migrate any SQL Server database to PostgreSQL in 3 steps:
+
+```bash
+# 1. Configure your databases
+cp .env.example .env                              # Resource settings
+cp airflow_settings.yaml.example airflow_settings.yaml  # Connections
+# Edit airflow_settings.yaml with your database details
+
+# 2. Start the stack
+astro dev start                         # Connections loaded automatically
+
+# 3. Run migration
+airflow dags trigger mssql_to_postgres_migration
+```
+
+See [Configuration](#configuration) for details on connecting to remote databases.
+
 ## Getting Started
 
 ### Prerequisites
 
 - Docker Desktop (4GB+ RAM recommended per database container)
-- [Astronomer CLI](https://www.astronomer.io/docs/astro/cli/install-cli)
+- [Astronomer CLI](https://www.astronomer.io/docs/astro/cli/install-cli) (optional - can use standalone Docker)
 - Access to source SQL Server and target PostgreSQL databases
 
 ### Installation
@@ -106,62 +125,109 @@ A standalone `validate_migration_env` DAG handles validation separately to avoid
    cd mssql-to-postgres-pipeline
    ```
 
-2. Start Airflow locally:
+2. Configure your environment:
+   ```bash
+   cp .env.example .env
+   cp airflow_settings.yaml.example airflow_settings.yaml
+   # Edit .env with resource settings for your machine (RAM presets)
+   # Edit airflow_settings.yaml with your database connection details
+   ```
+
+3. Start Airflow (creates Docker network):
    ```bash
    astro dev start
    ```
 
-3. Access the Airflow UI at http://localhost:8080
+4. **(Optional) Start local database containers:**
 
-### Configure Database Connections
+   If you need local SQL Server and PostgreSQL containers for testing:
+   ```bash
+   docker-compose up -d
+   ```
 
-Add connections via the Airflow CLI or UI:
+   > **Note**: Run `astro dev start` first - it creates the Docker network that database containers join.
 
-```bash
-# SQL Server source
-docker exec <scheduler-container> airflow connections add mssql_source \
-  --conn-type mssql \
-  --conn-host your-sqlserver-host \
-  --conn-schema your_database \
-  --conn-login username \
-  --conn-password 'password' \
-  --conn-port 1433
+   For remote databases (Azure SQL, AWS RDS, on-prem servers), skip this step and configure hosts in `airflow_settings.yaml`.
 
-# PostgreSQL target
-docker exec <scheduler-container> airflow connections add postgres_target \
-  --conn-type postgres \
-  --conn-host your-postgres-host \
-  --conn-schema target_database \
-  --conn-login username \
-  --conn-password 'password' \
-  --conn-port 5432
-```
+5. Access the Airflow UI at http://localhost:8080
 
-Or configure in `airflow_settings.yaml`:
+## Configuration
+
+Configuration is split between two files:
+- **`.env`** - Resource settings (memory limits, parallelism)
+- **`airflow_settings.yaml`** - Database connections
+
+### Database Connections
+
+Edit `airflow_settings.yaml` to configure your source and target databases:
 
 ```yaml
-connections:
-  - conn_id: mssql_source
-    conn_type: mssql
-    conn_host: your-sqlserver-host
-    conn_schema: your_database
-    conn_login: username
-    conn_password: password
-    conn_port: 1433
+airflow:
+  connections:
+    # SOURCE: SQL Server
+    - conn_id: mssql_source
+      conn_type: mssql
+      conn_host: mssql-server           # Docker container, IP, or hostname
+      # conn_host: 192.168.1.100        # Remote server
+      # conn_host: myserver.database.windows.net  # Azure SQL
+      conn_port: 1433
+      conn_login: sa
+      conn_password: YourStrong@Passw0rd
+      conn_schema: StackOverflow2013
 
-  - conn_id: postgres_target
-    conn_type: postgres
-    conn_host: your-postgres-host
-    conn_schema: target_database
-    conn_login: username
-    conn_password: password
-    conn_port: 5432
+    # TARGET: PostgreSQL
+    - conn_id: postgres_target
+      conn_type: postgres
+      conn_host: postgres-target        # Docker container, IP, or hostname
+      # conn_host: mydb.abc123.rds.amazonaws.com  # AWS RDS
+      conn_port: 5432
+      conn_login: postgres
+      conn_password: PostgresPassword123
+      conn_schema: stackoverflow
 ```
 
-Then restart Airflow to load the connections:
+Connections are loaded automatically when you run `astro dev start`.
+
+### Resource Settings
+
+The `.env` file contains resource presets for different machine sizes:
+
+| RAM | Preset |
+|-----|--------|
+| 16GB | Conservative settings for laptops |
+| 32GB | Default balanced settings |
+| 64GB+ | High performance settings |
+
+Uncomment the appropriate preset section in `.env` for your machine.
+
+### Applying Configuration Changes
+
+After editing `airflow_settings.yaml`, restart Airflow to reload connections:
+
 ```bash
 astro dev restart
 ```
+
+### Loading Test Data (Local SQL Server)
+
+To restore a SQL Server backup file (`.bak`) into the local container:
+
+```bash
+# 1. Copy backup file to container
+docker cp /path/to/YourDatabase.bak mssql-server:/tmp/
+
+# 2. Restore the database
+docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P 'YourStrong@Passw0rd' -C \
+  -Q "RESTORE DATABASE YourDatabase FROM DISK='/tmp/YourDatabase.bak' \
+      WITH MOVE 'YourDatabase' TO '/var/opt/mssql/data/YourDatabase.mdf', \
+           MOVE 'YourDatabase_log' TO '/var/opt/mssql/data/YourDatabase_log.ldf'"
+
+# 3. Update airflow_settings.yaml with the database name
+# conn_schema: YourDatabase
+```
+
+> **Note**: Logical file names in the MOVE clause vary by backup. Use `RESTORE FILELISTONLY` to discover them.
 
 ## Usage
 
