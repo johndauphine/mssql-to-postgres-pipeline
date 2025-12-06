@@ -304,15 +304,19 @@ def mssql_to_postgres_migration():
     @task
     def prepare_large_table_partitions(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
         """
-        Create partitions for any large table (>5M rows) using primary key ranges.
+        Create partitions for any large table (>1M rows) using NTILE-based boundaries.
 
-        Partitions tables by their primary key column, dividing the ID range
-        into equal chunks for parallel processing.
+        Uses NTILE to divide rows evenly by count (not by PK range), which:
+        - Works for ANY primary key type (integer, GUID, string)
+        - Handles sparse/gappy ID sequences correctly
+        - Guarantees balanced partitions
+
+        For composite PKs, uses ROW_NUMBER with row ranges instead.
         """
         params = context["params"]
         partitions = []
 
-        # Get MSSQL connection for querying PK ranges
+        # Get MSSQL connection for querying partition boundaries
         from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
         mssql_hook = MsSqlHook(mssql_conn_id=params["source_conn_id"])
 
@@ -336,85 +340,166 @@ def mssql_to_postgres_migration():
                 safe_table_name = validate_sql_identifier(table_name, "table name")
                 safe_source_schema = validate_sql_identifier(source_schema, "schema name")
             except ValueError as e:
-                # Don't log the potentially malicious identifier value directly
                 logger.error(f"Invalid SQL identifier during table validation: {e}")
                 continue
 
-            # Find primary key column
-            pk_column = table_info.get('primary_key')
-            if not pk_column:
-                # Query for primary key column
+            # Get primary key columns info from schema extraction
+            pk_columns_info = table_info.get('pk_columns')
+
+            if not pk_columns_info or not pk_columns_info.get('columns'):
+                # Fallback: Query for primary key columns directly
                 pk_query = """
-                    SELECT COLUMN_NAME
-                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                    WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
-                    AND TABLE_SCHEMA = %s
-                    AND TABLE_NAME = %s
-                    ORDER BY ORDINAL_POSITION
+                    SELECT c.name, t.name as data_type
+                    FROM sys.indexes i
+                    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                    INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    INNER JOIN sys.tables tbl ON i.object_id = tbl.object_id
+                    INNER JOIN sys.schemas s ON tbl.schema_id = s.schema_id
+                    WHERE i.is_primary_key = 1
+                      AND s.name = %s AND tbl.name = %s
+                    ORDER BY ic.key_ordinal
                 """
-                pk_result = mssql_hook.get_first(pk_query, parameters=[safe_source_schema, safe_table_name])
-                pk_column = pk_result[0] if pk_result else 'Id'
-
-            # Validate primary key column name
-            try:
-                safe_pk_column = validate_sql_identifier(pk_column, "primary key column")
-            except ValueError as e:
-                # Use safe_table_name since it's already validated
-                logger.error(f"Invalid primary key column for table {safe_table_name}: {e}")
-                continue
-
-            logger.info(f"Partitioning {safe_table_name} by [{safe_pk_column}] ({row_count:,} rows)")
-
-            # Get min/max values for the primary key
-            range_query = f"SELECT MIN([{safe_pk_column}]), MAX([{safe_pk_column}]) FROM [{safe_source_schema}].[{safe_table_name}]"
-            min_max = mssql_hook.get_first(range_query)
-
-            if not min_max or min_max[0] is None:
-                logger.warning(f"Could not get PK range for {safe_table_name}, skipping partitioning")
-                continue
-
-            min_id, max_id = min_max[0], min_max[1]
-            
-            # Validate that min_id and max_id are integers to prevent SQL injection and precision issues
-            if not isinstance(min_id, int) or not isinstance(max_id, int):
-                logger.error(f"Primary key range for {safe_table_name} must be integer: min_id={type(min_id).__name__}, max_id={type(max_id).__name__}")
-                continue
-            
-            if max_id < min_id:
-                logger.warning(f"Invalid PK range for {safe_table_name}: min_id ({min_id}) > max_id ({max_id}), skipping partitioning")
-                continue
-            id_range = max_id - min_id + 1
-
-            # Use dynamic partition count based on table size
-            partition_count = get_partition_count(row_count)
-            chunk_size = id_range // partition_count
-
-            logger.info(f"  PK range: {min_id:,} to {max_id:,}")
-            logger.info(f"  Using {partition_count} partitions (chunk size: {chunk_size:,} IDs)")
-
-            # Create partitions based on PK ranges
-            for i in range(partition_count):
-                start_id = min_id + (i * chunk_size)
-
-                if i == partition_count - 1:
-                    # Last partition gets everything remaining
-                    where_clause = f"[{safe_pk_column}] >= {start_id}"
+                pk_result = mssql_hook.get_records(pk_query, parameters=[safe_source_schema, safe_table_name])
+                if pk_result:
+                    pk_columns_info = {
+                        'columns': [{'name': row[0], 'data_type': row[1]} for row in pk_result],
+                        'is_composite': len(pk_result) > 1
+                    }
                 else:
-                    end_id = min_id + ((i + 1) * chunk_size) - 1
-                    where_clause = f"[{safe_pk_column}] >= {start_id} AND [{safe_pk_column}] <= {end_id}"
+                    # No PK found - use first column as fallback
+                    logger.warning(f"No primary key found for {safe_table_name}, using ROW_NUMBER with first column")
+                    first_col_query = f"""
+                        SELECT TOP 1 c.name
+                        FROM sys.columns c
+                        INNER JOIN sys.tables t ON c.object_id = t.object_id
+                        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                        WHERE s.name = %s AND t.name = %s
+                        ORDER BY c.column_id
+                    """
+                    first_col = mssql_hook.get_first(first_col_query, parameters=[safe_source_schema, safe_table_name])
+                    pk_columns_info = {
+                        'columns': [{'name': first_col[0], 'data_type': 'unknown'}] if first_col else [],
+                        'is_composite': False
+                    }
 
-                partition_info = {
-                    **table_info,
-                    'partition_name': f'partition_{i + 1}',
-                    'partition_index': i,
-                    'where_clause': where_clause,
-                    'pk_column': safe_pk_column,
-                    'estimated_rows': row_count // partition_count,
-                    'truncate_first': i == 0  # Only first partition truncates
-                }
-                partitions.append(partition_info)
+            if not pk_columns_info.get('columns'):
+                logger.error(f"Could not determine ordering column for {safe_table_name}, skipping")
+                continue
 
-            logger.info(f"  Created {partition_count} partitions for {safe_table_name}")
+            pk_columns = pk_columns_info['columns']
+            is_composite = pk_columns_info.get('is_composite', len(pk_columns) > 1)
+
+            # Validate PK column names
+            safe_pk_columns = []
+            for col in pk_columns:
+                try:
+                    safe_col = validate_sql_identifier(col['name'], "primary key column")
+                    safe_pk_columns.append(safe_col)
+                except ValueError as e:
+                    logger.error(f"Invalid primary key column for table {safe_table_name}: {e}")
+                    continue
+
+            if not safe_pk_columns:
+                logger.error(f"No valid PK columns for {safe_table_name}, skipping")
+                continue
+
+            partition_count = get_partition_count(row_count)
+
+            if is_composite:
+                # Composite PK: Use ROW_NUMBER with row ranges
+                logger.info(f"Partitioning {safe_table_name} using ROW_NUMBER (composite PK: {', '.join(safe_pk_columns)})")
+                logger.info(f"  Using {partition_count} partitions (~{row_count // partition_count:,} rows each)")
+
+                rows_per_partition = (row_count + partition_count - 1) // partition_count  # Ceiling division
+
+                for i in range(partition_count):
+                    start_row = i * rows_per_partition + 1
+                    end_row = min((i + 1) * rows_per_partition, row_count)
+
+                    partition_info = {
+                        **table_info,
+                        'partition_name': f'partition_{i + 1}',
+                        'partition_index': i,
+                        'use_row_number': True,
+                        'order_by_columns': safe_pk_columns,
+                        'start_row': start_row,
+                        'end_row': end_row,
+                        'pk_column': safe_pk_columns[0],
+                        'estimated_rows': end_row - start_row + 1,
+                        'truncate_first': i == 0
+                    }
+                    partitions.append(partition_info)
+            else:
+                # Single-column PK: Use NTILE to get balanced partition boundaries
+                pk_column = safe_pk_columns[0]
+                logger.info(f"Partitioning {safe_table_name} using NTILE on [{pk_column}] ({row_count:,} rows)")
+
+                # Query NTILE boundaries - this gives us actual boundary values for any PK type
+                boundaries_query = f"""
+                WITH numbered AS (
+                    SELECT [{pk_column}],
+                           NTILE({partition_count}) OVER (ORDER BY [{pk_column}]) as partition_id
+                    FROM [{safe_source_schema}].[{safe_table_name}]
+                )
+                SELECT partition_id, MIN([{pk_column}]) as min_pk, MAX([{pk_column}]) as max_pk, COUNT(*) as row_count
+                FROM numbered
+                GROUP BY partition_id
+                ORDER BY partition_id
+                """
+
+                try:
+                    boundaries = mssql_hook.get_records(boundaries_query)
+                except Exception as e:
+                    logger.error(f"Error querying NTILE boundaries for {safe_table_name}: {e}")
+                    continue
+
+                if not boundaries:
+                    logger.warning(f"No partition boundaries returned for {safe_table_name}, skipping")
+                    continue
+
+                logger.info(f"  NTILE returned {len(boundaries)} partitions")
+
+                for i, boundary in enumerate(boundaries):
+                    partition_id, min_pk, max_pk, part_row_count = boundary
+
+                    # Format boundary values for WHERE clause based on type
+                    if isinstance(min_pk, str):
+                        # String/GUID: use quoted values with proper escaping
+                        min_pk_sql = f"'{min_pk.replace(chr(39), chr(39)+chr(39))}'"
+                        max_pk_sql = f"'{max_pk.replace(chr(39), chr(39)+chr(39))}'"
+                    elif isinstance(min_pk, (int, float)):
+                        # Numeric: use as-is
+                        min_pk_sql = str(min_pk)
+                        max_pk_sql = str(max_pk)
+                    else:
+                        # Other types (datetime, etc): convert to string representation
+                        min_pk_sql = f"'{min_pk}'"
+                        max_pk_sql = f"'{max_pk}'"
+
+                    # Build WHERE clause
+                    if i == len(boundaries) - 1:
+                        # Last partition: >= min (no upper bound to catch any edge cases)
+                        where_clause = f"[{pk_column}] >= {min_pk_sql}"
+                    elif i == 0:
+                        # First partition: <= max
+                        where_clause = f"[{pk_column}] <= {max_pk_sql}"
+                    else:
+                        # Middle partitions: use both bounds
+                        where_clause = f"[{pk_column}] >= {min_pk_sql} AND [{pk_column}] <= {max_pk_sql}"
+
+                    partition_info = {
+                        **table_info,
+                        'partition_name': f'partition_{i + 1}',
+                        'partition_index': i,
+                        'where_clause': where_clause,
+                        'pk_column': pk_column,
+                        'estimated_rows': part_row_count,
+                        'truncate_first': i == 0
+                    }
+                    partitions.append(partition_info)
+
+                logger.info(f"  Created {len(boundaries)} partitions for {safe_table_name}")
 
         # Calculate total number of partitioned tables
         partitioned_tables = len(set(p['table_name'] for p in partitions)) if partitions else 0
@@ -469,10 +554,14 @@ def mssql_to_postgres_migration():
         """
         Transfer a partition of a large table in parallel.
 
-        Works with any table that has been partitioned by primary key range.
+        Supports two partitioning modes:
+        - Single-column PK: Uses WHERE clause with NTILE-derived boundaries
+        - Composite PK: Uses ROW_NUMBER with row range boundaries
 
         Args:
-            partition_info: Partition information including WHERE clause and table details
+            partition_info: Partition information including:
+                - where_clause: For single-column PK partitions
+                - use_row_number, start_row, end_row: For composite PK partitions
 
         Returns:
             Transfer result dictionary with statistics
@@ -500,6 +589,12 @@ def mssql_to_postgres_migration():
         result["table_name"] = table_name
         result["partition_name"] = partition_name
         result["is_partition"] = True
+
+        # For partitions, success = rows transferred without errors
+        # The full table validation (comparing total source vs target counts) is done by validation DAG
+        # This fixes the issue where intermediate partitions would be marked failed because
+        # target_row_count (cumulative) != source_row_count (total or partition depending on PK type)
+        result["success"] = len(result.get("errors", [])) == 0 and result.get("rows_transferred", 0) > 0
 
         if result["success"]:
             logger.info(
@@ -880,21 +975,25 @@ def mssql_to_postgres_migration():
         from collections import defaultdict
         table_partitions = defaultdict(list)
         
-        # Collect all partition results from transfer_partition task
-        # Note: Both first_partition_results and remaining_partition_results expand the same
-        # transfer_partition task, so pulling from 'transfer_partition' gets all map instances
-        try:
-            partitions = ti.xcom_pull(task_ids='transfer_partition', map_indexes=None)
-            if partitions:
-                if not isinstance(partitions, list):
-                    partitions = [partitions]
+        # Collect partition results from both first_partition_results and remaining_partition_results
+        # Since there are two .expand() calls on transfer_partition, Airflow creates separate task IDs:
+        # 'transfer_partition' for first_partition_results and 'transfer_partition__1' for remaining
+        for task_suffix in ['', '__1']:
+            task_name = f'transfer_partition{task_suffix}'
+            try:
+                # In Airflow 3.x, explicitly specify key='return_value' for mapped task results
+                partitions = ti.xcom_pull(task_ids=task_name, key='return_value')
+                logger.info(f"Retrieved from {task_name}: {type(partitions)} - {len(partitions) if isinstance(partitions, list) else 'single'}")
+                if partitions:
+                    if not isinstance(partitions, list):
+                        partitions = [partitions]
 
-                # Group partitions by table name
-                for p in partitions:
-                    if p:
-                        table_partitions[p.get('table_name', 'Unknown')].append(p)
-        except:
-            pass
+                    # Group partitions by table name
+                    for p in partitions:
+                        if p:
+                            table_partitions[p.get('table_name', 'Unknown')].append(p)
+            except Exception as e:
+                logger.warning(f"Could not retrieve from {task_name}: {e}")
 
         # Aggregate each table's partitions into a single result
         for table_name, parts in table_partitions.items():

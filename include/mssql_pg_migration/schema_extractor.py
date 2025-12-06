@@ -182,6 +182,47 @@ class SchemaExtractor:
             }
         return None
 
+    def get_primary_key_columns(self, table_object_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed primary key column information including data types.
+
+        Args:
+            table_object_id: SQL Server object_id of the table
+
+        Returns:
+            Dict with pk_columns list (name, data_type, ordinal) and metadata,
+            or None if no primary key exists
+        """
+        query = """
+        SELECT
+            c.name AS column_name,
+            t.name AS data_type,
+            ic.key_ordinal
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+        INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+        INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
+        WHERE i.is_primary_key = 1
+          AND i.object_id = %s
+        ORDER BY ic.key_ordinal
+        """
+        results = self.mssql_hook.get_records(query, parameters=[table_object_id])
+
+        if not results:
+            return None
+
+        integer_types = {'int', 'bigint', 'smallint', 'tinyint'}
+        columns = [
+            {'name': row[0], 'data_type': row[1], 'ordinal': row[2]}
+            for row in results
+        ]
+
+        return {
+            'columns': columns,
+            'is_composite': len(results) > 1,
+            'is_all_integer': all(col['data_type'].lower() in integer_types for col in columns)
+        }
+
     def get_indexes(self, table_object_id: int) -> List[Dict[str, Any]]:
         """
         Get all indexes for a table (excluding primary key).
@@ -389,6 +430,7 @@ class SchemaExtractor:
                 'row_count': table['row_count'],
                 'columns': self.get_columns(table['object_id']),
                 'primary_key': self.get_primary_key(table['object_id']),
+                'pk_columns': self.get_primary_key_columns(table['object_id']),
                 'indexes': self.get_indexes(table['object_id']),
                 'foreign_keys': self.get_foreign_keys(table['object_id']),
                 'check_constraints': self.get_check_constraints(table['object_id']),
