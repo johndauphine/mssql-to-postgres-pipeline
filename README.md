@@ -128,27 +128,26 @@ See [Configuration](#configuration) for details on connecting to remote database
 2. Configure your environment:
    ```bash
    cp .env.example .env
+   cp airflow_settings.yaml.example airflow_settings.yaml
    # Edit .env with resource settings for your machine (RAM presets)
+   # Edit airflow_settings.yaml with your database connection details
    ```
 
-3. Configure database connections in `airflow_settings.yaml`:
-   ```yaml
-   airflow:
-     connections:
-       - conn_id: mssql_source
-         conn_host: your-sqlserver-host    # or IP, or Azure SQL endpoint
-         conn_schema: your_database
-         # ... other settings
-       - conn_id: postgres_target
-         conn_host: your-postgres-host     # or IP, or RDS endpoint
-         conn_schema: target_database
-         # ... other settings
-   ```
-
-4. Start Airflow locally:
+3. Start Airflow (creates Docker network):
    ```bash
-   astro dev start    # Connections are loaded automatically from airflow_settings.yaml
+   astro dev start
    ```
+
+4. **(Optional) Start local database containers:**
+
+   If you need local SQL Server and PostgreSQL containers for testing:
+   ```bash
+   docker-compose up -d
+   ```
+
+   > **Note**: Run `astro dev start` first - it creates the Docker network that database containers join.
+
+   For remote databases (Azure SQL, AWS RDS, on-prem servers), skip this step and configure hosts in `airflow_settings.yaml`.
 
 5. Access the Airflow UI at http://localhost:8080
 
@@ -208,6 +207,27 @@ After editing `airflow_settings.yaml`, restart Airflow to reload connections:
 ```bash
 astro dev restart
 ```
+
+### Loading Test Data (Local SQL Server)
+
+To restore a SQL Server backup file (`.bak`) into the local container:
+
+```bash
+# 1. Copy backup file to container
+docker cp /path/to/YourDatabase.bak mssql-server:/tmp/
+
+# 2. Restore the database
+docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P 'YourStrong@Passw0rd' -C \
+  -Q "RESTORE DATABASE YourDatabase FROM DISK='/tmp/YourDatabase.bak' \
+      WITH MOVE 'YourDatabase' TO '/var/opt/mssql/data/YourDatabase.mdf', \
+           MOVE 'YourDatabase_log' TO '/var/opt/mssql/data/YourDatabase_log.ldf'"
+
+# 3. Update airflow_settings.yaml with the database name
+# conn_schema: YourDatabase
+```
+
+> **Note**: Logical file names in the MOVE clause vary by backup. Use `RESTORE FILELISTONLY` to discover them.
 
 ## Usage
 
