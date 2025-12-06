@@ -590,6 +590,12 @@ def mssql_to_postgres_migration():
         result["partition_name"] = partition_name
         result["is_partition"] = True
 
+        # For partitions, success = rows transferred without errors
+        # The full table validation (comparing total source vs target counts) is done by validation DAG
+        # This fixes the issue where intermediate partitions would be marked failed because
+        # target_row_count (cumulative) != source_row_count (total or partition depending on PK type)
+        result["success"] = len(result.get("errors", [])) == 0 and result.get("rows_transferred", 0) > 0
+
         if result["success"]:
             logger.info(
                 f"✓ {table_name} {partition_name}: Transferred {result['rows_transferred']:,} rows "
@@ -969,21 +975,25 @@ def mssql_to_postgres_migration():
         from collections import defaultdict
         table_partitions = defaultdict(list)
         
-        # Collect all partition results from transfer_partition task
-        # Note: Both first_partition_results and remaining_partition_results expand the same
-        # transfer_partition task, so pulling from 'transfer_partition' gets all map instances
-        try:
-            partitions = ti.xcom_pull(task_ids='transfer_partition', map_indexes=None)
-            if partitions:
-                if not isinstance(partitions, list):
-                    partitions = [partitions]
+        # Collect partition results from both first_partition_results and remaining_partition_results
+        # Since there are two .expand() calls on transfer_partition, Airflow creates separate task IDs:
+        # 'transfer_partition' for first_partition_results and 'transfer_partition__1' for remaining
+        for task_suffix in ['', '__1']:
+            task_name = f'transfer_partition{task_suffix}'
+            try:
+                # In Airflow 3.x, explicitly specify key='return_value' for mapped task results
+                partitions = ti.xcom_pull(task_ids=task_name, key='return_value')
+                logger.info(f"Retrieved from {task_name}: {type(partitions)} - {len(partitions) if isinstance(partitions, list) else 'single'}")
+                if partitions:
+                    if not isinstance(partitions, list):
+                        partitions = [partitions]
 
-                # Group partitions by table name
-                for p in partitions:
-                    if p:
-                        table_partitions[p.get('table_name', 'Unknown')].append(p)
-        except:
-            pass
+                    # Group partitions by table name
+                    for p in partitions:
+                        if p:
+                            table_partitions[p.get('table_name', 'Unknown')].append(p)
+            except Exception as e:
+                logger.warning(f"Could not retrieve from {task_name}: {e}")
 
         # Aggregate each table's partitions into a single result
         for table_name, parts in table_partitions.items():
