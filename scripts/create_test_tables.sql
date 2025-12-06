@@ -15,21 +15,21 @@ USE PartitionTest;
 GO
 
 -- Drop existing test tables
-DROP TABLE IF EXISTS dbo.GuidOrders;
-DROP TABLE IF EXISTS dbo.StringProducts;
-DROP TABLE IF EXISTS dbo.CompositeOrderDetails;
-DROP TABLE IF EXISTS dbo.SparseIntTable;
+IF OBJECT_ID('dbo.GuidOrders', 'U') IS NOT NULL DROP TABLE dbo.GuidOrders;
+IF OBJECT_ID('dbo.StringProducts', 'U') IS NOT NULL DROP TABLE dbo.StringProducts;
+IF OBJECT_ID('dbo.CompositeOrderDetails', 'U') IS NOT NULL DROP TABLE dbo.CompositeOrderDetails;
+IF OBJECT_ID('dbo.SparseIntTable', 'U') IS NOT NULL DROP TABLE dbo.SparseIntTable;
 GO
 
 ------------------------------------------------------------
 -- 1. GUID Primary Key Table (~2M rows)
 ------------------------------------------------------------
 CREATE TABLE dbo.GuidOrders (
-    OrderId UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    OrderId UNIQUEIDENTIFIER PRIMARY KEY,
     CustomerId INT NOT NULL,
-    OrderDate DATETIME2 DEFAULT GETDATE(),
+    OrderDate DATETIME2,
     TotalAmount DECIMAL(18,2),
-    Status VARCHAR(20) DEFAULT 'Pending'
+    Status VARCHAR(20)
 );
 GO
 
@@ -54,13 +54,14 @@ BEGIN
             WHEN 2 THEN 'Delivered'
             ELSE 'Cancelled'
         END
-    FROM (SELECT TOP (@batch) 1 as n FROM sys.all_objects a CROSS JOIN sys.all_objects b) x;
+    FROM (SELECT TOP (@batch) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as n FROM sys.all_objects a CROSS JOIN sys.all_objects b) x;
 
     SET @i = @i + @batch;
     IF @i % 500000 = 0 PRINT CONCAT('  ', @i, ' rows inserted...');
 END
+GO
 
-PRINT CONCAT('GuidOrders: ', (SELECT COUNT(*) FROM dbo.GuidOrders), ' rows');
+PRINT 'GuidOrders complete';
 GO
 
 ------------------------------------------------------------
@@ -97,13 +98,14 @@ BEGIN
         END,
         CAST(ABS(CHECKSUM(NEWID())) % 100000 AS DECIMAL(18,2)) / 100,
         ABS(CHECKSUM(NEWID())) % 1000
-    FROM (SELECT TOP (@batch2) 1 as n FROM sys.all_objects a CROSS JOIN sys.all_objects b) x;
+    FROM (SELECT TOP (@batch2) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as n FROM sys.all_objects a CROSS JOIN sys.all_objects b) x;
 
     SET @j = @j + @batch2;
     IF @j % 500000 = 0 PRINT CONCAT('  ', @j, ' rows inserted...');
 END
+GO
 
-PRINT CONCAT('StringProducts: ', (SELECT COUNT(*) FROM dbo.StringProducts), ' rows');
+PRINT 'StringProducts complete';
 GO
 
 ------------------------------------------------------------
@@ -115,7 +117,7 @@ CREATE TABLE dbo.CompositeOrderDetails (
     ProductId INT NOT NULL,
     Quantity INT NOT NULL,
     UnitPrice DECIMAL(18,2),
-    Discount DECIMAL(5,2) DEFAULT 0,
+    Discount DECIMAL(5,2),
     PRIMARY KEY (OrderId, LineNumber)
 );
 GO
@@ -132,30 +134,30 @@ WHILE @k < 2000000
 BEGIN
     INSERT INTO dbo.CompositeOrderDetails (OrderId, LineNumber, ProductId, Quantity, UnitPrice, Discount)
     SELECT
-        @orderNum + (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1) / 5,  -- ~5 lines per order
+        @orderNum + ((ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1) / 5),
         ((ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1) % 5) + 1,
         ABS(CHECKSUM(NEWID())) % 10000,
         ABS(CHECKSUM(NEWID())) % 20 + 1,
         CAST(ABS(CHECKSUM(NEWID())) % 50000 AS DECIMAL(18,2)) / 100,
         CAST(ABS(CHECKSUM(NEWID())) % 30 AS DECIMAL(5,2))
-    FROM (SELECT TOP (@batch3) 1 as n FROM sys.all_objects a CROSS JOIN sys.all_objects b) x;
+    FROM (SELECT TOP (@batch3) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as n FROM sys.all_objects a CROSS JOIN sys.all_objects b) x;
 
     SET @k = @k + @batch3;
-    SET @orderNum = @orderNum + @batch3 / 5;
+    SET @orderNum = @orderNum + (@batch3 / 5);
     IF @k % 500000 = 0 PRINT CONCAT('  ', @k, ' rows inserted...');
 END
+GO
 
-PRINT CONCAT('CompositeOrderDetails: ', (SELECT COUNT(*) FROM dbo.CompositeOrderDetails), ' rows');
+PRINT 'CompositeOrderDetails complete';
 GO
 
 ------------------------------------------------------------
 -- 4. Sparse Integer PK Table (~1.5M rows with gaps)
--- This tests NTILE handles gaps correctly
 ------------------------------------------------------------
 CREATE TABLE dbo.SparseIntTable (
     Id INT PRIMARY KEY,
     Data VARCHAR(100),
-    CreatedAt DATETIME2 DEFAULT GETDATE()
+    CreatedAt DATETIME2
 );
 GO
 
@@ -163,9 +165,8 @@ GO
 PRINT 'Inserting SparseIntTable (1.5M rows with gaps)...';
 SET NOCOUNT ON;
 
--- Create IDs with large gaps: 1-100, 10001-10100, 20001-20100, etc.
 DECLARE @m INT = 0;
-DECLARE @batch4 INT = 100;
+DECLARE @batch4 INT = 1000;
 DECLARE @baseId INT = 1;
 
 WHILE @m < 1500000
@@ -175,14 +176,15 @@ BEGIN
         @baseId + ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1,
         CONCAT('Data row ', @baseId + ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1),
         DATEADD(SECOND, -ABS(CHECKSUM(NEWID())) % 86400, GETDATE())
-    FROM (SELECT TOP (@batch4) 1 as n FROM sys.all_objects) x;
+    FROM (SELECT TOP (@batch4) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as n FROM sys.all_objects) x;
 
     SET @m = @m + @batch4;
     SET @baseId = @baseId + 10000;  -- Jump 10000 between batches = lots of gaps
     IF @m % 500000 = 0 PRINT CONCAT('  ', @m, ' rows inserted...');
 END
+GO
 
-PRINT CONCAT('SparseIntTable: ', (SELECT COUNT(*) FROM dbo.SparseIntTable), ' rows');
+PRINT 'SparseIntTable complete';
 GO
 
 ------------------------------------------------------------
@@ -190,17 +192,12 @@ GO
 ------------------------------------------------------------
 PRINT '';
 PRINT '=== Test Tables Created ===';
-SELECT
-    t.name AS TableName,
-    p.rows AS RowCount,
-    STRING_AGG(c.name + ' (' + ty.name + ')', ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS PrimaryKeyColumns
-FROM sys.tables t
-INNER JOIN sys.partitions p ON t.object_id = p.object_id AND p.index_id IN (0,1)
-LEFT JOIN sys.indexes i ON t.object_id = i.object_id AND i.is_primary_key = 1
-LEFT JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-LEFT JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-LEFT JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-WHERE t.schema_id = SCHEMA_ID('dbo')
-GROUP BY t.name, p.rows
-ORDER BY t.name;
+
+SELECT 'GuidOrders' as TableName, COUNT(*) as Rows, 'UNIQUEIDENTIFIER' as PKType FROM dbo.GuidOrders
+UNION ALL
+SELECT 'StringProducts', COUNT(*), 'VARCHAR(20)' FROM dbo.StringProducts
+UNION ALL
+SELECT 'CompositeOrderDetails', COUNT(*), 'INT, INT (composite)' FROM dbo.CompositeOrderDetails
+UNION ALL
+SELECT 'SparseIntTable', COUNT(*), 'INT (sparse)' FROM dbo.SparseIntTable;
 GO
