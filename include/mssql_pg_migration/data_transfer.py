@@ -115,7 +115,11 @@ class DataTransfer:
         chunk_size: int = 10000,
         truncate_target: bool = True,
         columns: Optional[List[str]] = None,
-        where_clause: Optional[str] = None
+        where_clause: Optional[str] = None,
+        use_row_number: bool = False,
+        order_by_columns: Optional[List[str]] = None,
+        start_row: Optional[int] = None,
+        end_row: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Transfer data from SQL Server table to PostgreSQL table.
@@ -129,6 +133,10 @@ class DataTransfer:
             truncate_target: Whether to truncate target table before transfer
             columns: Specific columns to transfer (None for all columns)
             where_clause: Optional WHERE clause for filtering source data
+            use_row_number: Use ROW_NUMBER pagination instead of keyset (for composite PKs)
+            order_by_columns: Columns for ORDER BY when using ROW_NUMBER mode
+            start_row: Starting row number (1-indexed) for ROW_NUMBER mode partition
+            end_row: Ending row number for ROW_NUMBER mode partition
 
         Returns:
             Transfer result dictionary with statistics
@@ -164,52 +172,107 @@ class DataTransfer:
         chunks_processed = 0
         errors = []
 
-        pk_column = self._get_primary_key_column(source_schema, source_table, columns)
-        logger.info(f"Using '{pk_column}' for keyset pagination")
-        pk_index = columns.index(pk_column) if pk_column in columns else 0
+        # Determine pagination mode
+        if use_row_number:
+            if not order_by_columns:
+                order_by_columns = [columns[0]]  # Fallback to first column
+            logger.info(f"Using ROW_NUMBER pagination (ORDER BY {', '.join(order_by_columns)})")
+            if start_row and end_row:
+                logger.info(f"Processing rows {start_row:,} to {end_row:,}")
+        else:
+            pk_column = self._get_primary_key_column(source_schema, source_table, columns)
+            logger.info(f"Using '{pk_column}' for keyset pagination")
+            pk_index = columns.index(pk_column) if pk_column in columns else 0
 
         try:
             with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
-                last_key_value = None
-                while rows_transferred < source_row_count:
-                    chunk_start = time.time()
+                if use_row_number:
+                    # ROW_NUMBER mode: process in chunks within the specified row range
+                    current_start = start_row if start_row else 1
+                    final_end = end_row if end_row else source_row_count
 
-                    rows, last_key_value = self._read_chunk_keyset(
-                        mssql_conn,
-                        source_schema,
-                        source_table,
-                        columns,
-                        pk_column,
-                        last_key_value,
-                        chunk_size,
-                        pk_index,
-                        where_clause,
-                    )
+                    while current_start <= final_end:
+                        chunk_start_time = time.time()
+                        current_end = min(current_start + chunk_size - 1, final_end)
 
-                    if not rows:
-                        break
+                        rows = self._read_chunk_row_number(
+                            mssql_conn,
+                            source_schema,
+                            source_table,
+                            columns,
+                            order_by_columns,
+                            current_start,
+                            current_end,
+                            where_clause,
+                        )
 
-                    rows_written = self._write_chunk(
-                        rows,
-                        target_schema,
-                        target_table,
-                        columns,
-                        postgres_conn
-                    )
+                        if not rows:
+                            break
 
-                    rows_transferred += rows_written
-                    chunks_processed += 1
+                        rows_written = self._write_chunk(
+                            rows,
+                            target_schema,
+                            target_table,
+                            columns,
+                            postgres_conn
+                        )
 
-                    chunk_time = time.time() - chunk_start
-                    rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+                        rows_transferred += rows_written
+                        chunks_processed += 1
+                        current_start = current_end + 1
 
-                    logger.info(
-                        f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
-                        f"({rows_transferred:,}/{source_row_count:,} total) "
-                        f"at {rows_per_second:,.0f} rows/sec"
-                    )
+                        chunk_time = time.time() - chunk_start_time
+                        rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
 
-                    postgres_conn.commit()
+                        logger.info(
+                            f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
+                            f"({rows_transferred:,}/{final_end - (start_row or 1) + 1:,} total) "
+                            f"at {rows_per_second:,.0f} rows/sec"
+                        )
+
+                        postgres_conn.commit()
+                else:
+                    # Keyset mode: original implementation
+                    last_key_value = None
+                    while rows_transferred < source_row_count:
+                        chunk_start_time = time.time()
+
+                        rows, last_key_value = self._read_chunk_keyset(
+                            mssql_conn,
+                            source_schema,
+                            source_table,
+                            columns,
+                            pk_column,
+                            last_key_value,
+                            chunk_size,
+                            pk_index,
+                            where_clause,
+                        )
+
+                        if not rows:
+                            break
+
+                        rows_written = self._write_chunk(
+                            rows,
+                            target_schema,
+                            target_table,
+                            columns,
+                            postgres_conn
+                        )
+
+                        rows_transferred += rows_written
+                        chunks_processed += 1
+
+                        chunk_time = time.time() - chunk_start_time
+                        rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+
+                        logger.info(
+                            f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
+                            f"({rows_transferred:,}/{source_row_count:,} total) "
+                            f"at {rows_per_second:,.0f} rows/sec"
+                        )
+
+                        postgres_conn.commit()
 
         except Exception as e:
             error_msg = f"Error transferring data: {str(e)}"
@@ -422,6 +485,63 @@ class DataTransfer:
             logger.error(f"Error reading chunk after key {last_key_value}: {str(e)}")
             raise
 
+    def _read_chunk_row_number(
+        self,
+        conn,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        order_by_columns: List[str],
+        start_row: int,
+        end_row: int,
+        where_clause: Optional[str] = None,
+    ) -> List[Tuple[Any, ...]]:
+        """
+        Read rows using ROW_NUMBER pagination for composite primary keys.
+
+        This is slower than keyset pagination but works correctly for any PK structure.
+
+        Args:
+            conn: MSSQL connection
+            schema_name: Source schema
+            table_name: Source table
+            columns: Columns to select
+            order_by_columns: All PK columns for deterministic ordering
+            start_row: First row number to include (1-indexed)
+            end_row: Last row number to include
+            where_clause: Optional filter
+
+        Returns:
+            List of rows
+        """
+        quoted_columns = ', '.join([f'[{col}]' for col in columns])
+        order_by = ', '.join([f'[{col}]' for col in order_by_columns])
+
+        # Build inner query with optional WHERE clause
+        inner_query = f"""
+        SELECT {quoted_columns},
+               ROW_NUMBER() OVER (ORDER BY {order_by}) as _rn
+        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        """
+        if where_clause:
+            inner_query += f"\nWHERE {where_clause}"
+
+        query = f"""
+        SELECT {quoted_columns}
+        FROM ({inner_query}) sub
+        WHERE _rn BETWEEN %s AND %s
+        ORDER BY _rn
+        """
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (start_row, end_row))
+                rows = cursor.fetchall()
+                return rows
+        except Exception as e:
+            logger.error(f"Error reading rows {start_row}-{end_row}: {str(e)}")
+            raise
+
     def _write_chunk(
         self,
         rows: List[Tuple[Any, ...]],
@@ -498,7 +618,12 @@ def transfer_table_data(
     Args:
         mssql_conn_id: SQL Server connection ID
         postgres_conn_id: PostgreSQL connection ID
-        table_info: Table information dictionary with schema and table names
+        table_info: Table information dictionary with schema and table names.
+            May include optional keys:
+            - use_row_number: Use ROW_NUMBER pagination for composite PKs
+            - order_by_columns: List of columns for ORDER BY
+            - start_row: Starting row number for partition
+            - end_row: Ending row number for partition
         chunk_size: Rows per chunk
         truncate: Whether to truncate target before transfer
         where_clause: Optional WHERE clause for filtering source data
@@ -521,7 +646,11 @@ def transfer_table_data(
         chunk_size=chunk_size,
         truncate_target=truncate,
         columns=table_info.get('columns'),
-        where_clause=where_clause
+        where_clause=where_clause,
+        use_row_number=table_info.get('use_row_number', False),
+        order_by_columns=table_info.get('order_by_columns'),
+        start_row=table_info.get('start_row'),
+        end_row=table_info.get('end_row'),
     )
 
 
