@@ -249,3 +249,77 @@ Tables are automatically partitioned based on row count:
 2. **Dedicated storage** - SSD with high IOPS for parallel writes
 3. **Increase PostgreSQL resources** - More shared_buffers for larger datasets
 4. **Consider CDC** - For incremental updates after initial load
+
+---
+
+## Hardware Comparison
+
+### Tested Systems
+
+| System | CPU | Cores | RAM | OS | Docker Backend |
+|--------|-----|-------|-----|-----|----------------|
+| Mac | Apple M3 Max | 14 | 36 GB | macOS Sequoia | Docker Desktop (native ARM) |
+| Windows | Intel/AMD | 16 | TBD | Windows 11 | Docker Desktop (WSL2) |
+
+### Expected Performance by Platform
+
+| Pipeline | Mac (M3 Max) | Windows (16-core) | Notes |
+|----------|--------------|-------------------|-------|
+| **MSSQL→PG** | 321K rows/sec | ~500K+ rows/sec | No Rosetta overhead on Windows |
+
+### Windows Setup
+
+#### WSL2 Configuration (Recommended)
+
+Create or edit `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=16GB
+processors=12
+swap=4GB
+```
+
+Restart WSL after changes:
+```powershell
+wsl --shutdown
+```
+
+#### Docker Desktop Settings
+
+1. Enable WSL2 backend (Settings → General → Use WSL 2 based engine)
+2. Resources → WSL Integration → Enable for your distro
+3. Allocate at least 12 CPUs and 12GB RAM
+
+#### Running on Windows
+
+```powershell
+# Pull latest optimizations
+git pull origin main
+
+# Start databases
+docker-compose down
+docker-compose up -d
+
+# Wait for SQL Server to be ready (takes ~30-60 seconds)
+Start-Sleep -Seconds 60
+
+# Start Airflow
+astro dev restart
+
+# Connect databases to Airflow network
+$network = docker network ls --format "{{.Name}}" | Select-String "airflow"
+docker network connect $network mssql-server
+docker network connect $network postgres-target
+
+# Trigger migration
+$scheduler = docker ps --format "{{.Names}}" | Select-String "scheduler"
+docker exec $scheduler airflow dags trigger mssql_to_postgres_migration
+```
+
+### Why Windows Should Be Faster for MSSQL
+
+1. **Native x86 SQL Server** - No Rosetta 2 emulation (Mac ARM must emulate x86)
+2. **More CPU cores** - 16 cores vs 14 cores
+3. **WSL2 performance** - Near-native Linux performance for containers
+4. **Expected improvement** - ~50-60% faster than Mac M3 Max
