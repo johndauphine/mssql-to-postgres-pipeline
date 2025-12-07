@@ -12,3 +12,5 @@ airflow.db
 
 # Test data (large files)
 stackoverflow_db/
+
+.mcp.json
