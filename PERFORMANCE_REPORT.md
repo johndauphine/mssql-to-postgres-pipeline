@@ -1,169 +1,6 @@
 # Migration Performance Report
 
-## Latest Run: StackOverflow2013 - 2025-12-04T21:58:22Z
-
-**Run ID:** `manual__2025-12-04T21:58:22.463972+00:00`
-**Final Status:** Success (validation DAG triggered and passed)
-**Total Duration:** 318.5 seconds (~5.3 minutes)
-**Dataset:** StackOverflow2013 (~106M rows)
-
-### Executive Summary
-
-| Metric | Value |
-|--------|-------|
-| **Total Rows Migrated** | 102,381,872 |
-| **Total Duration** | 318.5 seconds |
-| **Throughput** | ~321,000 rows/sec |
-| **Partition Tasks** | 38 parallel partitions |
-| **Validation** | 9/9 tables passed |
-
-### Execution Environment
-
-#### Host System
-| Property | Value |
-|----------|-------|
-| OS | Darwin 25.1.0 (macOS Sequoia) |
-| Architecture | arm64 |
-| CPU | Apple M3 Max |
-| Host Memory | 36 GB |
-
-#### Docker Resources
-| Property | Value |
-|----------|-------|
-| Docker CPUs | 14 |
-| Docker Memory | 16 GB |
-
-#### Container Configuration
-| Container | CPUs | Memory |
-|-----------|------|--------|
-| SQL Server 2022 (x86_64 emulated) | 8 | 4 GB |
-| PostgreSQL 16 (native ARM) | 6 | 4 GB |
-
-#### Database Versions
-| Database | Version |
-|----------|---------|
-| SQL Server | Microsoft SQL Server 2022 (RTM-CU21) - 16.0.4215.2 (X64) |
-| PostgreSQL | PostgreSQL 16-alpine on aarch64-unknown-linux-musl |
-
-### Source Database (StackOverflow2013)
-
-| Table | Rows |
-|-------|------|
-| Votes | 52,928,720 |
-| Comments | 24,534,730 |
-| Posts | 17,142,169 |
-| Badges | 8,042,005 |
-| Users | 2,465,713 |
-| PostLinks | 1,421,208 |
-| VoteTypes | 15 |
-| PostTypes | 8 |
-| LinkTypes | 2 |
-| **Total** | **106,534,570** |
-
-### Dynamic Partitioning
-
-Tables are automatically partitioned based on row count:
-- 1-2M rows: 2 partitions
-- 2-5M rows: 4 partitions
-- 5M+ rows: 8 partitions (max)
-
-| Table | Rows | Partitions | Rows/Partition |
-|-------|------|------------|----------------|
-| Votes | 52.9M | 8 | ~6.6M |
-| Comments | 24.5M | 8 | ~3.1M |
-| Posts | 17.1M | 8 | ~2.1M |
-| Badges | 8.0M | 8 | ~1.0M |
-| Users | 2.5M | 4 | ~625K |
-| PostLinks | 1.4M | 2 | ~710K |
-| Small tables | 25 | 0 (regular) | - |
-| **Total** | **106M** | **38** | - |
-
-### Airflow Parallelism Configuration
-
-| Setting | Value |
-|---------|-------|
-| `AIRFLOW__CORE__PARALLELISM` | 128 |
-| `AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG` | 64 |
-| `AIRFLOW__CELERY__WORKER_CONCURRENCY` | 64 |
-| `AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC` | 5 |
-| `AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE` | 10 |
-
-### PostgreSQL Tuning
-
-| Setting | Value |
-|---------|-------|
-| `max_connections` | 200 |
-| `shared_buffers` | 1GB |
-| `effective_cache_size` | 2GB |
-| `maintenance_work_mem` | 256MB |
-| `wal_buffers` | 64MB |
-| `max_wal_size` | 4GB |
-| `synchronous_commit` | off |
-
-### Migration Timeline (UTC)
-
-| Phase | Start | End | Duration |
-|-------|-------|-----|----------|
-| DAG Start | 21:58:22 | 22:03:41 | 318.5s |
-| extract_source_schema | 21:58:22 | 21:58:25 | 2.5s |
-| create_target_schema | 21:58:22 | 21:58:23 | 1.0s |
-| create_target_tables | 21:58:25 | 21:58:26 | 0.2s |
-| prepare_partitions | 21:58:26 | 21:58:27 | 0.6s |
-| transfer_partition (38 parallel) | 21:58:30 | 22:03:03 | ~273s |
-| collect_results | 22:03:03 | 22:03:03 | 0.1s |
-| convert_to_logged | 22:03:04 | 22:03:05 | 0.3s |
-| create_primary_keys | 22:03:05 | 22:03:06 | 0.1s |
-| create_indexes | 22:03:06 | 22:03:06 | 0.1s |
-| create_foreign_keys | 22:03:07 | 22:03:07 | 0.1s |
-| trigger_validation_dag | 22:03:08 | 22:03:39 | 30.1s |
-| validate_migration_env | 22:03:10 | 22:03:24 | 14.3s |
-
-### Partition Transfer Performance (Longest Running)
-
-| Partition | Table | Duration | Estimated Rows |
-|-----------|-------|----------|----------------|
-| partition_20 | Votes | 184.7s | ~6.6M |
-| partition_21 | Votes | 184.6s | ~6.6M |
-| partition_17 | Votes | 181.6s | ~6.6M |
-| partition_18 | Votes | 181.5s | ~6.6M |
-| partition_16 | Votes | 182.9s | ~6.6M |
-| partition_15 | Votes | 176.9s | ~6.6M |
-| partition_7 | Votes | 173.9s | ~6.6M |
-| partition_8 | Votes | 138.7s | ~6.6M |
-
-**Critical Path:** Votes table partitions (~185s max) determined total transfer time.
-
-### Data Verification
-
-| Table | Source Rows | Target Rows | Match |
-|-------|-------------|-------------|-------|
-| votes | 52,928,720 | 52,928,720 | Yes |
-| comments | 24,534,730 | 24,534,730 | Yes |
-| posts | 17,142,169 | 17,142,169 | Yes |
-| badges | 8,042,005 | 8,042,005 | Yes |
-| users | 2,465,713 | 2,465,713 | Yes |
-| postlinks | 1,421,208 | 1,421,208 | Yes |
-| votetypes | 15 | 15 | Yes |
-| posttypes | 8 | 8 | Yes |
-| linktypes | 2 | 2 | Yes |
-
----
-
-## Comparison: StackOverflow2010 vs StackOverflow2013
-
-| Metric | 2010 Dataset | 2013 Dataset | Scaling |
-|--------|--------------|--------------|---------|
-| Total Rows | 19.3M | 106M | 5.5x |
-| Migration Time | 141s | 318s | 2.3x |
-| Throughput | 137K rows/sec | 321K rows/sec | 2.3x |
-| Partitions | 22 | 38 | 1.7x |
-| Max Partition Time | ~115s | ~185s | 1.6x |
-
-**Key Finding:** 5.5x more data migrated in only 2.3x more time, demonstrating effective parallelism scaling.
-
----
-
-## Historical Run: StackOverflow2010 - 2025-11-23T17:18:15Z
+## Run: 2025-11-23T17:18:15Z
 
 **Run ID:** `manual__2025-11-23T17:18:15.048851+00:00`
 **Final Status:** Success (validation DAG triggered and passed)
@@ -197,9 +34,46 @@ Tables are automatically partitioned based on row count:
 | Comments (7) | 17:18:20.310 | 17:19:19.985 | 00:00:59.68 | 3,875,183 | 64,938 |
 | VoteTypes (8) | 17:18:20.805 | 17:18:21.661 | 00:00:00.86 | 15 | 18 |
 
-**Total Rows Migrated:** ~19.3M (~125,700 rows/sec overall)
+**Total Rows Migrated:** ~19.3M (≈125,700 rows/sec overall)
 
-### Source Database (StackOverflow2010)
+Key observations:
+- Streaming COPY kept memory flat while allowing adaptive chunks (no retries observed).
+- Map idx 4 (Votes) remains the dominant critical path at ~115s; all other tables completed in <60s.
+- Validation DAG (`validate_migration_env`) succeeded in 1.6s immediately after the transfer phase, confirming row-count parity.
+
+---
+
+**Run Date:** 2025-11-22
+**Run ID:** `manual__2025-11-22T22:33:42.629105+00:00`
+**Final Status:** Failed (validation task - data transfer successful)
+
+---
+
+## Execution Environment
+
+### Host System
+| Property | Value |
+|----------|-------|
+| OS | Darwin 25.1.0 (macOS) |
+| Architecture | arm64 |
+| CPU | Apple M3 Max |
+| Host Memory | 36 GB |
+
+### Docker Resources
+| Property | Value |
+|----------|-------|
+| Docker CPUs | 14 |
+| Docker Memory | 7.7 GB |
+
+### Database Versions
+| Database | Version |
+|----------|---------|
+| SQL Server | Microsoft SQL Server 2022 (RTM-CU21) - 16.0.4215.2 (X64) |
+| PostgreSQL | PostgreSQL 16.11 on aarch64-unknown-linux-musl |
+
+---
+
+## Source Database (StackOverflow2010)
 
 | Table | Rows |
 |-------|------|
@@ -216,110 +90,78 @@ Tables are automatically partitioned based on row count:
 
 ---
 
-## Performance Optimization Summary
+## Migration Timeline
 
-### Bottleneck Analysis
-
-1. **Primary Bottleneck: SQL Server Emulation (Rosetta 2)**
-   - SQL Server x86_64 runs under Rosetta 2 on Apple Silicon
-   - Estimated 40-50% performance penalty
-   - Native ARM SQL Server would achieve ~80-90 second migration
-
-2. **Secondary Bottleneck: Disk I/O**
-   - Docker Desktop virtualization adds filesystem overhead
-   - Multiple parallel reads/writes saturate disk subsystem
-   - Cannot optimize further without native filesystem access
-
-3. **Mitigated: Airflow Task Queuing**
-   - Increased parallelism from 32 to 64 max tasks per DAG
-   - All 38 partitions can now run concurrently
-   - No queuing delays observed
-
-### Optimizations Applied
-
-1. **Dynamic Partitioning** - Tables automatically partitioned by size
-2. **Increased Airflow Parallelism** - 64 concurrent tasks per DAG
-3. **PostgreSQL Tuning** - Optimized for bulk loading
-4. **Connection Pooling** - Reuses database connections
-5. **Keyset Pagination** - Efficient large table chunking
-
-### Recommendations for Production
-
-1. **Use native Linux** - Eliminates Rosetta 2 overhead (~40% faster)
-2. **Dedicated storage** - SSD with high IOPS for parallel writes
-3. **Increase PostgreSQL resources** - More shared_buffers for larger datasets
-4. **Consider CDC** - For incremental updates after initial load
+| Phase | Start Time (UTC) | End Time (UTC) | Duration |
+|-------|------------------|----------------|----------|
+| DAG Start | 22:33:43 | - | - |
+| extract_source_schema | 22:33:43 | 22:33:45 | 2.2s |
+| create_target_schema | 22:33:43 | 22:33:44 | 0.98s |
+| create_target_tables | 22:33:46 | 22:33:46 | 0.27s |
+| transfer_table_data (parallel) | 22:33:47 | 22:49:48 | ~16 min |
+| create_foreign_keys | 22:49:48 | 22:49:49 | 0.30s |
+| validate_migration | 22:49:48 | 22:51:22 | Failed (XCom error) |
+| **Total DAG Duration** | 22:33:43 | 22:51:24 | **17 min 41 sec** |
 
 ---
 
-## Hardware Comparison
+## Table Transfer Performance
 
-### Tested Systems
+| Table | Start (UTC) | End (UTC) | Duration | Rows | Rows/sec |
+|-------|-------------|-----------|----------|------|----------|
+| LinkTypes (idx 2) | 22:33:47 | 22:33:48 | 0.6s | 2 | 3 |
+| PostTypes (idx 5) | 22:33:48 | 22:33:49 | 1.0s | 8 | 8 |
+| VoteTypes (idx 8) | 22:33:49 | 22:33:50 | 0.9s | 15 | 17 |
+| PostLinks (idx 3) | 22:33:47 | 22:33:53 | 5.3s | 161,519 | 30,475 |
+| Users (idx 0) | 22:33:47 | 22:34:16 | 28.6s | 299,398 | 10,468 |
+| Badges (idx 6) | 22:33:48 | 22:34:08 | 19.3s | 1,102,019 | 57,099 |
+| Posts (idx 1) | 22:33:47 | 22:39:40 | 5 min 53s | 3,729,195* | 10,566 |
+| Comments (idx 7) | 22:33:49 | 22:44:44 | 10 min 55s | 3,875,183 | 5,917 |
+| Votes (idx 4) | 22:33:47 | 22:49:48 | 16 min 1s | 10,143,364 | 10,556 |
 
-| System | CPU | Cores | RAM | OS | Docker Backend |
-|--------|-----|-------|-----|-----|----------------|
-| Mac | Apple M3 Max | 14 | 36 GB | macOS Sequoia | Docker Desktop (native ARM) |
-| Windows | Intel/AMD | 16 | TBD | Windows 11 | Docker Desktop (WSL2) |
+*Note: Posts table transfer may be incomplete (2,910,000 rows in target vs 3,729,195 source)
 
-### Expected Performance by Platform
+---
 
-| Pipeline | Mac (M3 Max) | Windows (16-core) | Notes |
-|----------|--------------|-------------------|-------|
-| **MSSQL→PG** | 321K rows/sec | ~500K+ rows/sec | No Rosetta overhead on Windows |
+## Data Verification
 
-### Windows Setup
+| Table | Source Rows | Target Rows | Match |
+|-------|-------------|-------------|-------|
+| votes | 10,143,364 | 10,143,364 | Yes |
+| comments | 3,875,183 | 3,875,183 | Yes |
+| posts | 3,729,195 | 2,910,000 | **No** |
+| badges | 1,102,019 | 1,102,019 | Yes |
+| users | 299,398 | 299,398 | Yes |
+| postlinks | 161,519 | 161,519 | Yes |
+| votetypes | 15 | 15 | Yes |
+| posttypes | 8 | 8 | Yes |
+| linktypes | 2 | 2 | Yes |
 
-#### WSL2 Configuration (Recommended)
+---
 
-Create or edit `%UserProfile%\.wslconfig`:
+## Performance Metrics
 
-```ini
-[wsl2]
-memory=16GB
-processors=12
-swap=4GB
-```
+| Metric | Value |
+|--------|-------|
+| Total Rows Migrated | ~18,491,508 |
+| Overall Throughput | ~17,450 rows/sec |
+| Parallelism | 9 concurrent table transfers |
+| Chunk Size | 10,000 rows (default) |
+| Largest Table Duration | 16 min 1 sec (Votes - 10.1M rows) |
 
-Restart WSL after changes:
-```powershell
-wsl --shutdown
-```
+---
 
-#### Docker Desktop Settings
+## Issues Encountered
 
-1. Enable WSL2 backend (Settings → General → Use WSL 2 based engine)
-2. Resources → WSL Integration → Enable for your distro
-3. Allocate at least 12 CPUs and 12GB RAM
+1. **Validation Task Failure**: XCom not found error for offset=9 in `transfer_table_data`. The validation task retried 3 times and failed, causing `generate_final_report` to be skipped.
 
-#### Running on Windows
+2. **Posts Table Incomplete**: Target has 2,910,000 rows vs 3,729,195 source rows (78% complete). This may be a chunking issue where the last chunk didn't complete successfully despite task success status.
 
-```powershell
-# Pull latest optimizations
-git pull origin main
+---
 
-# Start databases
-docker-compose down
-docker-compose up -d
+## Recommendations
 
-# Wait for SQL Server to be ready (takes ~30-60 seconds)
-Start-Sleep -Seconds 60
-
-# Start Airflow
-astro dev restart
-
-# Connect databases to Airflow network
-$network = docker network ls --format "{{.Name}}" | Select-String "airflow"
-docker network connect $network mssql-server
-docker network connect $network postgres-target
-
-# Trigger migration
-$scheduler = docker ps --format "{{.Names}}" | Select-String "scheduler"
-docker exec $scheduler airflow dags trigger mssql_to_postgres_migration
-```
-
-### Why Windows Should Be Faster for MSSQL
-
-1. **Native x86 SQL Server** - No Rosetta 2 emulation (Mac ARM must emulate x86)
-2. **More CPU cores** - 16 cores vs 14 cores
-3. **WSL2 performance** - Near-native Linux performance for containers
-4. **Expected improvement** - ~50-60% faster than Mac M3 Max
+1. Investigate the Posts table transfer issue - may need to add explicit row count verification before marking task as success
+2. Fix XCom handling in validation task to gracefully handle missing return values
+3. Consider increasing chunk_size for large tables to reduce overhead
+4. Add retry logic at the chunk level for more resilient transfers
