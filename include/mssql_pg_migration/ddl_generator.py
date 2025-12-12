@@ -49,7 +49,7 @@ class DDLGenerator:
 
         # Start building the CREATE TABLE statement
         table_name = mapped_schema['table_name']
-        qualified_name = f"{target_schema}.{self._quote_identifier(table_name)}"
+        qualified_name = f"{self._quote_identifier(target_schema)}.{self._quote_identifier(table_name)}"
 
         unlogged_clause = "UNLOGGED " if unlogged else ""
         ddl_parts = [f"CREATE {unlogged_clause}TABLE {qualified_name} ("]
@@ -90,7 +90,7 @@ class DDLGenerator:
         Returns:
             DROP TABLE DDL statement
         """
-        qualified_name = f"{schema_name}.{self._quote_identifier(table_name)}"
+        qualified_name = f"{self._quote_identifier(schema_name)}.{self._quote_identifier(table_name)}"
         cascade_clause = " CASCADE" if cascade else ""
         return f"DROP TABLE IF EXISTS {qualified_name}{cascade_clause}"
 
@@ -106,7 +106,7 @@ class DDLGenerator:
         Returns:
             TRUNCATE TABLE DDL statement
         """
-        qualified_name = f"{schema_name}.{self._quote_identifier(table_name)}"
+        qualified_name = f"{self._quote_identifier(schema_name)}.{self._quote_identifier(table_name)}"
         cascade_clause = " CASCADE" if cascade else ""
         return f"TRUNCATE TABLE {qualified_name}{cascade_clause}"
 
@@ -131,7 +131,7 @@ class DDLGenerator:
             unique_clause = "UNIQUE " if index.get('is_unique') else ""
 
             ddl = f"CREATE {unique_clause}INDEX {self._quote_identifier(index_name)} " \
-                  f"ON {target_schema}.{self._quote_identifier(table_name)} ({columns})"
+                  f"ON {self._quote_identifier(target_schema)}.{self._quote_identifier(table_name)} ({columns})"
             index_statements.append(ddl)
 
         return index_statements
@@ -161,10 +161,10 @@ class DDLGenerator:
             on_delete = fk.get('on_delete', 'NO ACTION')
             on_update = fk.get('on_update', 'NO ACTION')
 
-            ddl = f"ALTER TABLE {target_schema}.{self._quote_identifier(table_name)} " \
+            ddl = f"ALTER TABLE {self._quote_identifier(target_schema)}.{self._quote_identifier(table_name)} " \
                   f"ADD CONSTRAINT {self._quote_identifier(constraint_name)} " \
                   f"FOREIGN KEY ({columns}) " \
-                  f"REFERENCES {target_schema}.{self._quote_identifier(ref_table)} ({ref_columns}) " \
+                  f"REFERENCES {self._quote_identifier(target_schema)}.{self._quote_identifier(ref_table)} ({ref_columns}) " \
                   f"ON DELETE {on_delete} ON UPDATE {on_update}"
             fk_statements.append(ddl)
 
@@ -196,7 +196,7 @@ class DDLGenerator:
             pg_definition = self._convert_check_constraint(definition)
 
             if pg_definition:
-                ddl = f"ALTER TABLE {target_schema}.{self._quote_identifier(table_name)} " \
+                ddl = f"ALTER TABLE {self._quote_identifier(target_schema)}.{self._quote_identifier(table_name)} " \
                       f"ADD CONSTRAINT {self._quote_identifier(constraint_name)} " \
                       f"CHECK {pg_definition}"
                 check_statements.append(ddl)
@@ -219,7 +219,7 @@ class DDLGenerator:
         Returns:
             ALTER TABLE SET LOGGED DDL statement
         """
-        qualified_name = f"{schema_name}.{self._quote_identifier(table_name)}"
+        qualified_name = f"{self._quote_identifier(schema_name)}.{self._quote_identifier(table_name)}"
         return f"ALTER TABLE {qualified_name} SET LOGGED"
 
     def generate_primary_key(self, table_schema: Dict[str, Any], target_schema: str = 'public') -> Optional[str]:
@@ -238,7 +238,7 @@ class DDLGenerator:
         """
         mapped_schema = map_table_schema(table_schema)
         table_name = mapped_schema['table_name']
-        qualified_name = f"{target_schema}.{self._quote_identifier(table_name)}"
+        qualified_name = f"{self._quote_identifier(target_schema)}.{self._quote_identifier(table_name)}"
 
         pk = mapped_schema.get('primary_key')
         if not pk:
@@ -361,29 +361,21 @@ class DDLGenerator:
 
     def _quote_identifier(self, identifier: str) -> str:
         """
-        Quote a PostgreSQL identifier if necessary.
+        Quote a PostgreSQL identifier safely.
+
+        Always quotes and escapes identifiers to prevent SQL injection and
+        handle reserved words, mixed case, and special characters.
 
         Args:
             identifier: Identifier to quote
 
         Returns:
-            Quoted identifier
+            Safely quoted identifier
         """
-        # List of PostgreSQL reserved words (simplified)
-        reserved_words = {
-            'user', 'order', 'group', 'table', 'column', 'select', 'insert',
-            'update', 'delete', 'where', 'from', 'join', 'left', 'right',
-            'inner', 'outer', 'cross', 'natural', 'using', 'on', 'as', 'case',
-            'when', 'then', 'else', 'end', 'null', 'not', 'and', 'or', 'in',
-            'exists', 'like', 'between', 'distinct', 'having', 'limit', 'offset'
-        }
-
-        # Quote if reserved word, contains special characters, or starts with number
-        if (identifier.lower() in reserved_words or
-            not identifier.replace('_', '').isalnum() or
-            identifier[0].isdigit()):
-            return f'"{identifier}"'
-        return identifier
+        # Escape embedded double quotes by doubling them (PostgreSQL standard)
+        escaped = identifier.replace('"', '""')
+        # Always quote to be safe - handles reserved words, mixed case, special chars
+        return f'"{escaped}"'
 
     def _convert_check_constraint(self, sql_server_definition: str) -> Optional[str]:
         """

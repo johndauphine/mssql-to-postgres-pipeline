@@ -22,6 +22,7 @@ import csv
 import math
 import pymssql
 from psycopg2 import pool as pg_pool
+from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
 
@@ -333,8 +334,11 @@ class DataTransfer:
                 query += f" WHERE {where_clause}"
             count = self.mssql_hook.get_first(query)[0]
         else:
-            # PostgreSQL - use unquoted names (PostgreSQL lowercases them)
-            query = f'SELECT COUNT(*) FROM {schema_name}.{table_name}'
+            # PostgreSQL - use safe identifier quoting
+            query = sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
+                sql.Identifier(schema_name),
+                sql.Identifier(table_name)
+            )
             count = self.postgres_hook.get_first(query)[0]
 
         return count or 0
@@ -347,7 +351,10 @@ class DataTransfer:
             schema_name: Schema name
             table_name: Table name
         """
-        query = f'TRUNCATE TABLE {schema_name}.{table_name} CASCADE'
+        query = sql.SQL('TRUNCATE TABLE {}.{} CASCADE').format(
+            sql.Identifier(schema_name),
+            sql.Identifier(table_name)
+        )
         self.postgres_hook.run(query)
 
     def _get_table_columns(self, schema_name: str, table_name: str) -> List[str]:
@@ -566,10 +573,12 @@ class DataTransfer:
         if not rows:
             return 0
 
-        column_list = ', '.join(columns)
-        copy_sql = (
-            f"COPY {schema_name}.{table_name} ({column_list}) "
-            "FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '')"
+        # Use safe identifier quoting for schema, table, and columns
+        quoted_columns = sql.SQL(', ').join([sql.Identifier(col) for col in columns])
+        copy_sql = sql.SQL('COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E\'\\t\', QUOTE \'""\', NULL \'\')').format(
+            sql.Identifier(schema_name),
+            sql.Identifier(table_name),
+            quoted_columns
         )
 
         stream = _CSVRowStream(rows, self._normalize_value)

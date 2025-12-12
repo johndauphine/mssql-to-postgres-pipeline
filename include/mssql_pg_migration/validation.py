@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
+from psycopg2 import sql
 import logging
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,11 @@ class MigrationValidator:
         source_query = f"SELECT COUNT(*) FROM [{source_schema}].[{source_table}]"
         source_count = self.mssql_hook.get_first(source_query)[0] or 0
 
-        # Get target row count
-        target_query = f'SELECT COUNT(*) FROM {target_schema}."{target_table}"'
+        # Get target row count - use safe identifier quoting
+        target_query = sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
+            sql.Identifier(target_schema),
+            sql.Identifier(target_table)
+        )
         target_count = self.postgres_hook.get_first(target_query)[0] or 0
 
         # Calculate difference
@@ -120,7 +124,6 @@ class MigrationValidator:
 
         # Build column lists
         source_columns = ', '.join([f'[{col}]' for col in key_columns])
-        target_columns = ', '.join([f'"{col}"' for col in key_columns])
 
         # Get sample from source
         source_query = f"""
@@ -130,12 +133,14 @@ class MigrationValidator:
         """
         source_sample = self.mssql_hook.get_records(source_query)
 
-        # Get sample from target
-        target_query = f"""
-        SELECT {target_columns}
-        FROM {target_schema}."{target_table}"
-        LIMIT {sample_size}
-        """
+        # Get sample from target - use safe identifier quoting
+        target_columns_sql = sql.SQL(', ').join([sql.Identifier(col) for col in key_columns])
+        target_query = sql.SQL('SELECT {} FROM {}.{} LIMIT {}').format(
+            target_columns_sql,
+            sql.Identifier(target_schema),
+            sql.Identifier(target_table),
+            sql.Literal(sample_size)
+        )
         target_sample = self.postgres_hook.get_records(target_query)
 
         # Compare samples
