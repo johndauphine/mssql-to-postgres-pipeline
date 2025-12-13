@@ -16,6 +16,7 @@ from airflow.sdk import Asset, dag, task
 from airflow.models.param import Param
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
+import pendulum
 from datetime import timedelta
 from typing import List, Dict, Any
 import logging
@@ -1065,8 +1066,8 @@ def mssql_to_postgres_migration():
 
         duration_seconds = 0
         if dag_run and dag_run.start_date:
-            # Use pendulum for timezone-aware safe diff
-            duration_seconds = (datetime.now() - dag_run.start_date).total_seconds()
+            # Use pendulum now for timezone-aware safe diff
+            duration_seconds = (pendulum.now("UTC") - dag_run.start_date).total_seconds()
 
         rows_per_second = int(total_rows / duration_seconds) if duration_seconds > 0 and total_rows else 0
         tables_list = [r.get("table_name", "unknown") for r in transfer_results]
