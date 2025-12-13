@@ -1065,7 +1065,8 @@ def mssql_to_postgres_migration():
 
         duration_seconds = 0
         if dag_run and dag_run.start_date:
-            duration_seconds = (datetime.utcnow() - dag_run.start_date.replace(tzinfo=None)).total_seconds()
+            # Use pendulum for timezone-aware safe diff
+            duration_seconds = (datetime.now() - dag_run.start_date).total_seconds()
 
         rows_per_second = int(total_rows / duration_seconds) if duration_seconds > 0 and total_rows else 0
         tables_list = [r.get("table_name", "unknown") for r in transfer_results]
