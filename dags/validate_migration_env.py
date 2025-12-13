@@ -19,7 +19,8 @@ from datetime import timedelta
 import logging
 import os
 import pymssql
-import pg8000
+import psycopg2
+from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
     doc_md=__doc__,
     default_args={
         "owner": "data-team",
-        "retries": 0,
+        "retries": 2,
     },
     params={
         "source_schema": Param(default="dbo", type="string"),
@@ -91,7 +92,7 @@ def validate_migration_env():
             return f"SQL Server connection failed: {e}"
 
         try:
-            postgres_conn = pg8000.connect(**postgres_config)
+            postgres_conn = psycopg2.connect(**postgres_config)
             postgres_cursor = postgres_conn.cursor()
             logger.info(f"✓ Connected to PostgreSQL: {postgres_config['host']}")
         except Exception as e:
@@ -144,13 +145,16 @@ def validate_migration_env():
             source_count = source_counts[table_name]
 
             # Query target
-            target_table = table_name.lower()
             try:
-                postgres_cursor.execute(
-                    f'SELECT COUNT(*) FROM {target_schema}."{target_table}"'
+                # Preserve identifier case to match how tables were created; quote safely
+                query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                    sql.Identifier(target_schema),
+                    sql.Identifier(table_name),
                 )
+                postgres_cursor.execute(query)
                 target_count = postgres_cursor.fetchone()[0]
-            except:
+            except Exception as e:
+                logger.warning(f"Failed to count target table {target_schema}.{table_name}: {e}")
                 target_count = None
                 missing += 1
 

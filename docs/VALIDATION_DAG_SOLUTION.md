@@ -29,7 +29,7 @@ We created multiple standalone validation DAGs to work around these issues:
 - **Learning**: Airflow 3 SDK has problems resolving connections from hooks
 
 ### 2. Second Attempt: `validate_migration_standalone_v2.py`
-- **Approach**: Used `BaseHook.get_connection()` to retrieve connection details, then direct connections with `pymssql` and `pg8000`
+- **Approach**: Used `BaseHook.get_connection()` to retrieve connection details, then direct connections with `pymssql` and `psycopg2`
 - **Result**: More promising but still had issues
 - **Learning**: Direct database connections work but need proper configuration
 
@@ -62,9 +62,9 @@ postgres_config = {
     'password': os.environ.get('POSTGRES_PASSWORD', 'PostgresPassword123'),
 }
 
-# Direct connections using pymssql and pg8000
+# Direct connections using pymssql and psycopg2
 mssql_conn = pymssql.connect(**mssql_config)
-postgres_conn = pg8000.connect(**postgres_config)
+postgres_conn = psycopg2.connect(**postgres_config)
 ```
 
 ## Key Design Decisions
@@ -76,7 +76,7 @@ postgres_conn = pg8000.connect(**postgres_config)
 
 ### 2. Direct Database Connections
 - Uses `pymssql` for SQL Server (instead of `MsSqlHook`)
-- Uses `pg8000` for PostgreSQL (pure Python, no C dependencies)
+- Uses `psycopg2` for PostgreSQL
 - Bypasses Airflow connection resolution issues
 
 ### 3. Environment Variable Configuration
@@ -140,7 +140,7 @@ astro dev run dags trigger validate_migration_env
 Required Python packages (already in `requirements.txt`):
 ```
 pymssql>=2.2.0
-pg8000>=1.30.0
+psycopg2-binary>=2.9.9
 ```
 
 ## Known Issues

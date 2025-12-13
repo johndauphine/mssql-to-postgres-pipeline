@@ -126,8 +126,8 @@ conn.close()
 
 # Test PostgreSQL connection
 run_test "PostgreSQL Connection" "docker exec ${CONTAINER_PREFIX}-scheduler-1 python -c \"
-import pg8000
-conn = pg8000.connect(host='postgres-target', port=5432, database='stackoverflow', user='postgres', password='PostgresPassword123')
+import psycopg2
+conn = psycopg2.connect(host='postgres-target', port=5432, database='stackoverflow', user='postgres', password='PostgresPassword123')
 cursor = conn.cursor()
 cursor.execute('SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s', ('public',))
 count = cursor.fetchone()[0]
@@ -177,11 +177,12 @@ echo "=================="
 echo "Running detailed validation..."
 docker exec ${CONTAINER_PREFIX}-scheduler-1 python -c "
 import pymssql
-import pg8000
+import psycopg2
+from psycopg2 import sql
 
 # Connect to both databases
 mssql_conn = pymssql.connect(server='mssql-server', port=1433, database='StackOverflow2010', user='sa', password='YourStrong@Passw0rd')
-postgres_conn = pg8000.connect(host='postgres-target', port=5432, database='stackoverflow', user='postgres', password='PostgresPassword123')
+postgres_conn = psycopg2.connect(host='postgres-target', port=5432, database='stackoverflow', user='postgres', password='PostgresPassword123')
 
 mssql_cursor = mssql_conn.cursor()
 postgres_cursor = postgres_conn.cursor()
@@ -197,9 +198,14 @@ for table in tables:
 
     # PostgreSQL count
     try:
-        postgres_cursor.execute(f\"SELECT COUNT(*) FROM public.\\\"{table.lower()}\\\"\")
+        query = sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
+            sql.Identifier('public'),
+            sql.Identifier(table.lower()),
+        )
+        postgres_cursor.execute(query)
         target_count = postgres_cursor.fetchone()[0]
-    except:
+    except Exception as e:
+        print(f\"{table}: ERROR - {e}\")
         target_count = 0
 
     match = '✓' if source_count == target_count else '✗'

@@ -71,8 +71,8 @@ class TestDAGValidation:
             "extract_source_schema",
             "create_target_schema",
             "create_target_tables",
-            "validate_migration",
-            "generate_final_report",
+            "trigger_validation_dag",
+            "generate_migration_summary",
         ]
 
         for task_id in expected_tasks:
@@ -81,7 +81,7 @@ class TestDAGValidation:
     def test_dag_schedule(self, dag_bag):
         """Test that the DAG has appropriate schedule settings."""
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        assert dag.schedule_interval is None, "Migration DAG should be manually triggered"
+        assert dag.schedule is None, "Migration DAG should be manually triggered"
         assert dag.catchup is False, "Migration DAG should not catch up"
         assert dag.max_active_runs == 1, "Only one migration should run at a time"
 
@@ -171,7 +171,7 @@ class TestTypeMapping:
         assert type_mapping.map_default_value("(getdate())") == "CURRENT_TIMESTAMP"
         assert type_mapping.map_default_value("newid()") == "gen_random_uuid()"
         assert type_mapping.map_default_value("(0)") == "0"
-        assert type_mapping.map_default_value("('active')") == "('active')"
+        assert type_mapping.map_default_value("('active')") == "'active'"
 
 
 class TestValidation:
@@ -188,7 +188,11 @@ class TestValidation:
 
         # Mock PostgreSQL connection
         mock_pg = MagicMock()
-        mock_pg.get_first.return_value = (1000,)
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_pg.get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (1000,)
         mock_pg_hook.return_value = mock_pg
 
         validator = validation.MigrationValidator("mssql_conn", "pg_conn")
@@ -210,7 +214,11 @@ class TestValidation:
 
         # Mock PostgreSQL connection
         mock_pg = MagicMock()
-        mock_pg.get_first.return_value = (950,)
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_pg.get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (950,)
         mock_pg_hook.return_value = mock_pg
 
         validator = validation.MigrationValidator("mssql_conn", "pg_conn")
@@ -293,9 +301,9 @@ class TestDDLGenerator:
         assert generator._quote_identifier("order") == '"order"'
         assert generator._quote_identifier("table") == '"table"'
 
-        # Normal identifiers shouldn't be quoted
-        assert generator._quote_identifier("users") == "users"
-        assert generator._quote_identifier("customer_id") == "customer_id"
+        # Normal identifiers should be quoted too (safe by default)
+        assert generator._quote_identifier("users") == '"users"'
+        assert generator._quote_identifier("customer_id") == '"customer_id"'
 
         # Special characters should trigger quoting
         assert generator._quote_identifier("user-id") == '"user-id"'
@@ -308,10 +316,10 @@ class TestDDLGenerator:
         generator = DDLGenerator.__new__(DDLGenerator)
 
         ddl = generator.generate_drop_table("users", "public", cascade=True)
-        assert ddl == 'DROP TABLE IF EXISTS public."users" CASCADE'
+        assert ddl == 'DROP TABLE IF EXISTS "public"."users" CASCADE'
 
         ddl = generator.generate_drop_table("products", "store", cascade=False)
-        assert ddl == 'DROP TABLE IF EXISTS store.products'
+        assert ddl == 'DROP TABLE IF EXISTS "store"."products"'
 
     def test_truncate_table_generation(self):
         """Test TRUNCATE TABLE statement generation."""
@@ -320,7 +328,7 @@ class TestDDLGenerator:
         generator = DDLGenerator.__new__(DDLGenerator)
 
         ddl = generator.generate_truncate_table("users", "public", cascade=True)
-        assert ddl == 'TRUNCATE TABLE public."users" CASCADE'
+        assert ddl == 'TRUNCATE TABLE "public"."users" CASCADE'
 
 
 if __name__ == "__main__":
