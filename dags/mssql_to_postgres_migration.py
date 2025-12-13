@@ -29,9 +29,9 @@ from include.mssql_pg_migration import (
     validation,
 )
 from include.mssql_pg_migration.notifications import (
-    on_dag_success,
     on_dag_failure,
     on_task_failure,
+    send_success_notification,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,6 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
         "pool": "default_pool",  # Use default pool for all tasks
         "on_failure_callback": on_task_failure,
     },
-    on_success_callback=on_dag_success,
     on_failure_callback=on_dag_failure,
     params={
         "source_conn_id": Param(
@@ -1056,8 +1055,44 @@ def mssql_to_postgres_migration():
     # Generate final report (simplified version without validation results)
     @task
     def generate_migration_summary(**context):
-        """Generate a summary of the migration."""
-        logger.info("Migration completed successfully!")
+        """Generate a summary of the migration and send notifications."""
+        dag_run = context.get("dag_run")
+        ti = context["ti"]
+
+        transfer_results = ti.xcom_pull(task_ids="collect_all_results", key="return_value") or []
+        tables_migrated = len(transfer_results)
+        total_rows = sum(r.get("rows_transferred", 0) for r in transfer_results)
+
+        duration_seconds = 0
+        if dag_run and dag_run.start_date:
+            duration_seconds = (datetime.now() - dag_run.start_date).total_seconds()
+
+        rows_per_second = int(total_rows / duration_seconds) if duration_seconds > 0 and total_rows else 0
+        tables_list = [r.get("table_name", "unknown") for r in transfer_results]
+
+        stats = {
+            "tables_migrated": tables_migrated,
+            "total_rows": total_rows,
+            "rows_per_second": rows_per_second,
+            "tables_list": tables_list,
+        }
+
+        logger.info(
+            "Migration summary: tables=%s, rows=%s, duration=%.2fs, rps=%s",
+            tables_migrated,
+            total_rows,
+            duration_seconds,
+            rows_per_second,
+        )
+
+        send_success_notification(
+            dag_id=dag_run.dag_id if dag_run else "unknown",
+            run_id=dag_run.run_id if dag_run else "unknown",
+            start_date=dag_run.start_date if dag_run else None,
+            duration_seconds=duration_seconds,
+            stats=stats,
+        )
+
         logger.info("Validation DAG has been triggered to verify data integrity.")
         return "Migration complete. Check validation DAG for results."
 
