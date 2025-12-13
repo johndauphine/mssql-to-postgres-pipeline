@@ -596,10 +596,6 @@ def on_dag_failure(context: Dict[str, Any]) -> None:
         logger.debug("Notifications disabled, skipping failure callback")
         return
 
-    # Deduplicate DAG failure emails when a task-level failure already sent one
-    if not _mark_failure_notification(context.get('dag_run')):
-        return
-
     channels = get_notification_channels()
     if not channels:
         logger.debug("No notification channels configured")
@@ -686,10 +682,6 @@ def on_task_failure(context: Dict[str, Any]) -> None:
         default_args={'on_failure_callback': on_task_failure, ...}
     """
     if not is_notifications_enabled():
-        return
-
-    # Deduplicate task failure vs. DAG failure notifications
-    if not _mark_failure_notification(context.get('dag_run')):
         return
 
     channels = get_notification_channels()
@@ -994,7 +986,9 @@ def send_failure_notification(
         logger.info("Notifications disabled, skipping failure notification")
         return
 
-    if not _mark_failure_notification(run_id=run_id, dag_id=dag_id):
+    # Deduplicate only after we actually send once per run
+    if not _should_send_failure_notification(dag_id, run_id):
+        logger.info(f"Skipping duplicate failure notification for {dag_id}:{run_id}")
         return
 
     channels = get_notification_channels()
@@ -1088,15 +1082,16 @@ This is an automated notification from the MSSQL to PostgreSQL Migration Pipelin
         result = send_email_notification(subject, body, html_body)
         logger.info(f"Failure email notification sent: {result}")
 
+    # Mark that we sent (or attempted) a failure notification for this run
+    _update_failure_notice_ts(dag_id, run_id)
 
-def _mark_failure_notification(dag_run=None, *, dag_id: Optional[str] = None, run_id: Optional[str] = None) -> bool:
+
+def _should_send_failure_notification(dag_id: Optional[str], run_id: Optional[str]) -> bool:
     """
     Returns True if we should send a failure notification, False if a recent one was sent.
     Uses an in-process window to prevent duplicate DAG + task failure emails for the same run.
     """
     try:
-        dag_id = dag_id or getattr(dag_run, 'dag_id', None)
-        run_id = run_id or getattr(dag_run, 'run_id', None)
         if not dag_id or not run_id:
             return True  # cannot dedupe without identifiers
 
@@ -1104,11 +1099,19 @@ def _mark_failure_notification(dag_run=None, *, dag_id: Optional[str] = None, ru
         now = time()
         last = _last_failure_notice_ts.get(key)
         if last and (now - last) < _FAILURE_DEDUPE_WINDOW_SECONDS:
-            logger.info(f"Skipping duplicate failure notification for {key}")
             return False
-
-        _last_failure_notice_ts[key] = now
         return True
     except Exception as exc:
         logger.warning(f"Failed to check failure notification dedupe: {exc}")
         return True
+
+
+def _update_failure_notice_ts(dag_id: Optional[str], run_id: Optional[str]) -> None:
+    """Record that we sent a failure notification for this run."""
+    try:
+        if not dag_id or not run_id:
+            return
+        key = f"{dag_id}:{run_id}"
+        _last_failure_notice_ts[key] = time()
+    except Exception as exc:
+        logger.warning(f"Failed to update failure notification timestamp: {exc}")
