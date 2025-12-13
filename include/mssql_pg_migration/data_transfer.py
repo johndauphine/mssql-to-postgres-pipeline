@@ -387,15 +387,14 @@ class DataTransfer:
         columns = self.mssql_hook.get_records(query, parameters=[schema_name, table_name])
         return [col[0] for col in columns]
 
-    def _get_primary_key_column(
+    def _get_primary_key_columns(
         self,
         schema_name: str,
         table_name: str,
         columns: List[str]
-    ) -> str:
+    ) -> List[str]:
         """
-        Get the primary key column for keyset pagination.
-        Prefers 'Id' column if available, otherwise uses the first column.
+        Get all primary key columns for keyset pagination (supports composite PKs).
 
         Args:
             schema_name: Schema name
@@ -403,13 +402,8 @@ class DataTransfer:
             columns: List of available columns
 
         Returns:
-            Column name to use for keyset pagination
+            List of PK column names in ordinal order, or fallback to single column
         """
-        # Prefer 'Id' column if it exists (case-insensitive)
-        for col in columns:
-            if col.lower() == 'id':
-                return col
-
         # Try to get actual primary key from database
         query = """
         SELECT c.name
@@ -424,12 +418,40 @@ class DataTransfer:
         try:
             pk_cols = self.mssql_hook.get_records(query, parameters=[schema_name, table_name])
             if pk_cols:
-                return pk_cols[0][0]
+                # Return all PK columns in order
+                return [col[0] for col in pk_cols]
         except Exception:
             pass
 
-        # Fallback to first column
-        return columns[0] if columns else 'Id'
+        # Fallback: prefer 'Id' column if it exists (case-insensitive)
+        for col in columns:
+            if col.lower() == 'id':
+                return [col]
+
+        # Final fallback to first column
+        return [columns[0]] if columns else ['Id']
+
+    def _get_primary_key_column(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: List[str]
+    ) -> str:
+        """
+        Get the primary key column for keyset pagination (legacy, single PK).
+
+        Deprecated: Use _get_primary_key_columns() for composite PK support.
+
+        Args:
+            schema_name: Schema name
+            table_name: Table name
+            columns: List of available columns
+
+        Returns:
+            Column name to use for keyset pagination
+        """
+        pk_cols = self._get_primary_key_columns(schema_name, table_name, columns)
+        return pk_cols[0] if pk_cols else (columns[0] if columns else 'Id')
 
     def _calculate_optimal_chunk_size(self, row_count: int, requested_chunk: int) -> int:
         """Determine an appropriate chunk size based on table volume."""
