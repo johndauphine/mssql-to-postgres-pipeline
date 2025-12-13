@@ -28,6 +28,11 @@ from include.mssql_pg_migration import (
     data_transfer,
     validation,
 )
+from include.mssql_pg_migration.notifications import (
+    on_dag_success,
+    on_dag_failure,
+    on_task_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +87,10 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
         "retry_exponential_backoff": False,
         "max_retry_delay": timedelta(minutes=30),
         "pool": "default_pool",  # Use default pool for all tasks
+        "on_failure_callback": on_task_failure,
     },
+    on_success_callback=on_dag_success,
+    on_failure_callback=on_dag_failure,
     params={
         "source_conn_id": Param(
             default="mssql_source",
