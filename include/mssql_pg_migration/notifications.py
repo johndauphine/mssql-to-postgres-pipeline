@@ -279,24 +279,50 @@ def get_migration_stats_from_dag_run(dag_run) -> Dict[str, Any]:
 
         logger.info(f"Getting migration stats from DagRun: {dag_run}")
 
-        # Get task instance to pull XCom values (Airflow 3.0 compatible)
-        ti = dag_run.get_task_instance('extract_source_schema')
-        if ti:
-            logger.info(f"Found task instance: {ti}")
-            # Get extracted tables info
-            extracted_tables = ti.xcom_pull(key='extracted_tables')
+        def _get_ti(dg, task_id: str):
+            ti_obj = None
+            try:
+                ti_obj = dg.get_task_instance(task_id)
+            except Exception as ex:
+                logger.warning(f"Could not get task instance {task_id} from provided DagRun: {ex}")
+            if ti_obj:
+                return ti_obj
+            # Fallback: reload DagRun from DB (Airflow callbacks sometimes pass a lightweight object)
+            reloaded = get_dag_run_from_db(dg.dag_id, dg.run_id)
+            if reloaded:
+                try:
+                    return reloaded.get_task_instance(task_id)
+                except Exception as ex:
+                    logger.warning(f"Fallback DagRun lookup failed for {task_id}: {ex}")
+            return None
+
+        # Pull extracted schema stats
+        ti_extract = _get_ti(dag_run, 'extract_source_schema')
+        if ti_extract:
+            logger.info(f"Found task instance: {ti_extract}")
+            extracted_tables = ti_extract.xcom_pull(key='extracted_tables')
             logger.info(f"extracted_tables XCom: {extracted_tables}")
             if extracted_tables:
                 stats['tables_list'] = extracted_tables
                 stats['tables_migrated'] = len(extracted_tables)
 
-            # Get total row count
-            total_rows = ti.xcom_pull(key='total_row_count')
+            total_rows = ti_extract.xcom_pull(key='total_row_count')
             logger.info(f"total_row_count XCom: {total_rows}")
             if total_rows:
                 stats['total_rows'] = total_rows
         else:
             logger.warning("Could not get task instance for extract_source_schema")
+
+        # Fallback: aggregate from collect_all_results return value if schema XComs are missing
+        if stats['tables_migrated'] == 0 or stats['total_rows'] == 0:
+            ti_collect = _get_ti(dag_run, 'collect_all_results')
+            if ti_collect:
+                results = ti_collect.xcom_pull(task_ids='collect_all_results', key='return_value')
+                logger.info(f"collect_all_results XCom: {results}")
+                if results and isinstance(results, list):
+                    stats['tables_migrated'] = len(results)
+                    stats['tables_list'] = [r.get('table_name', 'unknown') for r in results]
+                    stats['total_rows'] = sum(r.get('rows_transferred', 0) for r in results)
 
         # Calculate throughput if we have duration and rows
         if dag_run.start_date and dag_run.end_date and stats['total_rows']:
