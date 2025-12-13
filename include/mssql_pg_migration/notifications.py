@@ -596,79 +596,10 @@ def on_dag_failure(context: Dict[str, Any]) -> None:
         logger.debug("Notifications disabled, skipping failure callback")
         return
 
-    channels = get_notification_channels()
-    if not channels:
-        logger.debug("No notification channels configured")
-        return
-
-    info = format_dag_context(context)
-    exception = context.get('exception')
-
-    title = f"❌ DAG Failed: {info['dag_id']}"
-    error_msg = str(exception) if exception else 'Unknown error'
-    message = f"Migration pipeline failed.\n\nError: {error_msg}"
-
-    fields = [
-        {'title': 'DAG', 'value': info['dag_id']},
-        {'title': 'Run ID', 'value': info['run_id']},
-        {'title': 'Started', 'value': info['start_date']},
-        {'title': 'Duration', 'value': info['duration']},
-        {'title': 'Error', 'value': error_msg[:100], 'short': False},
-    ]
-
-    if 'slack' in channels:
-        send_slack_notification(
-            message=message,
-            title=title,
-            color='#dc3545',  # red
-            fields=fields
-        )
-
-    if 'email' in channels:
-        subject = title
-        body = f"""{title}
-
-Migration pipeline failed.
-
-Run Details:
-  • DAG: {info['dag_id']}
-  • Run ID: {info['run_id']}
-  • Started: {info['start_date']}
-  • Duration: {info['duration']}
-
-Error:
-{error_msg}
-
-Please check the Airflow UI for more details.
-
-This is an automated notification from the MSSQL to PostgreSQL Migration Pipeline.
-"""
-        html_body = f"""
-<html>
-<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-<h2 style="color: #dc3545; border-bottom: 2px solid #dc3545; padding-bottom: 10px;">{title}</h2>
-<p>Migration pipeline failed.</p>
-
-<h3>Run Details</h3>
-<table style="border-collapse: collapse; width: 100%;">
-<tr style="background: #f8f9fa;"><td style="padding: 8px; font-weight: bold; width: 150px;">DAG:</td><td style="padding: 8px;">{info['dag_id']}</td></tr>
-<tr><td style="padding: 8px; font-weight: bold;">Run ID:</td><td style="padding: 8px; font-family: monospace; font-size: 12px;">{info['run_id']}</td></tr>
-<tr style="background: #f8f9fa;"><td style="padding: 8px; font-weight: bold;">Started:</td><td style="padding: 8px;">{info['start_date']}</td></tr>
-<tr><td style="padding: 8px; font-weight: bold;">Duration:</td><td style="padding: 8px;">{info['duration']}</td></tr>
-</table>
-
-<h3 style="color: #dc3545;">Error</h3>
-<pre style="background: #fff3f3; padding: 15px; border-radius: 5px; border-left: 4px solid #dc3545; overflow-x: auto;">{error_msg}</pre>
-
-<p>Please check the Airflow UI for more details.</p>
-
-<p style="color: #666; font-size: 12px; margin-top: 20px; border-top: 1px solid #ddd; padding-top: 10px;">
-This is an automated notification from the MSSQL to PostgreSQL Migration Pipeline.
-</p>
-</body>
-</html>
-"""
-        send_email_notification(subject, body, html_body)
+    # To avoid duplicate emails, we skip DAG-level failure notifications entirely;
+    # task-level failure callbacks will send the single failure notice.
+    logger.info("Skipping DAG failure notification; relying on task-level failure notice.")
+    return
 
 
 def on_task_failure(context: Dict[str, Any]) -> None:
