@@ -353,7 +353,7 @@ Large validation results can cause XCom serialization issues. The pipeline uses 
 - apache-airflow-providers-microsoft-mssql >= 3.8.0
 - apache-airflow-providers-postgres >= 5.12.0
 - pymssql >= 2.2.0
-- pg8000 >= 1.30.0
+- psycopg2-binary >= 2.9.9
 
 ## License
 

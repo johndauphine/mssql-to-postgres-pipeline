@@ -19,8 +19,8 @@ from datetime import timedelta
 import logging
 import os
 import pymssql
-import pg8000
-from pg8000 import dbapi as pg_dbapi
+import psycopg2
+from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ def validate_migration_env():
             return f"SQL Server connection failed: {e}"
 
         try:
-            postgres_conn = pg8000.connect(**postgres_config)
+            postgres_conn = psycopg2.connect(**postgres_config)
             postgres_cursor = postgres_conn.cursor()
             logger.info(f"✓ Connected to PostgreSQL: {postgres_config['host']}")
         except Exception as e:
@@ -147,8 +147,10 @@ def validate_migration_env():
             # Query target
             try:
                 # Preserve identifier case to match how tables were created; quote safely
-                target_ident = pg_dbapi.Identifier(target_schema, table_name)
-                query = pg_dbapi.SQL('SELECT COUNT(*) FROM {}').format(target_ident)
+                query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                    sql.Identifier(target_schema),
+                    sql.Identifier(table_name),
+                )
                 postgres_cursor.execute(query)
                 target_count = postgres_cursor.fetchone()[0]
             except Exception as e:
