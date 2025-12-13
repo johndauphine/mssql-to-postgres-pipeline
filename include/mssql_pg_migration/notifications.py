@@ -277,6 +277,16 @@ def get_migration_stats_from_dag_run(dag_run) -> Dict[str, Any]:
             logger.warning("No dag_run provided")
             return stats
 
+        # Always reload a full DagRun from the DB to avoid lightweight DTO limitations
+        try:
+            dag_id = getattr(dag_run, 'dag_id', None)
+            run_id = getattr(dag_run, 'run_id', None)
+            reloaded = get_dag_run_from_db(dag_id, run_id)
+            if reloaded:
+                dag_run = reloaded
+        except Exception as ex:
+            logger.warning(f"Could not reload DagRun from DB: {ex}")
+
         logger.info(f"Getting migration stats from DagRun: {dag_run}")
 
         def _get_ti(dg, task_id: str):
@@ -302,14 +312,14 @@ def get_migration_stats_from_dag_run(dag_run) -> Dict[str, Any]:
             logger.info(f"Found task instance: {ti_extract}")
             extracted_tables = ti_extract.xcom_pull(key='extracted_tables')
             logger.info(f"extracted_tables XCom: {extracted_tables}")
-            if extracted_tables:
+            if extracted_tables is not None:
                 stats['tables_list'] = extracted_tables
                 stats['tables_migrated'] = len(extracted_tables)
 
             total_rows = ti_extract.xcom_pull(key='total_row_count')
             logger.info(f"total_row_count XCom: {total_rows}")
-            if total_rows:
-                stats['total_rows'] = total_rows
+            if total_rows is not None:
+                stats['total_rows'] = int(total_rows)
         else:
             logger.warning("Could not get task instance for extract_source_schema")
 
