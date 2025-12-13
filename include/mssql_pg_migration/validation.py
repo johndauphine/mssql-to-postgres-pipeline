@@ -57,7 +57,11 @@ class MigrationValidator:
             sql.Identifier(target_schema),
             sql.Identifier(target_table)
         )
-        target_count = self.postgres_hook.get_first(target_query)[0] or 0
+        # Execute using cursor to handle sql.SQL objects
+        conn = self.postgres_hook.get_conn()
+        with conn.cursor() as cursor:
+            cursor.execute(target_query)
+            target_count = cursor.fetchone()[0] or 0
 
         # Calculate difference
         row_difference = target_count - source_count
@@ -141,7 +145,11 @@ class MigrationValidator:
             sql.Identifier(target_table),
             sql.Literal(sample_size)
         )
-        target_sample = self.postgres_hook.get_records(target_query)
+        # Execute using cursor to handle sql.SQL objects
+        conn = self.postgres_hook.get_conn()
+        with conn.cursor() as cursor:
+            cursor.execute(target_query)
+            target_sample = cursor.fetchall()
 
         # Compare samples
         matches = 0

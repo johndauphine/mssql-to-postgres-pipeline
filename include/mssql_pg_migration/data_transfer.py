@@ -339,7 +339,11 @@ class DataTransfer:
                 sql.Identifier(schema_name),
                 sql.Identifier(table_name)
             )
-            count = self.postgres_hook.get_first(query)[0]
+            # Execute using cursor to handle sql.SQL objects
+            conn = self.postgres_hook.get_conn()
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                count = cursor.fetchone()[0]
 
         return count or 0
 
@@ -355,7 +359,11 @@ class DataTransfer:
             sql.Identifier(schema_name),
             sql.Identifier(table_name)
         )
-        self.postgres_hook.run(query)
+        # Execute using cursor to handle sql.SQL objects
+        conn = self.postgres_hook.get_conn()
+        with conn.cursor() as cursor:
+            cursor.execute(query)
+        conn.commit()
 
     def _get_table_columns(self, schema_name: str, table_name: str) -> List[str]:
         """
@@ -575,7 +583,7 @@ class DataTransfer:
 
         # Use safe identifier quoting for schema, table, and columns
         quoted_columns = sql.SQL(', ').join([sql.Identifier(col) for col in columns])
-        copy_sql = sql.SQL('COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E\'\\t\', QUOTE \'""\', NULL \'\')').format(
+        copy_sql = sql.SQL('COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E\'\\t\', QUOTE \'"\', NULL \'\')').format(
             sql.Identifier(schema_name),
             sql.Identifier(table_name),
             quoted_columns
