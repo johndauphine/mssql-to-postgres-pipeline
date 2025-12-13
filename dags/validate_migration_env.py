@@ -20,6 +20,7 @@ import logging
 import os
 import pymssql
 import pg8000
+from pg8000 import dbapi as pg_dbapi
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
     doc_md=__doc__,
     default_args={
         "owner": "data-team",
-        "retries": 0,
+        "retries": 2,
     },
     params={
         "source_schema": Param(default="dbo", type="string"),
@@ -144,13 +145,14 @@ def validate_migration_env():
             source_count = source_counts[table_name]
 
             # Query target
-            target_table = table_name.lower()
             try:
-                postgres_cursor.execute(
-                    f'SELECT COUNT(*) FROM {target_schema}."{target_table}"'
-                )
+                # Preserve identifier case to match how tables were created; quote safely
+                target_ident = pg_dbapi.Identifier(target_schema, table_name)
+                query = pg_dbapi.SQL('SELECT COUNT(*) FROM {}').format(target_ident)
+                postgres_cursor.execute(query)
                 target_count = postgres_cursor.fetchone()[0]
-            except:
+            except Exception as e:
+                logger.warning(f"Failed to count target table {target_schema}.{table_name}: {e}")
                 target_count = None
                 missing += 1
 

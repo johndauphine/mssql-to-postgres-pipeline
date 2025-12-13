@@ -286,6 +286,12 @@ class DataTransfer:
         elapsed_time = time.time() - start_time
         avg_rows_per_second = rows_transferred / elapsed_time if elapsed_time > 0 else 0
 
+        partial_load = bool(where_clause) or use_row_number
+
+        success = len(errors) == 0 and (
+            rows_transferred > 0 if partial_load else target_row_count == source_row_count
+        )
+
         result = {
             'source_table': f"{source_schema}.{source_table}",
             'target_table': f"{target_schema}.{target_table}",
@@ -296,7 +302,7 @@ class DataTransfer:
             'chunk_size': chunk_size,
             'elapsed_time_seconds': elapsed_time,
             'avg_rows_per_second': avg_rows_per_second,
-            'success': len(errors) == 0 and target_row_count == source_row_count,
+            'success': success,
             'errors': errors,
             'timestamp': datetime.now().isoformat(),
         }
@@ -328,24 +334,28 @@ class DataTransfer:
             Row count
         """
         if is_source:
-            # SQL Server
             query = f"SELECT COUNT(*) FROM [{schema_name}].[{table_name}]"
             if where_clause:
                 query += f" WHERE {where_clause}"
             count = self.mssql_hook.get_first(query)[0]
-        else:
-            # PostgreSQL - use safe identifier quoting
-            query = sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
-                sql.Identifier(schema_name),
-                sql.Identifier(table_name)
-            )
-            # Execute using cursor to handle sql.SQL objects
+            return count or 0
+
+        query = sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
+            sql.Identifier(schema_name),
+            sql.Identifier(table_name)
+        )
+        count = 0
+        conn = None
+        try:
             conn = self.postgres_hook.get_conn()
             with conn.cursor() as cursor:
                 cursor.execute(query)
-                count = cursor.fetchone()[0]
+                count = cursor.fetchone()[0] or 0
+        finally:
+            if conn:
+                conn.close()
 
-        return count or 0
+        return count
 
     def _truncate_table(self, schema_name: str, table_name: str) -> None:
         """
@@ -359,11 +369,15 @@ class DataTransfer:
             sql.Identifier(schema_name),
             sql.Identifier(table_name)
         )
-        # Execute using cursor to handle sql.SQL objects
-        conn = self.postgres_hook.get_conn()
-        with conn.cursor() as cursor:
-            cursor.execute(query)
-        conn.commit()
+        conn = None
+        try:
+            conn = self.postgres_hook.get_conn()
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+            conn.commit()
+        finally:
+            if conn:
+                conn.close()
 
     def _get_table_columns(self, schema_name: str, table_name: str) -> List[str]:
         """
