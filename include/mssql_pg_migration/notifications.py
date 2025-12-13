@@ -21,6 +21,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime, timezone
+from time import time
 import urllib.request
 import urllib.error
 import functools
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 # Global storage for exception info (used by on_failure_callback)
 # This is a workaround for Airflow 3.0 where exceptions are not passed to callbacks
 _last_exception_info: Dict[str, str] = {}
+
+# Track recently sent failure notifications to avoid duplicate emails
+_last_failure_notice_ts: Dict[str, float] = {}
+_FAILURE_DEDUPE_WINDOW_SECONDS = 60
 
 
 def store_exception(task_id: str, exception: Exception) -> None:
@@ -591,6 +596,10 @@ def on_dag_failure(context: Dict[str, Any]) -> None:
         logger.debug("Notifications disabled, skipping failure callback")
         return
 
+    # Deduplicate DAG failure emails when a task-level failure already sent one
+    if not _mark_failure_notification(context.get('dag_run')):
+        return
+
     channels = get_notification_channels()
     if not channels:
         logger.debug("No notification channels configured")
@@ -677,6 +686,10 @@ def on_task_failure(context: Dict[str, Any]) -> None:
         default_args={'on_failure_callback': on_task_failure, ...}
     """
     if not is_notifications_enabled():
+        return
+
+    # Deduplicate task failure vs. DAG failure notifications
+    if not _mark_failure_notification(context.get('dag_run')):
         return
 
     channels = get_notification_channels()
@@ -981,6 +994,9 @@ def send_failure_notification(
         logger.info("Notifications disabled, skipping failure notification")
         return
 
+    if not _mark_failure_notification(run_id=run_id, dag_id=dag_id):
+        return
+
     channels = get_notification_channels()
     if not channels:
         logger.info("No notification channels configured")
@@ -1071,3 +1087,28 @@ This is an automated notification from the MSSQL to PostgreSQL Migration Pipelin
 """
         result = send_email_notification(subject, body, html_body)
         logger.info(f"Failure email notification sent: {result}")
+
+
+def _mark_failure_notification(dag_run=None, *, dag_id: Optional[str] = None, run_id: Optional[str] = None) -> bool:
+    """
+    Returns True if we should send a failure notification, False if a recent one was sent.
+    Uses an in-process window to prevent duplicate DAG + task failure emails for the same run.
+    """
+    try:
+        dag_id = dag_id or getattr(dag_run, 'dag_id', None)
+        run_id = run_id or getattr(dag_run, 'run_id', None)
+        if not dag_id or not run_id:
+            return True  # cannot dedupe without identifiers
+
+        key = f"{dag_id}:{run_id}"
+        now = time()
+        last = _last_failure_notice_ts.get(key)
+        if last and (now - last) < _FAILURE_DEDUPE_WINDOW_SECONDS:
+            logger.info(f"Skipping duplicate failure notification for {key}")
+            return False
+
+        _last_failure_notice_ts[key] = now
+        return True
+    except Exception as exc:
+        logger.warning(f"Failed to check failure notification dedupe: {exc}")
+        return True
