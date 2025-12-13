@@ -1060,11 +1060,6 @@ def mssql_to_postgres_migration():
         dag_run = context.get("dag_run")
         ti = context["ti"]
 
-        # Optional failure simulation for notification testing
-        import os
-        if os.getenv("SIMULATE_FAILURE") == "1":
-            raise RuntimeError("Simulated failure for notification testing")
-
         transfer_results = ti.xcom_pull(task_ids="collect_all_results", key="return_value") or []
         tables_migrated = len(transfer_results)
         total_rows = sum(r.get("rows_transferred", 0) for r in transfer_results)
