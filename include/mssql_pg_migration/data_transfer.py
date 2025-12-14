@@ -4,7 +4,7 @@ Data Transfer Module
 This module handles the actual data migration from SQL Server to PostgreSQL,
 including chunked reading, bulk loading, and progress tracking.
 
-Uses direct pymssql connections for keyset pagination to avoid issues with
+Uses direct pyodbc connections for keyset pagination to avoid issues with
 Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
@@ -20,7 +20,7 @@ import threading
 import time
 import csv
 import math
-import pymssql
+import pyodbc
 from psycopg2 import pool as pg_pool
 from psycopg2 import sql
 
@@ -48,12 +48,18 @@ class DataTransfer:
         # Get direct MSSQL connection parameters for keyset pagination
         # This avoids issues with Airflow hook's get_pandas_df on large datasets
         mssql_conn = self.mssql_hook.get_connection(mssql_conn_id)
+        # Build ODBC connection parameters
+        port = mssql_conn.port or 1433
+        server = f"{mssql_conn.host},{port}" if port != 1433 else mssql_conn.host
+
         self._mssql_config = {
-            'server': mssql_conn.host,
-            'port': mssql_conn.port or 1433,
-            'database': mssql_conn.schema,
-            'user': mssql_conn.login,
-            'password': mssql_conn.password,
+            'DRIVER': '{ODBC Driver 18 for SQL Server}',
+            'SERVER': server,
+            'DATABASE': mssql_conn.schema,
+            'UID': mssql_conn.login if mssql_conn.login else '',
+            'PWD': mssql_conn.password if mssql_conn.password else '',
+            'TrustServerCertificate': 'yes',
+            'Trusted_Connection': 'yes' if not mssql_conn.login else 'no',
         }
 
         # Initialize shared PostgreSQL connection pool for this connection ID
@@ -101,7 +107,9 @@ class DataTransfer:
 
     @contextlib.contextmanager
     def _mssql_connection(self):
-        conn = pymssql.connect(**self._mssql_config)
+        # Build ODBC connection string from config dict
+        conn_str = ';'.join([f"{k}={v}" for k, v in self._mssql_config.items() if v])
+        conn = pyodbc.connect(conn_str)
         try:
             yield conn
         finally:
@@ -395,7 +403,7 @@ class DataTransfer:
         FROM sys.columns c
         INNER JOIN sys.tables t ON c.object_id = t.object_id
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = %s AND t.name = %s
+        WHERE s.name = ? AND t.name = ?
         ORDER BY c.column_id
         """
         columns = self.mssql_hook.get_records(query, parameters=[schema_name, table_name])
@@ -426,7 +434,7 @@ class DataTransfer:
         INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
         INNER JOIN sys.tables t ON i.object_id = t.object_id
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = %s AND t.name = %s AND i.is_primary_key = 1
+        WHERE s.name = ? AND t.name = ? AND i.is_primary_key = 1
         ORDER BY ic.key_ordinal
         """
         try:
@@ -509,7 +517,7 @@ class DataTransfer:
         if where_clause:
             where_conditions.append(f"({where_clause})")
         if last_key_value is not None:
-            where_conditions.append(f"[{pk_column}] > %s")
+            where_conditions.append(f"[{pk_column}] > ?")
 
         if where_conditions:
             where_part = "WHERE " + " AND ".join(where_conditions)
@@ -580,7 +588,7 @@ class DataTransfer:
         query = f"""
         SELECT {quoted_columns}
         FROM ({inner_query}) sub
-        WHERE _rn BETWEEN %s AND %s
+        WHERE _rn BETWEEN ? AND ?
         ORDER BY _rn
         """
 
