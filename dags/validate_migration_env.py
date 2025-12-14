@@ -12,7 +12,7 @@ Set these environment variables before running:
 Or use the default test values if not set.
 """
 
-from airflow.sdk import dag, task
+from airflow.decorators import dag, task
 from airflow.models.param import Param
 from pendulum import datetime
 from datetime import timedelta

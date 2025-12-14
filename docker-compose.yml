@@ -1,11 +1,209 @@
-version: '3.8'
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    # Core Airflow Configuration
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-metadata/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+
+    # Internal API / Execution API (Airflow 3.0)
+    AIRFLOW__CORE__DATABASE_ACCESS_ISOLATION: 'True'
+    AIRFLOW__CORE__INTERNAL_API_URL: http://airflow-webserver:8080/internal_api
+    # Shared secret used by scheduler/webserver/triggerer for the execution/internal API
+    AIRFLOW__CORE__INTERNAL_API_SECRET_KEY: ${AIRFLOW__CORE__INTERNAL_API_SECRET_KEY:-YXNkZmFzZGZhc2RmYXNkZjEyMzQ1Njc4OTA=}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+    AIRFLOW__WEBSERVER__RUN_INTERNAL_API: 'true'
+    # Use FAB auth (like pg→pg pipeline) instead of SimpleAuth
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # Shared JWT secret for API auth to avoid per-process defaults
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-YXNkZmFzZGZhc2RmYXNkZjEyMzQ1Njc4OTA=}
+
+    # Performance Settings (from Dockerfile)
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-128}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-64}
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: ${AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL:-10}
+    AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC: ${AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC:-5}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE: ${AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE:-10}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW: ${AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW:-20}
+
+    # Migration Settings
+    MAX_PARTITIONS: ${MAX_PARTITIONS:-8}
+    PG_POOL_MINCONN: ${PG_POOL_MINCONN:-1}
+    PG_POOL_MAXCONN: ${PG_POOL_MAXCONN:-8}
+
+    # Database Connection Strings (replacing airflow_settings.yaml)
+    AIRFLOW_CONN_MSSQL_SOURCE: 'mssql://sa:YourStrong@Passw0rd@mssql-server:1433/StackOverflow2010'
+    AIRFLOW_CONN_POSTGRES_TARGET: 'postgresql://postgres:PostgresPassword123@postgres-target:5432/stackoverflow'
+
+    # Notification Settings (enable Slack by default; set SLACK_WEBHOOK_URL in .env)
+    NOTIFICATION_ENABLED: ${NOTIFICATION_ENABLED:-true}
+    NOTIFICATION_CHANNELS: ${NOTIFICATION_CHANNELS:-slack}
+    SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+    SMTP_PORT: ${SMTP_PORT:-587}
+    SMTP_USER: ${SMTP_USER:-}
+    SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    NOTIFICATION_EMAIL_FROM: ${NOTIFICATION_EMAIL_FROM:-}
+    NOTIFICATION_EMAIL_TO: ${NOTIFICATION_EMAIL_TO:-}
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/include:/opt/airflow/include
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres-metadata:
+      condition: service_healthy
+  networks:
+    - airflow
 
 services:
-  # SQL Server 2022 (x86_64 via Rosetta 2) with StackOverflow2010 database
+  # ===========================================================================
+  # AIRFLOW METADATA DATABASE (PostgreSQL)
+  # ===========================================================================
+  postgres-metadata:
+    image: postgres:16-alpine
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-metadata-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - airflow
+
+  # ===========================================================================
+  # AIRFLOW WEBSERVER
+  # ===========================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/internal_api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # AIRFLOW SCHEDULER
+  # ===========================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # AIRFLOW TRIGGERER (for deferrable operators)
+  # ===========================================================================
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # AIRFLOW DAG PROCESSOR
+  # ===========================================================================
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # AIRFLOW INIT (one-time initialization)
+  # ===========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/include /sources/config
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/{logs,dags,plugins,include,config}
+        # Initialize DB and create default admin user (FAB auth)
+        /entrypoint airflow db migrate
+        /entrypoint airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME:-airflow} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD:-airflow} || true
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+
+  # ===========================================================================
+  # SQL SERVER 2022 (Source Database)
+  # ===========================================================================
   mssql-server:
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: mssql-server
-    user: "0:0"  # Run as root to access existing volume
+    user: "0:0"
     environment:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=${MSSQL_PASSWORD:-YourStrong@Passw0rd}
@@ -17,7 +215,7 @@ services:
       - mssql_data:/var/opt/mssql
       - ./stackoverflow_db:/tmp/stackoverflow_db
     networks:
-      - migration_network
+      - airflow
     mem_limit: ${MSSQL_MEM_LIMIT:-4g}
     mem_reservation: ${MSSQL_MEM_RESERVATION:-2g}
     cpus: ${MSSQL_CPUS:-4}
@@ -29,7 +227,9 @@ services:
       start_period: 60s
     restart: unless-stopped
 
-  # PostgreSQL 16 for target database
+  # ===========================================================================
+  # POSTGRESQL 16 (Target Database)
+  # ===========================================================================
   postgres-target:
     image: postgres:16-alpine
     container_name: postgres-target
@@ -43,26 +243,26 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
-      - migration_network
+      - airflow
     mem_limit: ${PG_MEM_LIMIT:-3g}
     mem_reservation: ${PG_MEM_RESERVATION:-1536m}
     cpus: ${PG_CPUS:-4}
     command:
       - "postgres"
       - "-c"
-      - "max_connections=100"
+      - "max_connections=${PG_MAX_CONNECTIONS:-200}"
       - "-c"
-      - "shared_buffers=${PG_SHARED_BUFFERS:-512MB}"
+      - "shared_buffers=${PG_SHARED_BUFFERS:-1GB}"
       - "-c"
-      - "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}"
+      - "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-2GB}"
       - "-c"
       - "maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}"
       - "-c"
       - "checkpoint_completion_target=0.9"
       - "-c"
-      - "wal_buffers=16MB"
+      - "wal_buffers=${PG_WAL_BUFFERS:-64MB}"
       - "-c"
-      - "max_wal_size=1GB"
+      - "max_wal_size=${PG_MAX_WAL_SIZE:-4GB}"
       - "-c"
       - "synchronous_commit=off"
     healthcheck:
@@ -77,8 +277,9 @@ volumes:
     driver: local
   postgres_data:
     driver: local
+  postgres-metadata-data:
+    driver: local
 
 networks:
-  migration_network:
-    name: mssql-to-postgres-pipeline_f4fd8c_airflow
-    external: true
+  airflow:
+    driver: bridge
