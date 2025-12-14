@@ -12,7 +12,8 @@ It handles:
 The DAG is designed to be generic and reusable for any SQL Server database migration.
 """
 
-from airflow.sdk import Asset, dag, task
+from airflow.decorators import dag, task
+from airflow.datasets import Dataset as Asset
 from airflow.models.param import Param
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
