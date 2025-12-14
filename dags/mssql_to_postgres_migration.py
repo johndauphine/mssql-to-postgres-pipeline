@@ -89,9 +89,10 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
         "retry_exponential_backoff": False,
         "max_retry_delay": timedelta(minutes=30),
         "pool": "default_pool",  # Use default pool for all tasks
-        "on_failure_callback": on_task_failure,
+        # TEMP: Disabled for Airflow 3.0 - callbacks not yet implemented
+        # # "on_failure_callback": on_task_failure,
     },
-    on_failure_callback=on_dag_failure,
+    # on_failure_callback=on_dag_failure,
     params={
         "source_conn_id": Param(
             default="mssql_source",

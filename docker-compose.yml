@@ -11,6 +11,18 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
 
+    # Internal API / Execution API (Airflow 3.0)
+    AIRFLOW__CORE__DATABASE_ACCESS_ISOLATION: 'True'
+    AIRFLOW__CORE__INTERNAL_API_URL: http://airflow-webserver:8080/internal_api
+    # Shared secret used by scheduler/webserver/triggerer for the execution/internal API
+    AIRFLOW__CORE__INTERNAL_API_SECRET_KEY: ${AIRFLOW__CORE__INTERNAL_API_SECRET_KEY:-YXNkZmFzZGZhc2RmYXNkZjEyMzQ1Njc4OTA=}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+    AIRFLOW__WEBSERVER__RUN_INTERNAL_API: 'true'
+    # Use FAB auth (like pg→pg pipeline) instead of SimpleAuth
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # Shared JWT secret for API auth to avoid per-process defaults
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-YXNkZmFzZGZhc2RmYXNkZjEyMzQ1Njc4OTA=}
+
     # Performance Settings (from Dockerfile)
     AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-128}
     AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-64}
@@ -85,7 +97,7 @@ services:
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/internal_api/health"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -104,7 +116,7 @@ services:
     container_name: airflow-scheduler
     command: scheduler
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
       interval: 30s
       timeout: 10s
       retries: 5
@@ -165,6 +177,15 @@ services:
       - |
         mkdir -p /sources/logs /sources/dags /sources/plugins /sources/include /sources/config
         chown -R "${AIRFLOW_UID:-50000}:0" /sources/{logs,dags,plugins,include,config}
+        # Initialize DB and create default admin user (FAB auth)
+        /entrypoint airflow db migrate
+        /entrypoint airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME:-airflow} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD:-airflow} || true
         exec /entrypoint airflow version
     environment:
       <<: *airflow-common-env
