@@ -1,6 +1,6 @@
 # SQL Server to PostgreSQL Migration Pipeline
 
-An Apache Airflow pipeline for automated, full-refresh migrations from Microsoft SQL Server to PostgreSQL. Built with the Astronomer framework for reliable orchestration and easy deployment.
+An Apache Airflow 3.0 pipeline for automated, full-refresh migrations from Microsoft SQL Server to PostgreSQL. Uses Docker Compose with LocalExecutor for reliable orchestration and flexible deployment.
 
 ## Features
 
@@ -96,15 +96,14 @@ Migrate any SQL Server database to PostgreSQL in 3 steps:
 
 ```bash
 # 1. Configure your databases
-cp .env.example .env                              # Resource settings
-cp airflow_settings.yaml.example airflow_settings.yaml  # Connections
-# Edit airflow_settings.yaml with your database details
+cp .env.example .env
+# Edit .env to set connection strings (AIRFLOW_CONN_MSSQL_SOURCE, AIRFLOW_CONN_POSTGRES_TARGET)
 
 # 2. Start the stack
-astro dev start                         # Connections loaded automatically
+docker-compose up -d
 
-# 3. Run migration
-airflow dags trigger mssql_to_postgres_migration
+# 3. Run migration (UI: http://localhost:8080, login: airflow/airflow)
+docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration
 ```
 
 See [Configuration](#configuration) for details on connecting to remote databases.
@@ -113,8 +112,8 @@ See [Configuration](#configuration) for details on connecting to remote database
 
 ### Prerequisites
 
-- Docker Desktop (4GB+ RAM recommended per database container)
-- [Astronomer CLI](https://www.astronomer.io/docs/astro/cli/install-cli) (optional - can use standalone Docker)
+- Docker Desktop (16GB+ RAM recommended for full stack)
+- Docker Compose (included with Docker Desktop)
 - Access to source SQL Server and target PostgreSQL databases
 
 ### Installation
@@ -128,65 +127,55 @@ See [Configuration](#configuration) for details on connecting to remote database
 2. Configure your environment:
    ```bash
    cp .env.example .env
-   cp airflow_settings.yaml.example airflow_settings.yaml
-   # Edit .env with resource settings for your machine (RAM presets)
-   # Edit airflow_settings.yaml with your database connection details
+   # Edit .env with:
+   #   - Resource settings for your machine (RAM presets: 16GB/32GB/64GB)
+   #   - Database connection strings (AIRFLOW_CONN_MSSQL_SOURCE, AIRFLOW_CONN_POSTGRES_TARGET)
    ```
 
-3. Start Airflow (creates Docker network):
-   ```bash
-   astro dev start
-   ```
-
-4. **(Optional) Start local database containers:**
-
-   If you need local SQL Server and PostgreSQL containers for testing:
+3. Start the full stack (Airflow + databases):
    ```bash
    docker-compose up -d
    ```
 
-   > **Note**: Run `astro dev start` first - it creates the Docker network that database containers join.
+   This starts 7 containers:
+   - `airflow-webserver` - Web UI and API server
+   - `airflow-scheduler` - Task orchestration
+   - `airflow-dag-processor` - DAG parsing
+   - `airflow-triggerer` - Deferrable operators
+   - `postgres-metadata` - Airflow metadata database
+   - `mssql-server` - SQL Server 2022 (source - optional for testing)
+   - `postgres-target` - PostgreSQL 16 (target - optional for testing)
 
-   For remote databases (Azure SQL, AWS RDS, on-prem servers), skip this step and configure hosts in `airflow_settings.yaml`.
+   > **Note**: For remote databases (Azure SQL, AWS RDS, on-prem), configure connection strings in `.env` and skip local database containers.
 
-5. Access the Airflow UI at http://localhost:8080
+4. Access the Airflow UI at http://localhost:8080 (username: `airflow`, password: `airflow`)
 
 ## Configuration
 
-Configuration is split between two files:
-- **`.env`** - Resource settings (memory limits, parallelism)
-- **`airflow_settings.yaml`** - Database connections
+Configuration is managed through the `.env` file which contains:
+- Resource settings (memory limits, parallelism)
+- Database connection strings
 
 ### Database Connections
 
-Edit `airflow_settings.yaml` to configure your source and target databases:
+Edit `.env` to configure your source and target databases using Airflow connection URIs:
 
-```yaml
-airflow:
-  connections:
-    # SOURCE: SQL Server
-    - conn_id: mssql_source
-      conn_type: mssql
-      conn_host: mssql-server           # Docker container, IP, or hostname
-      # conn_host: 192.168.1.100        # Remote server
-      # conn_host: myserver.database.windows.net  # Azure SQL
-      conn_port: 1433
-      conn_login: sa
-      conn_password: YourStrong@Passw0rd
-      conn_schema: StackOverflow2013
+```bash
+# SOURCE: SQL Server
+AIRFLOW_CONN_MSSQL_SOURCE='mssql://sa:YourStrong@Passw0rd@mssql-server:1433/StackOverflow2010'
+# Examples for remote databases:
+# AIRFLOW_CONN_MSSQL_SOURCE='mssql://user:pass@192.168.1.100:1433/MyDatabase'
+# AIRFLOW_CONN_MSSQL_SOURCE='mssql://user:pass@myserver.database.windows.net:1433/MyDatabase'
 
-    # TARGET: PostgreSQL
-    - conn_id: postgres_target
-      conn_type: postgres
-      conn_host: postgres-target        # Docker container, IP, or hostname
-      # conn_host: mydb.abc123.rds.amazonaws.com  # AWS RDS
-      conn_port: 5432
-      conn_login: postgres
-      conn_password: PostgresPassword123
-      conn_schema: stackoverflow
+# TARGET: PostgreSQL
+AIRFLOW_CONN_POSTGRES_TARGET='postgresql://postgres:PostgresPassword123@postgres-target:5432/stackoverflow'
+# Examples for remote databases:
+# AIRFLOW_CONN_POSTGRES_TARGET='postgresql://user:pass@mydb.abc123.rds.amazonaws.com:5432/mydb'
 ```
 
-Connections are loaded automatically when you run `astro dev start`.
+Connection string format: `<type>://<user>:<password>@<host>:<port>/<database>`
+
+Connections are automatically loaded from environment variables when Airflow starts.
 
 ### Resource Settings
 
@@ -202,10 +191,10 @@ Uncomment the appropriate preset section in `.env` for your machine.
 
 ### Applying Configuration Changes
 
-After editing `airflow_settings.yaml`, restart Airflow to reload connections:
+After editing `.env`, restart Airflow services to reload configuration:
 
 ```bash
-astro dev restart
+docker-compose restart airflow-scheduler airflow-webserver
 ```
 
 ### Loading Test Data (Local SQL Server)
@@ -223,8 +212,8 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
       WITH MOVE 'YourDatabase' TO '/var/opt/mssql/data/YourDatabase.mdf', \
            MOVE 'YourDatabase_log' TO '/var/opt/mssql/data/YourDatabase_log.ldf'"
 
-# 3. Update airflow_settings.yaml with the database name
-# conn_schema: YourDatabase
+# 3. Update .env with the database name in connection string
+# AIRFLOW_CONN_MSSQL_SOURCE='mssql://sa:YourStrong@Passw0rd@mssql-server:1433/YourDatabase'
 ```
 
 > **Note**: Logical file names in the MOVE clause vary by backup. Use `RESTORE FILELISTONLY` to discover them.
@@ -253,12 +242,12 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
 ### Example: Trigger via CLI
 
 ```bash
-astro dev run dags trigger mssql_to_postgres_migration
+docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration
 ```
 
 Or with custom configuration:
 ```bash
-astro dev run dags trigger mssql_to_postgres_migration \
+docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration \
   --conf '{"source_schema": "sales", "target_schema": "sales", "chunk_size": 50000}'
 ```
 
@@ -266,13 +255,13 @@ astro dev run dags trigger mssql_to_postgres_migration \
 
 ```bash
 # View scheduler logs
-astro dev logs -s -f
+docker-compose logs airflow-scheduler -f
 
 # List DAG runs
-astro dev run dags list-runs mssql_to_postgres_migration
+docker exec airflow-scheduler airflow dags list-runs mssql_to_postgres_migration
 
 # Check validation results
-astro dev run dags list-runs validate_migration_env
+docker exec airflow-scheduler airflow dags list-runs validate_migration_env
 ```
 
 ## Project Structure
@@ -295,10 +284,10 @@ mssql-to-postgres-pipeline/
 ├── docs/
 │   ├── HANDOFF_NOTES.md                 # Session handoff documentation
 │   └── *.md                             # Additional technical documentation
-├── docker-compose.yml                   # Database containers (SQL Server, PostgreSQL)
-├── Dockerfile                           # Astronomer Runtime image
+├── docker-compose.yml                   # Full stack (Airflow + databases)
+├── Dockerfile                           # Apache Airflow 3.0 image
 ├── requirements.txt                     # Python dependencies
-└── airflow_settings.yaml                # Local connections/variables
+└── .env.example                         # Configuration template
 ```
 
 ## Development
@@ -306,32 +295,41 @@ mssql-to-postgres-pipeline/
 ### Validate DAGs
 
 ```bash
-astro dev parse
+docker exec airflow-scheduler airflow dags list
 ```
 
 ### Run Tests
 
 ```bash
-# Initialize Airflow DB first (required for DagBag tests)
-astro dev run airflow db init
-
-# Run tests
-astro dev pytest tests/
+# Run tests inside scheduler container
+docker exec airflow-scheduler pytest /opt/airflow/tests/
 ```
 
 ### View Logs
 
 ```bash
-astro dev logs
+# All services
+docker-compose logs -f
+
+# Specific service
+docker-compose logs airflow-scheduler -f
 ```
 
 ### Stop Airflow
 
 ```bash
-astro dev stop
+docker-compose down
 ```
 
 ## Known Issues and Workarounds
+
+### Airflow 3.0 Callback Limitation
+
+Airflow 3.0 does not yet support task-level and DAG-level failure callbacks ([GitHub Issue #44354](https://github.com/apache/airflow/issues/44354)). As a temporary workaround:
+
+- Failure callbacks are currently disabled in the migration DAG
+- Notification system (Slack/email) is temporarily unavailable
+- Will be re-enabled once Airflow implements callback support
 
 ### TEXT Column NULL Handling
 
@@ -349,11 +347,12 @@ Large validation results can cause XCom serialization issues. The pipeline uses 
 
 ## Dependencies
 
-- Astronomer Runtime 3.1
+- Apache Airflow 3.0.0 (vanilla)
 - apache-airflow-providers-microsoft-mssql >= 3.8.0
 - apache-airflow-providers-postgres >= 5.12.0
 - pymssql >= 2.2.0
 - psycopg2-binary >= 2.9.9
+- FreeTDS development libraries (for SQL Server connectivity)
 
 ## License
 
