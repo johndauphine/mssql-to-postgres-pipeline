@@ -40,9 +40,9 @@ x-airflow-common:
     AIRFLOW_CONN_MSSQL_SOURCE: 'mssql://sa:YourStrong@Passw0rd@mssql-server:1433/StackOverflow2010'
     AIRFLOW_CONN_POSTGRES_TARGET: 'postgresql://postgres:PostgresPassword123@postgres-target:5432/stackoverflow'
 
-    # Notification Settings
-    NOTIFICATION_ENABLED: ${NOTIFICATION_ENABLED:-false}
-    NOTIFICATION_CHANNELS: ${NOTIFICATION_CHANNELS:-email,slack}
+    # Notification Settings (enable Slack by default; set SLACK_WEBHOOK_URL in .env)
+    NOTIFICATION_ENABLED: ${NOTIFICATION_ENABLED:-true}
+    NOTIFICATION_CHANNELS: ${NOTIFICATION_CHANNELS:-slack}
     SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
     SMTP_PORT: ${SMTP_PORT:-587}
     SMTP_USER: ${SMTP_USER:-}
