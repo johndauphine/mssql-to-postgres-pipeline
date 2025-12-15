@@ -6,7 +6,7 @@ using system tables and information schema views.
 """
 
 from typing import List, Dict, Any, Optional
-from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class SchemaExtractor:
         Args:
             mssql_conn_id: Airflow connection ID for SQL Server
         """
-        self.mssql_hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
+        self.mssql_hook = OdbcConnectionHelper(odbc_conn_id=mssql_conn_id)
 
     def get_tables(self, schema_name: str = 'dbo', exclude_patterns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """

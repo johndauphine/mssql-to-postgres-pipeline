@@ -327,8 +327,8 @@ def mssql_to_postgres_migration():
         partitions = []
 
         # Get MSSQL connection for querying partition boundaries
-        from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
-        mssql_hook = MsSqlHook(mssql_conn_id=params["source_conn_id"])
+        from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+        mssql_hook = OdbcConnectionHelper(odbc_conn_id=params["source_conn_id"])
 
         for table_info in created_tables:
             row_count = table_info.get('row_count', 0)

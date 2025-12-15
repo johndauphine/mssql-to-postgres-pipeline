@@ -2,7 +2,8 @@
 apache-airflow==3.0.0
 
 # Database Providers
-apache-airflow-providers-microsoft-mssql>=3.8.0
+# Note: We use OdbcConnectionHelper instead of apache-airflow-providers-microsoft-mssql
+# to support corporate environments where the MSSQL provider may not be available
 apache-airflow-providers-postgres>=5.12.0
 
 # Database Connectivity
