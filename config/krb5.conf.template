@@ -1,0 +1,28 @@
+[libdefaults]
+    default_realm = CORP.LOCAL
+    dns_lookup_realm = false
+    dns_lookup_kdc = true
+    ticket_lifetime = 24h
+    renew_lifetime = 7d
+    forwardable = true
+    default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 rc4-hmac
+    default_tgs_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 rc4-hmac
+    permitted_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 rc4-hmac
+
+[realms]
+    CORP.LOCAL = {
+        kdc = dc01.corp.local
+        kdc = dc02.corp.local
+        admin_server = dc01.corp.local
+    }
+
+[domain_realm]
+    .corp.local = CORP.LOCAL
+    corp.local = CORP.LOCAL
+
+# INSTRUCTIONS:
+# 1. Copy this file to krb5.conf
+# 2. Replace CORP.LOCAL with your AD domain (UPPERCASE)
+# 3. Replace corp.local with your domain (lowercase)
+# 4. Replace dc01.corp.local and dc02.corp.local with your domain controllers
+# 5. Update the KDC and admin_server addresses as needed

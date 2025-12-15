@@ -18,7 +18,7 @@ from pendulum import datetime
 from datetime import timedelta
 import logging
 import os
-import pymssql
+import pyodbc
 import psycopg2
 from psycopg2 import sql
 
@@ -60,13 +60,22 @@ def validate_migration_env():
         params = context["params"]
 
         # Get connection details from environment with defaults for testing
-        mssql_config = {
-            'server': os.environ.get('MSSQL_HOST', 'mssql-server'),
-            'port': int(os.environ.get('MSSQL_PORT', '1433')),
-            'database': os.environ.get('MSSQL_DATABASE', 'StackOverflow2010'),
-            'user': os.environ.get('MSSQL_USERNAME', 'sa'),
-            'password': os.environ.get('MSSQL_PASSWORD', 'YourStrong@Passw0rd'),
-        }
+        mssql_host = os.environ.get('MSSQL_HOST', 'mssql-server')
+        mssql_port = int(os.environ.get('MSSQL_PORT', '1433'))
+        mssql_database = os.environ.get('MSSQL_DATABASE', 'StackOverflow2010')
+        mssql_user = os.environ.get('MSSQL_USERNAME', 'sa')
+        mssql_password = os.environ.get('MSSQL_PASSWORD', 'YourStrong@Passw0rd')
+
+        # Build ODBC connection string
+        server = f"{mssql_host},{mssql_port}" if mssql_port != 1433 else mssql_host
+        mssql_conn_str = (
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"SERVER={server};"
+            f"DATABASE={mssql_database};"
+            f"UID={mssql_user};"
+            f"PWD={mssql_password};"
+            f"TrustServerCertificate=yes;"
+        )
 
         postgres_config = {
             'host': os.environ.get('POSTGRES_HOST', 'postgres-target'),
@@ -84,9 +93,9 @@ def validate_migration_env():
         logger.info("Connecting to databases...")
 
         try:
-            mssql_conn = pymssql.connect(**mssql_config)
+            mssql_conn = pyodbc.connect(mssql_conn_str)
             mssql_cursor = mssql_conn.cursor()
-            logger.info(f"✓ Connected to SQL Server: {mssql_config['server']}")
+            logger.info(f"✓ Connected to SQL Server: {mssql_host}")
         except Exception as e:
             logger.error(f"SQL Server connection failed: {e}")
             return f"SQL Server connection failed: {e}"
@@ -113,7 +122,7 @@ def validate_migration_env():
                 AND ss.name = t.TABLE_SCHEMA
             LEFT JOIN sys.partitions p ON p.object_id = st.object_id
                 AND p.index_id IN (0, 1)
-            WHERE t.TABLE_SCHEMA = %s
+            WHERE t.TABLE_SCHEMA = ?
               AND t.TABLE_TYPE = 'BASE TABLE'
             GROUP BY t.TABLE_NAME
             ORDER BY t.TABLE_NAME
