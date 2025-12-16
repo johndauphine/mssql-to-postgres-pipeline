@@ -364,7 +364,7 @@ def mssql_to_postgres_migration():
                     INNER JOIN sys.tables tbl ON i.object_id = tbl.object_id
                     INNER JOIN sys.schemas s ON tbl.schema_id = s.schema_id
                     WHERE i.is_primary_key = 1
-                      AND s.name = %s AND tbl.name = %s
+                      AND s.name = ? AND tbl.name = ?
                     ORDER BY ic.key_ordinal
                 """
                 pk_result = mssql_hook.get_records(pk_query, parameters=[safe_source_schema, safe_table_name])
@@ -376,12 +376,12 @@ def mssql_to_postgres_migration():
                 else:
                     # No PK found - use first column as fallback
                     logger.warning(f"No primary key found for {safe_table_name}, using ROW_NUMBER with first column")
-                    first_col_query = f"""
+                    first_col_query = """
                         SELECT TOP 1 c.name
                         FROM sys.columns c
                         INNER JOIN sys.tables t ON c.object_id = t.object_id
                         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                        WHERE s.name = %s AND t.name = %s
+                        WHERE s.name = ? AND t.name = ?
                         ORDER BY c.column_id
                     """
                     first_col = mssql_hook.get_first(first_col_query, parameters=[safe_source_schema, safe_table_name])
