@@ -147,7 +147,7 @@ def validate_where_clause_template(clause_sql: str) -> None:
         r'%s'  # Parameterized value
         r'|'  # OR
         r'\('  # Tuple start
-        r'("'[a-zA-Z_][a-zA-Z0-9_]*"[\s]*,[\s]*)*'  # Tuple of quoted identifiers
+        r'("[a-zA-Z_][a-zA-Z0-9_]*"[\s]*,[\s]*)*'  # Tuple of quoted identifiers
         r'"[a-zA-Z_][a-zA-Z0-9_]*"'  # Last identifier in tuple
         r'\)'  # Tuple end
         r'[\s]*'  # Whitespace
