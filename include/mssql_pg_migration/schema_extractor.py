@@ -43,7 +43,7 @@ class SchemaExtractor:
         """
         # Build query with optional IN clause for include_tables
         if include_tables:
-            # Filter at SQL level for efficiency
+            # Filter at SQL level for efficiency (case-insensitive comparison)
             placeholders = ', '.join(['?' for _ in include_tables])
             query = f"""
             SELECT
@@ -60,10 +60,11 @@ class SchemaExtractor:
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
             WHERE s.name = ?
               AND t.is_ms_shipped = 0
-              AND t.name IN ({placeholders})
+              AND UPPER(t.name) IN ({placeholders})
             ORDER BY t.name
             """
-            parameters = [schema_name] + list(include_tables)
+            # Uppercase table names for case-insensitive matching
+            parameters = [schema_name] + [t.upper() for t in include_tables]
             logger.info(f"Extracting {len(include_tables)} specific tables from schema '{schema_name}'")
         else:
             query = """
