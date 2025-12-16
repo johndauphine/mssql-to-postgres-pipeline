@@ -196,10 +196,11 @@ def mssql_to_postgres_migration():
 
         postgres_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
 
-        create_schema_sql = f"CREATE SCHEMA IF NOT EXISTS {schema_name}"
+        # Quote schema name to preserve case in PostgreSQL
+        create_schema_sql = f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'
         postgres_hook.run(create_schema_sql)
 
-        logger.info(f"Ensured schema {schema_name} exists in PostgreSQL")
+        logger.info(f'Ensured schema "{schema_name}" exists in PostgreSQL')
         return f"Schema {schema_name} ready"
 
     @task
