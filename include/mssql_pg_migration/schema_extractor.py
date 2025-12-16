@@ -117,7 +117,7 @@ class SchemaExtractor:
         LEFT JOIN sys.identity_columns ic ON c.object_id = ic.object_id AND c.column_id = ic.column_id
         LEFT JOIN sys.default_constraints dc ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
         LEFT JOIN sys.computed_columns cc ON c.object_id = cc.object_id AND c.column_id = cc.column_id
-        WHERE c.object_id = %s
+        WHERE c.object_id = ?
         ORDER BY c.column_id
         """
 
@@ -168,7 +168,7 @@ class SchemaExtractor:
             ), 1, 2, '') AS columns
         FROM sys.indexes i
         WHERE i.is_primary_key = 1
-          AND i.object_id = %s
+          AND i.object_id = ?
         """
 
         result = self.mssql_hook.get_first(query, parameters=[table_object_id])
@@ -203,7 +203,7 @@ class SchemaExtractor:
         INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
         INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE i.is_primary_key = 1
-          AND i.object_id = %s
+          AND i.object_id = ?
         ORDER BY ic.key_ordinal
         """
         results = self.mssql_hook.get_records(query, parameters=[table_object_id])
@@ -255,7 +255,7 @@ class SchemaExtractor:
                 FOR XML PATH('')
             ), 1, 2, '') AS columns_with_order
         FROM sys.indexes i
-        WHERE i.object_id = %s
+        WHERE i.object_id = ?
           AND i.is_primary_key = 0  -- Exclude primary key
           AND i.type > 0  -- Exclude heap
         """
@@ -312,7 +312,7 @@ class SchemaExtractor:
             fk.delete_referential_action_desc AS on_delete,
             fk.update_referential_action_desc AS on_update
         FROM sys.foreign_keys fk
-        WHERE fk.parent_object_id = %s
+        WHERE fk.parent_object_id = ?
         """
 
         foreign_keys = self.mssql_hook.get_records(query, parameters=[table_object_id])
@@ -351,7 +351,7 @@ class SchemaExtractor:
             cc.definition,
             cc.is_disabled
         FROM sys.check_constraints cc
-        WHERE cc.parent_object_id = %s
+        WHERE cc.parent_object_id = ?
         """
 
         constraints = self.mssql_hook.get_records(query, parameters=[table_object_id])
@@ -383,7 +383,7 @@ class SchemaExtractor:
         SELECT object_id
         FROM sys.tables t
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = %s AND t.name = %s
+        WHERE s.name = ? AND t.name = ?
         """
 
         result = self.mssql_hook.get_first(query, parameters=[schema_name, table_name])
