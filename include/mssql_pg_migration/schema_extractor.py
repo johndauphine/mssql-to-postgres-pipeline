@@ -24,36 +24,68 @@ class SchemaExtractor:
         """
         self.mssql_hook = OdbcConnectionHelper(odbc_conn_id=mssql_conn_id)
 
-    def get_tables(self, schema_name: str = 'dbo', exclude_patterns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    def get_tables(
+        self,
+        schema_name: str = 'dbo',
+        exclude_patterns: Optional[List[str]] = None,
+        include_tables: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Get all tables from a specific schema.
+        Get tables from a specific schema.
 
         Args:
             schema_name: Schema name to extract tables from
             exclude_patterns: List of table name patterns to exclude (supports wildcards)
+            include_tables: List of specific table names to include (if provided, only these tables are returned)
 
         Returns:
             List of table information dictionaries
         """
-        query = """
-        SELECT
-            s.name AS schema_name,
-            t.name AS table_name,
-            t.object_id,
-            t.create_date,
-            t.modify_date,
-            (SELECT SUM(p.rows)
-             FROM sys.partitions p
-             WHERE p.object_id = t.object_id
-               AND p.index_id IN (0, 1)) AS row_count
-        FROM sys.tables t
-        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = ?
-          AND t.is_ms_shipped = 0  -- Exclude system tables
-        ORDER BY t.name
-        """
+        # Build query with optional IN clause for include_tables
+        if include_tables:
+            # Filter at SQL level for efficiency
+            placeholders = ', '.join(['?' for _ in include_tables])
+            query = f"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                t.object_id,
+                t.create_date,
+                t.modify_date,
+                (SELECT SUM(p.rows)
+                 FROM sys.partitions p
+                 WHERE p.object_id = t.object_id
+                   AND p.index_id IN (0, 1)) AS row_count
+            FROM sys.tables t
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = ?
+              AND t.is_ms_shipped = 0
+              AND t.name IN ({placeholders})
+            ORDER BY t.name
+            """
+            parameters = [schema_name] + list(include_tables)
+            logger.info(f"Extracting {len(include_tables)} specific tables from schema '{schema_name}'")
+        else:
+            query = """
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                t.object_id,
+                t.create_date,
+                t.modify_date,
+                (SELECT SUM(p.rows)
+                 FROM sys.partitions p
+                 WHERE p.object_id = t.object_id
+                   AND p.index_id IN (0, 1)) AS row_count
+            FROM sys.tables t
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = ?
+              AND t.is_ms_shipped = 0  -- Exclude system tables
+            ORDER BY t.name
+            """
+            parameters = [schema_name]
 
-        tables = self.mssql_hook.get_records(query, parameters=[schema_name])
+        tables = self.mssql_hook.get_records(query, parameters=parameters)
 
         result = []
         for table in tables:
@@ -407,18 +439,24 @@ class SchemaExtractor:
 
         return schema_info
 
-    def get_all_tables_schema(self, schema_name: str = 'dbo', exclude_patterns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    def get_all_tables_schema(
+        self,
+        schema_name: str = 'dbo',
+        exclude_patterns: Optional[List[str]] = None,
+        include_tables: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
         """
         Get complete schema information for all tables in a schema.
 
         Args:
             schema_name: Schema name to extract from
             exclude_patterns: List of table name patterns to exclude
+            include_tables: List of specific table names to include
 
         Returns:
             List of complete table schema information
         """
-        tables = self.get_tables(schema_name, exclude_patterns)
+        tables = self.get_tables(schema_name, exclude_patterns, include_tables)
         result = []
 
         for table in tables:
@@ -499,7 +537,8 @@ class SchemaExtractor:
 def extract_schema_info(
     mssql_conn_id: str,
     schema_name: str = 'dbo',
-    exclude_tables: Optional[List[str]] = None
+    exclude_tables: Optional[List[str]] = None,
+    include_tables: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """
     Convenience function to extract complete schema information.
@@ -508,9 +547,10 @@ def extract_schema_info(
         mssql_conn_id: Airflow connection ID for SQL Server
         schema_name: Schema name to extract from
         exclude_tables: List of table patterns to exclude
+        include_tables: List of specific table names to include (filters at SQL level)
 
     Returns:
         List of complete table schema information
     """
     extractor = SchemaExtractor(mssql_conn_id)
-    return extractor.get_all_tables_schema(schema_name, exclude_tables)
+    return extractor.get_all_tables_schema(schema_name, exclude_tables, include_tables)

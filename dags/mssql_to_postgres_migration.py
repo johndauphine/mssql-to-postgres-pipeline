@@ -169,19 +169,13 @@ def mssql_to_postgres_migration():
         params = context["params"]
         logger.info(f"Extracting schema from {params['source_schema']} in SQL Server")
 
-        # Extract all tables and their schemas
+        # Extract tables and their schemas (filtered at SQL level if include_tables specified)
         tables = schema_extractor.extract_schema_info(
             mssql_conn_id=params["source_conn_id"],
             schema_name=params["source_schema"],
-            exclude_tables=params.get("exclude_tables", [])
+            exclude_tables=params.get("exclude_tables", []),
+            include_tables=params.get("include_tables", []) or None
         )
-
-        # Filter to only included tables if specified
-        include_tables = params.get("include_tables", [])
-        if include_tables:
-            include_set = set(t.upper() for t in include_tables)
-            tables = [t for t in tables if t["table_name"].upper() in include_set]
-            logger.info(f"Filtered to {len(tables)} tables from include_tables list")
 
         logger.info(f"Extracted schema for {len(tables)} tables")
 
