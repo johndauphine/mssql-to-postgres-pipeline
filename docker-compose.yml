@@ -36,13 +36,13 @@ x-airflow-common:
     PG_POOL_MINCONN: ${PG_POOL_MINCONN:-1}
     PG_POOL_MAXCONN: ${PG_POOL_MAXCONN:-8}
 
-    # Database Connection Strings (replacing airflow_settings.yaml)
-    # UPDATE THESE WITH YOUR CORPORATE DATABASE DETAILS:
+    # Database Connection Strings
+    # Set these in .env file or override here for local testing
     # For SQL Server with Kerberos: generic://hostname:1433/database
     # For SQL Server with SQL Auth: generic://username:password@hostname:1433/database
     # For PostgreSQL: postgresql://username:password@hostname:5432/database
-    AIRFLOW_CONN_MSSQL_SOURCE: 'generic://YOUR_SQLSERVER_HOST:1433/YOUR_DATABASE'
-    AIRFLOW_CONN_POSTGRES_TARGET: 'postgresql://YOUR_PG_USER:YOUR_PG_PASSWORD@YOUR_PG_HOST:5432/YOUR_PG_DATABASE'
+    AIRFLOW_CONN_MSSQL_SOURCE: ${AIRFLOW_CONN_MSSQL_SOURCE:-generic://sa:YourStrong%40Passw0rd@mssql-server:1433/StackOverflow2010}
+    AIRFLOW_CONN_POSTGRES_TARGET: ${AIRFLOW_CONN_POSTGRES_TARGET:-postgresql://postgres:PostgresPassword123@postgres-target:5432/stackoverflow}
 
     # Notification Settings (enable Slack by default; set SLACK_WEBHOOK_URL in .env)
     NOTIFICATION_ENABLED: ${NOTIFICATION_ENABLED:-true}
