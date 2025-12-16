@@ -23,9 +23,11 @@ import logging
 import re
 import os
 
-# Read max parallel transfers from environment (set in docker-compose.yml or .env)
-# This controls how many table/partition transfers run concurrently
+# Read configuration from environment (set in docker-compose.yml or .env)
+# MAX_PARALLEL_TRANSFERS: how many table/partition transfers run concurrently
+# MAX_ACTIVE_TASKS: total concurrent tasks across the entire DAG run
 MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
+MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
 
 # Import our custom migration modules
 from include.mssql_pg_migration import (
@@ -83,7 +85,7 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
     schedule=None,  # Run manually or trigger via API
     catchup=False,
     max_active_runs=1,
-    max_active_tasks=16,  # Reduced for 16GB RAM systems (was 64)
+    max_active_tasks=MAX_ACTIVE_TASKS,
     is_paused_upon_creation=False,
     doc_md=__doc__,
     default_args={
