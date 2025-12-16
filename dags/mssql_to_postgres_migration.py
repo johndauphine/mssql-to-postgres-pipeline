@@ -140,6 +140,13 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             type="boolean",
             description="Create tables as UNLOGGED during load for faster bulk inserts (converts to LOGGED after)"
         ),
+        "max_parallel_transfers": Param(
+            default=8,
+            type="integer",
+            minimum=1,
+            maximum=32,
+            description="Maximum number of parallel table/partition transfers (reduce for large schemas or limited resources)"
+        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
@@ -514,7 +521,7 @@ def mssql_to_postgres_migration():
         logger.info(f"Total: {len(partitions)} partitions across {partitioned_tables} large tables")
         return partitions
 
-    @task
+    @task(max_active_tis_per_dagrun="{{ params.max_parallel_transfers }}")
     def transfer_table_data(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
         """
         Transfer data for a single table from SQL Server to PostgreSQL.
@@ -557,7 +564,7 @@ def mssql_to_postgres_migration():
 
         return result
 
-    @task
+    @task(max_active_tis_per_dagrun="{{ params.max_parallel_transfers }}")
     def transfer_partition(partition_info: Dict[str, Any], **context) -> Dict[str, Any]:
         """
         Transfer a partition of a large table in parallel.
