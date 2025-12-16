@@ -6,7 +6,7 @@ using system tables and information schema views.
 """
 
 from typing import List, Dict, Any, Optional
-from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class SchemaExtractor:
         Args:
             mssql_conn_id: Airflow connection ID for SQL Server
         """
-        self.mssql_hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
+        self.mssql_hook = OdbcConnectionHelper(odbc_conn_id=mssql_conn_id)
 
     def get_tables(self, schema_name: str = 'dbo', exclude_patterns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
@@ -48,7 +48,7 @@ class SchemaExtractor:
                AND p.index_id IN (0, 1)) AS row_count
         FROM sys.tables t
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = %s
+        WHERE s.name = ?
           AND t.is_ms_shipped = 0  -- Exclude system tables
         ORDER BY t.name
         """
@@ -117,7 +117,7 @@ class SchemaExtractor:
         LEFT JOIN sys.identity_columns ic ON c.object_id = ic.object_id AND c.column_id = ic.column_id
         LEFT JOIN sys.default_constraints dc ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
         LEFT JOIN sys.computed_columns cc ON c.object_id = cc.object_id AND c.column_id = cc.column_id
-        WHERE c.object_id = %s
+        WHERE c.object_id = ?
         ORDER BY c.column_id
         """
 
@@ -168,7 +168,7 @@ class SchemaExtractor:
             ), 1, 2, '') AS columns
         FROM sys.indexes i
         WHERE i.is_primary_key = 1
-          AND i.object_id = %s
+          AND i.object_id = ?
         """
 
         result = self.mssql_hook.get_first(query, parameters=[table_object_id])
@@ -203,7 +203,7 @@ class SchemaExtractor:
         INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
         INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE i.is_primary_key = 1
-          AND i.object_id = %s
+          AND i.object_id = ?
         ORDER BY ic.key_ordinal
         """
         results = self.mssql_hook.get_records(query, parameters=[table_object_id])
@@ -255,7 +255,7 @@ class SchemaExtractor:
                 FOR XML PATH('')
             ), 1, 2, '') AS columns_with_order
         FROM sys.indexes i
-        WHERE i.object_id = %s
+        WHERE i.object_id = ?
           AND i.is_primary_key = 0  -- Exclude primary key
           AND i.type > 0  -- Exclude heap
         """
@@ -312,7 +312,7 @@ class SchemaExtractor:
             fk.delete_referential_action_desc AS on_delete,
             fk.update_referential_action_desc AS on_update
         FROM sys.foreign_keys fk
-        WHERE fk.parent_object_id = %s
+        WHERE fk.parent_object_id = ?
         """
 
         foreign_keys = self.mssql_hook.get_records(query, parameters=[table_object_id])
@@ -351,7 +351,7 @@ class SchemaExtractor:
             cc.definition,
             cc.is_disabled
         FROM sys.check_constraints cc
-        WHERE cc.parent_object_id = %s
+        WHERE cc.parent_object_id = ?
         """
 
         constraints = self.mssql_hook.get_records(query, parameters=[table_object_id])
@@ -383,7 +383,7 @@ class SchemaExtractor:
         SELECT object_id
         FROM sys.tables t
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = %s AND t.name = %s
+        WHERE s.name = ? AND t.name = ?
         """
 
         result = self.mssql_hook.get_first(query, parameters=[schema_name, table_name])

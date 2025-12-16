@@ -9,7 +9,7 @@ Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
 from typing import Dict, Any, Optional, List, Tuple, Iterable
-from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, date, time as dt_time
 from decimal import Decimal
@@ -41,7 +41,7 @@ class DataTransfer:
             mssql_conn_id: Airflow connection ID for SQL Server
             postgres_conn_id: Airflow connection ID for PostgreSQL
         """
-        self.mssql_hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
+        self.mssql_hook = OdbcConnectionHelper(odbc_conn_id=mssql_conn_id)
         self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
         self._postgres_conn_id = postgres_conn_id
 
