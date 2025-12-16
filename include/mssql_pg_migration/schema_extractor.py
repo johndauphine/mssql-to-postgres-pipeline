@@ -48,7 +48,7 @@ class SchemaExtractor:
                AND p.index_id IN (0, 1)) AS row_count
         FROM sys.tables t
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = %s
+        WHERE s.name = ?
           AND t.is_ms_shipped = 0  -- Exclude system tables
         ORDER BY t.name
         """
