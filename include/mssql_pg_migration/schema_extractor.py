@@ -66,6 +66,7 @@ class SchemaExtractor:
             # Uppercase schema and table names for case-insensitive matching
             parameters = [schema_name.upper()] + [t.upper() for t in include_tables]
             logger.info(f"Extracting {len(include_tables)} specific tables from schema '{schema_name}'")
+            logger.info(f"SQL parameters: schema={parameters[0]}, tables={parameters[1:5]}{'...' if len(parameters) > 5 else ''}")
         else:
             query = """
             SELECT
@@ -113,6 +114,24 @@ class SchemaExtractor:
             result.append(table_dict)
 
         logger.info(f"Found {len(result)} tables in schema '{schema_name}'")
+
+        # Debug: if no tables found, list available schemas
+        if not result and include_tables:
+            try:
+                schemas = self.mssql_hook.get_records(
+                    "SELECT name FROM sys.schemas WHERE name NOT LIKE 'db_%' ORDER BY name"
+                )
+                schema_names = [s[0] for s in schemas]
+                logger.warning(f"No tables found. Available schemas: {schema_names[:10]}")
+
+                # Check if any tables exist with similar names
+                sample_tables = self.mssql_hook.get_records(
+                    "SELECT TOP 5 s.name, t.name FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id ORDER BY t.name"
+                )
+                logger.warning(f"Sample tables in database: {[(s[0], s[1]) for s in sample_tables]}")
+            except Exception as e:
+                logger.warning(f"Could not get debug info: {e}")
+
         return result
 
     def get_columns(self, table_object_id: int) -> List[Dict[str, Any]]:
