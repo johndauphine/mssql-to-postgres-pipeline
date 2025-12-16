@@ -125,6 +125,11 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             maximum=500000,
             description="Number of rows to transfer per batch"
         ),
+        "include_tables": Param(
+            default=[],
+            type="array",
+            description="List of specific tables to include (if empty, all tables are included)"
+        ),
         "exclude_tables": Param(
             default=[],
             type="array",
@@ -170,6 +175,13 @@ def mssql_to_postgres_migration():
             schema_name=params["source_schema"],
             exclude_tables=params.get("exclude_tables", [])
         )
+
+        # Filter to only included tables if specified
+        include_tables = params.get("include_tables", [])
+        if include_tables:
+            include_set = set(t.upper() for t in include_tables)
+            tables = [t for t in tables if t["table_name"].upper() in include_set]
+            logger.info(f"Filtered to {len(tables)} tables from include_tables list")
 
         logger.info(f"Extracted schema for {len(tables)} tables")
 
