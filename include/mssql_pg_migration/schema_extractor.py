@@ -58,13 +58,13 @@ class SchemaExtractor:
                    AND p.index_id IN (0, 1)) AS row_count
             FROM sys.tables t
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name = ?
+            WHERE UPPER(s.name) = ?
               AND t.is_ms_shipped = 0
               AND UPPER(t.name) IN ({placeholders})
             ORDER BY t.name
             """
-            # Uppercase table names for case-insensitive matching
-            parameters = [schema_name] + [t.upper() for t in include_tables]
+            # Uppercase schema and table names for case-insensitive matching
+            parameters = [schema_name.upper()] + [t.upper() for t in include_tables]
             logger.info(f"Extracting {len(include_tables)} specific tables from schema '{schema_name}'")
         else:
             query = """
@@ -80,11 +80,11 @@ class SchemaExtractor:
                    AND p.index_id IN (0, 1)) AS row_count
             FROM sys.tables t
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name = ?
+            WHERE UPPER(s.name) = ?
               AND t.is_ms_shipped = 0  -- Exclude system tables
             ORDER BY t.name
             """
-            parameters = [schema_name]
+            parameters = [schema_name.upper()]
 
         tables = self.mssql_hook.get_records(query, parameters=parameters)
 
