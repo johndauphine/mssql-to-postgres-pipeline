@@ -169,10 +169,10 @@ def mssql_to_postgres_migration():
         params = context["params"]
         logger.info(f"Extracting schema from {params['source_schema']} in SQL Server")
 
-        # Parse include_tables - handle both string (JSON) and list formats
+        # Parse include_tables - handle string (JSON or CSV) and list formats
         include_tables_raw = params.get("include_tables", [])
         if isinstance(include_tables_raw, str):
-            # If it's a string, try to parse as JSON
+            # If it's a string, try to parse as JSON first
             import json
             try:
                 include_tables = json.loads(include_tables_raw)
@@ -183,6 +183,18 @@ def mssql_to_postgres_migration():
                 logger.info(f"Parsed include_tables from comma-separated string: {len(include_tables)} tables")
         else:
             include_tables = include_tables_raw
+
+        # Handle case where list contains comma-separated strings (e.g., ["ACCT,EMPL"])
+        if include_tables and isinstance(include_tables, list):
+            expanded = []
+            for item in include_tables:
+                if isinstance(item, str) and ',' in item:
+                    # Split comma-separated items within the list
+                    expanded.extend([t.strip() for t in item.split(',') if t.strip()])
+                elif isinstance(item, str) and item.strip():
+                    expanded.append(item.strip())
+            include_tables = expanded
+            logger.info(f"Final include_tables: {len(include_tables)} tables")
 
         # Extract tables and their schemas (filtered at SQL level if include_tables specified)
         tables = schema_extractor.extract_schema_info(
