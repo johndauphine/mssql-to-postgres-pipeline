@@ -169,12 +169,27 @@ def mssql_to_postgres_migration():
         params = context["params"]
         logger.info(f"Extracting schema from {params['source_schema']} in SQL Server")
 
+        # Parse include_tables - handle both string (JSON) and list formats
+        include_tables_raw = params.get("include_tables", [])
+        if isinstance(include_tables_raw, str):
+            # If it's a string, try to parse as JSON
+            import json
+            try:
+                include_tables = json.loads(include_tables_raw)
+                logger.info(f"Parsed include_tables from JSON string: {len(include_tables)} tables")
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as comma-separated list
+                include_tables = [t.strip() for t in include_tables_raw.split(',') if t.strip()]
+                logger.info(f"Parsed include_tables from comma-separated string: {len(include_tables)} tables")
+        else:
+            include_tables = include_tables_raw
+
         # Extract tables and their schemas (filtered at SQL level if include_tables specified)
         tables = schema_extractor.extract_schema_info(
             mssql_conn_id=params["source_conn_id"],
             schema_name=params["source_schema"],
             exclude_tables=params.get("exclude_tables", []),
-            include_tables=params.get("include_tables", []) or None
+            include_tables=include_tables or None
         )
 
         logger.info(f"Extracted schema for {len(tables)} tables")
