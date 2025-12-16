@@ -103,8 +103,8 @@ class SchemaExtractor:
             c.is_nullable,
             c.is_identity,
             c.is_computed,
-            ic.seed_value,
-            ic.increment_value,
+            CAST(ic.seed_value AS BIGINT) AS seed_value,
+            CAST(ic.increment_value AS BIGINT) AS increment_value,
             dc.definition AS default_value,
             cc.definition AS computed_definition,
             CASE

@@ -13,7 +13,6 @@ The DAG is designed to be generic and reusable for any SQL Server database migra
 """
 
 from airflow.decorators import dag, task
-from airflow.datasets import Dataset as Asset
 from airflow.models.param import Param
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
@@ -149,9 +148,7 @@ def mssql_to_postgres_migration():
     Main DAG for SQL Server to PostgreSQL migration.
     """
 
-    @task(
-        outlets=[Asset("mssql_schema_extracted")]
-    )
+    @task
     def extract_source_schema(**context) -> List[Dict[str, Any]]:
         """
         Extract complete schema information from SQL Server.
