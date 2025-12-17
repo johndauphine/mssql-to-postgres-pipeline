@@ -182,14 +182,24 @@ class DataTransfer:
         errors = []
 
         # Determine pagination mode
+        # Auto-detect composite PKs and switch to ROW_NUMBER mode
+        pk_columns = self._get_primary_key_columns(source_schema, source_table, columns)
+        is_composite_pk = len(pk_columns) > 1
+
+        if is_composite_pk and not use_row_number:
+            # Composite PK detected - must use ROW_NUMBER pagination
+            use_row_number = True
+            order_by_columns = pk_columns
+            logger.info(f"Detected composite PK ({', '.join(pk_columns)}) - switching to ROW_NUMBER pagination")
+
         if use_row_number:
             if not order_by_columns:
-                order_by_columns = [columns[0]]  # Fallback to first column
+                order_by_columns = pk_columns if pk_columns else [columns[0]]
             logger.info(f"Using ROW_NUMBER pagination (ORDER BY {', '.join(order_by_columns)})")
             if start_row and end_row:
                 logger.info(f"Processing rows {start_row:,} to {end_row:,}")
         else:
-            pk_column = self._get_primary_key_column(source_schema, source_table, columns)
+            pk_column = pk_columns[0] if pk_columns else columns[0]
             logger.info(f"Using '{pk_column}' for keyset pagination")
             pk_index = columns.index(pk_column) if pk_column in columns else 0
 
