@@ -1005,14 +1005,20 @@ def mssql_to_postgres_migration():
     # In Airflow 3 TaskFlow API, pass expanded results directly as parameters
     @task(trigger_rule="all_done")
     def collect_all_results(
+        expected_tables: List[Dict[str, Any]],
         regular_results: List[Dict[str, Any]],
         first_partition_results: List[Dict[str, Any]],
         remaining_partition_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Collect and aggregate results from all transfer tasks."""
+        """Collect and aggregate results from all transfer tasks.
+
+        Compares expected tables (from create_target_tables) with actual results
+        to identify and track failed transfers.
+        """
         from collections import defaultdict
 
         all_results = []
+        successful_table_names = set()
 
         # Process regular table results (non-partitioned tables)
         logger.info(f"Processing regular_results: {type(regular_results)}, count={len(regular_results) if regular_results else 0}")
@@ -1020,6 +1026,8 @@ def mssql_to_postgres_migration():
             for r in regular_results:
                 if r is not None and isinstance(r, dict):
                     all_results.append(r)
+                    if r.get('success', False):
+                        successful_table_names.add(r.get('table_name', ''))
                     logger.info(f"Regular table: {r.get('table_name', 'unknown')} - {r.get('rows_transferred', 0):,} rows, success={r.get('success')}")
 
         # Process partition results and aggregate by table name
@@ -1049,18 +1057,44 @@ def mssql_to_postgres_migration():
                 'success': success,
                 'partitions_processed': len(parts)
             })
+            if success:
+                successful_table_names.add(table_name)
             logger.info(f"Partitioned table: {table_name} - {total_rows:,} rows from {len(parts)} partitions, success={success}")
+
+        # Identify tables that were expected but have no results (completely failed transfers)
+        expected_table_names = {t.get('table_name', '') for t in expected_tables} if expected_tables else set()
+        tables_with_results = {r.get('table_name', '') for r in all_results}
+        missing_tables = expected_table_names - tables_with_results
+
+        # Add failed entries for tables that have no results at all
+        for table_name in missing_tables:
+            if table_name:  # Skip empty names
+                all_results.append({
+                    'table_name': table_name,
+                    'rows_transferred': 0,
+                    'success': False,
+                    'error': 'Transfer failed - no results received'
+                })
+                logger.warning(f"FAILED table: {table_name} - no transfer results received (task failed)")
 
         # Log summary
         successful = sum(1 for r in all_results if r.get('success', False))
         failed = len(all_results) - successful
-        logger.info(f"Collected results for {len(all_results)} tables: {successful} succeeded, {failed} failed")
+        failed_table_names = [r.get('table_name', 'unknown') for r in all_results if not r.get('success', False)]
+
+        if failed > 0:
+            logger.warning(f"Collected results: {len(all_results)} tables total, {successful} succeeded, {failed} FAILED")
+            logger.warning(f"FAILED TABLES: {', '.join(failed_table_names)}")
+        else:
+            logger.info(f"Collected results for {len(all_results)} tables: {successful} succeeded, {failed} failed")
 
         return all_results
 
     # Collect all results by passing expanded task results directly
     # This uses Airflow 3's TaskFlow API automatic XCom passing
+    # Pass expected_tables (created_tables) to track which tables should have been migrated
     transfer_results = collect_all_results(
+        expected_tables=created_tables,
         regular_results=regular_transfer_results,
         first_partition_results=first_partition_results,
         remaining_partition_results=remaining_partition_results
