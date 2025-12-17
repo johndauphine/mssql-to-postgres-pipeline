@@ -1002,50 +1002,45 @@ def mssql_to_postgres_migration():
     first_partition_results >> remaining_partition_results
 
     # Collect all transfer results (both regular tables and partitioned large tables)
+    # In Airflow 3 TaskFlow API, pass expanded results directly as parameters
     @task(trigger_rule="all_done")
-    def collect_all_results(**context) -> List[Dict[str, Any]]:
+    def collect_all_results(
+        regular_results: List[Dict[str, Any]],
+        first_partition_results: List[Dict[str, Any]],
+        remaining_partition_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """Collect and aggregate results from all transfer tasks."""
-        ti = context['ti']
+        from collections import defaultdict
+
         all_results = []
 
-        # Get regular table results
-        try:
-            regular = ti.xcom_pull(task_ids='transfer_table_data', map_indexes=None)
-            if regular:
-                if isinstance(regular, list):
-                    all_results.extend([r for r in regular if r])
-                else:
-                    all_results.append(regular)
-        except Exception as e:
-            logger.warning(f"Failed to retrieve regular table results: {e}")
+        # Process regular table results (non-partitioned tables)
+        logger.info(f"Processing regular_results: {type(regular_results)}, count={len(regular_results) if regular_results else 0}")
+        if regular_results:
+            for r in regular_results:
+                if r is not None and isinstance(r, dict):
+                    all_results.append(r)
+                    logger.info(f"Regular table: {r.get('table_name', 'unknown')} - {r.get('rows_transferred', 0):,} rows, success={r.get('success')}")
 
-        # Get partition results from both first and remaining partitions and aggregate by table name
-        from collections import defaultdict
+        # Process partition results and aggregate by table name
         table_partitions = defaultdict(list)
-        
-        # Collect partition results from both first_partition_results and remaining_partition_results
-        # Since there are two .expand() calls on transfer_partition, Airflow creates separate task IDs:
-        # 'transfer_partition' for first_partition_results and 'transfer_partition__1' for remaining
-        for task_suffix in ['', '__1']:
-            task_name = f'transfer_partition{task_suffix}'
-            try:
-                # In Airflow 3.x, explicitly specify key='return_value' for mapped task results
-                partitions = ti.xcom_pull(task_ids=task_name, key='return_value')
-                logger.info(f"Retrieved from {task_name}: {type(partitions)} - {len(partitions) if isinstance(partitions, list) else 'single'}")
-                if partitions:
-                    if not isinstance(partitions, list):
-                        partitions = [partitions]
 
-                    # Group partitions by table name
-                    for p in partitions:
-                        if p:
-                            table_partitions[p.get('table_name', 'Unknown')].append(p)
-            except Exception as e:
-                logger.warning(f"Could not retrieve from {task_name}: {e}")
+        logger.info(f"Processing first_partition_results: {type(first_partition_results)}, count={len(first_partition_results) if first_partition_results else 0}")
+        if first_partition_results:
+            for p in first_partition_results:
+                if p is not None and isinstance(p, dict):
+                    table_partitions[p.get('table_name', 'Unknown')].append(p)
+
+        logger.info(f"Processing remaining_partition_results: {type(remaining_partition_results)}, count={len(remaining_partition_results) if remaining_partition_results else 0}")
+        if remaining_partition_results:
+            for p in remaining_partition_results:
+                if p is not None and isinstance(p, dict):
+                    table_partitions[p.get('table_name', 'Unknown')].append(p)
 
         # Aggregate each table's partitions into a single result
         for table_name, parts in table_partitions.items():
             total_rows = sum(p.get('rows_transferred', 0) for p in parts)
+            # A table is successful only if ALL its partitions succeeded
             success = all(p.get('success', False) for p in parts)
 
             all_results.append({
@@ -1054,14 +1049,22 @@ def mssql_to_postgres_migration():
                 'success': success,
                 'partitions_processed': len(parts)
             })
-            logger.info(f"Aggregated {len(parts)} partitions for {table_name}: {total_rows:,} total rows")
+            logger.info(f"Partitioned table: {table_name} - {total_rows:,} rows from {len(parts)} partitions, success={success}")
 
-        logger.info(f"Collected results for {len(all_results)} tables")
+        # Log summary
+        successful = sum(1 for r in all_results if r.get('success', False))
+        failed = len(all_results) - successful
+        logger.info(f"Collected results for {len(all_results)} tables: {successful} succeeded, {failed} failed")
+
         return all_results
 
-    # Collect all results
-    transfer_results = collect_all_results()
-    [regular_transfer_results, first_partition_results, remaining_partition_results] >> transfer_results
+    # Collect all results by passing expanded task results directly
+    # This uses Airflow 3's TaskFlow API automatic XCom passing
+    transfer_results = collect_all_results(
+        regular_results=regular_transfer_results,
+        first_partition_results=first_partition_results,
+        remaining_partition_results=remaining_partition_results
+    )
 
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)

@@ -37,6 +37,8 @@ x-airflow-common:
     MAX_ACTIVE_TASKS: ${MAX_ACTIVE_TASKS:-16}
     PG_POOL_MINCONN: ${PG_POOL_MINCONN:-1}
     PG_POOL_MAXCONN: ${PG_POOL_MAXCONN:-8}
+    # For testing: set to comma-separated table names to simulate failures
+    SIMULATE_FAILURE_TABLES: ${SIMULATE_FAILURE_TABLES:-}
 
     # Database Connection Strings
     # Set these in .env file or override here for local testing

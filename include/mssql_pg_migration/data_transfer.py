@@ -692,6 +692,18 @@ def transfer_table_data(
     Returns:
         Transfer result dictionary
     """
+    import os
+
+    # Simulated failure for testing resilience
+    # Set SIMULATE_FAILURE_TABLES=Table1,Table2 to simulate failures for specific tables
+    simulate_failures = os.environ.get('SIMULATE_FAILURE_TABLES', '')
+    if simulate_failures:
+        failure_tables = [t.strip().upper() for t in simulate_failures.split(',') if t.strip()]
+        table_name = table_info['table_name'].upper()
+        if table_name in failure_tables:
+            logger.error(f"SIMULATED FAILURE for table {table_info['table_name']} (testing resilience)")
+            raise Exception(f"Simulated failure for table {table_info['table_name']}")
+
     transfer = DataTransfer(mssql_conn_id, postgres_conn_id)
 
     source_schema = table_info.get('source_schema', table_info.get('schema_name', 'dbo'))
