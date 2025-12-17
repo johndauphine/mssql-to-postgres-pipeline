@@ -26,8 +26,10 @@ import os
 # Read configuration from environment (set in docker-compose.yml or .env)
 # MAX_PARALLEL_TRANSFERS: how many table/partition transfers run concurrently
 # MAX_ACTIVE_TASKS: total concurrent tasks across the entire DAG run
+# DEFAULT_CHUNK_SIZE: rows per batch during data transfer
 MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
 MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
+DEFAULT_CHUNK_SIZE = int(os.environ.get('DEFAULT_CHUNK_SIZE', '200000'))
 
 # Import our custom migration modules
 from include.mssql_pg_migration import (
@@ -121,7 +123,7 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             description="Target schema in PostgreSQL"
         ),
         "chunk_size": Param(
-            default=200000,
+            default=DEFAULT_CHUNK_SIZE,
             type="integer",
             minimum=100,
             maximum=500000,
