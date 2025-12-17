@@ -205,7 +205,7 @@ ROW_NUMBER pagination is slower than keyset pagination due to the subquery. For 
 
 ### Memory Issues
 If partitions are still too large:
-1. Decrease `chunk_size` parameter (default: 100,000)
+1. Decrease `chunk_size` parameter (default: 200,000)
 2. Increase partition count (up to MAX_PARTITIONS)
 
 ### Verifying Partition Balance

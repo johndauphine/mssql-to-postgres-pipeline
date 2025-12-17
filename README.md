@@ -234,7 +234,7 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
 | `target_conn_id` | `postgres_target` | Airflow connection ID for PostgreSQL |
 | `source_schema` | `dbo` | Schema to migrate from SQL Server |
 | `target_schema` | `public` | Target schema in PostgreSQL |
-| `chunk_size` | `10000` | Rows per batch during transfer (100-100,000) |
+| `chunk_size` | `200000` | Rows per batch during transfer (100-500,000) |
 | `exclude_tables` | `[]` | Table patterns to skip (supports wildcards) |
 | `validate_samples` | `false` | Enable sample data validation (slower) |
 | `create_foreign_keys` | `true` | Create foreign key constraints after transfer |

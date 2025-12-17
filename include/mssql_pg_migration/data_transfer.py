@@ -121,7 +121,7 @@ class DataTransfer:
         source_table: str,
         target_schema: str,
         target_table: str,
-        chunk_size: int = 10000,
+        chunk_size: int = 200000,
         truncate_target: bool = True,
         columns: Optional[List[str]] = None,
         where_clause: Optional[str] = None,
@@ -669,7 +669,7 @@ def transfer_table_data(
     mssql_conn_id: str,
     postgres_conn_id: str,
     table_info: Dict[str, Any],
-    chunk_size: int = 10000,
+    chunk_size: int = 200000,
     truncate: bool = True,
     where_clause: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -731,7 +731,7 @@ def parallel_transfer_tables(
     mssql_conn_id: str,
     postgres_conn_id: str,
     tables: List[Dict[str, Any]],
-    chunk_size: int = 10000,
+    chunk_size: int = 200000,
     truncate: bool = True
 ) -> List[Dict[str, Any]]:
     """
