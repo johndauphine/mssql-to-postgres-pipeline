@@ -121,7 +121,7 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             description="Target schema in PostgreSQL"
         ),
         "chunk_size": Param(
-            default=100000,
+            default=200000,
             type="integer",
             minimum=100,
             maximum=500000,
