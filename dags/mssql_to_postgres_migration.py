@@ -659,7 +659,7 @@ def mssql_to_postgres_migration():
         return result
 
 
-    @task
+    @task(trigger_rule="all_done")
     def create_foreign_keys(
         tables_schema: List[Dict[str, Any]],
         transfer_results: List[Dict[str, Any]],
@@ -708,7 +708,7 @@ def mssql_to_postgres_migration():
         logger.info(f"Created {fk_count} foreign key constraints")
         return f"Created {fk_count} foreign keys"
 
-    @task
+    @task(trigger_rule="all_done")
     def convert_tables_to_logged(
         transfer_results: List[Dict[str, Any]],
         **context
@@ -749,7 +749,7 @@ def mssql_to_postgres_migration():
         logger.info(f"Converted {converted_count} tables to LOGGED for durability")
         return f"Converted {converted_count} tables to LOGGED"
 
-    @task
+    @task(trigger_rule="all_done")
     def create_indexes(
         tables_schema: List[Dict[str, Any]],
         transfer_results: List[Dict[str, Any]],
@@ -795,7 +795,7 @@ def mssql_to_postgres_migration():
         logger.info(f"Created {index_count} indexes")
         return f"Created {index_count} indexes"
 
-    @task
+    @task(trigger_rule="all_done")
     def create_primary_keys(
         tables_schema: List[Dict[str, Any]],
         transfer_results: List[Dict[str, Any]],
@@ -1084,6 +1084,7 @@ def mssql_to_postgres_migration():
         trigger_dag_id="validate_migration_env",
         wait_for_completion=True,
         poke_interval=30,
+        trigger_rule="all_done",  # Run even if some transfers failed
         conf={
             "source_schema": "{{ params.source_schema }}",
             "target_schema": "{{ params.target_schema }}",
@@ -1094,15 +1095,21 @@ def mssql_to_postgres_migration():
     fk_status >> trigger_validation
 
     # Generate final report (simplified version without validation results)
-    @task
+    @task(trigger_rule="all_done")
     def generate_migration_summary(**context):
         """Generate a summary of the migration and send notifications."""
         dag_run = context.get("dag_run")
         ti = context["ti"]
 
         transfer_results = ti.xcom_pull(task_ids="collect_all_results", key="return_value") or []
-        tables_migrated = len(transfer_results)
-        total_rows = sum(r.get("rows_transferred", 0) for r in transfer_results)
+
+        # Separate successful and failed tables
+        successful_tables = [r for r in transfer_results if r.get("success", False)]
+        failed_tables = [r for r in transfer_results if not r.get("success", False)]
+
+        tables_migrated = len(successful_tables)
+        tables_failed = len(failed_tables)
+        total_rows = sum(r.get("rows_transferred", 0) for r in successful_tables)
 
         duration_seconds = 0
         if dag_run and dag_run.start_date:
@@ -1110,18 +1117,34 @@ def mssql_to_postgres_migration():
             duration_seconds = (pendulum.now("UTC") - dag_run.start_date).total_seconds()
 
         rows_per_second = int(total_rows / duration_seconds) if duration_seconds > 0 and total_rows else 0
-        tables_list = [r.get("table_name", "unknown") for r in transfer_results]
+        successful_tables_list = [r.get("table_name", "unknown") for r in successful_tables]
+        failed_tables_list = [r.get("table_name", "unknown") for r in failed_tables]
 
         stats = {
             "tables_migrated": tables_migrated,
+            "tables_failed": tables_failed,
             "total_rows": total_rows,
             "rows_per_second": rows_per_second,
-            "tables_list": tables_list,
+            "tables_list": successful_tables_list,
+            "failed_tables_list": failed_tables_list,
         }
 
+        # Log summary with clear success/failure breakdown
+        if tables_failed > 0:
+            logger.warning(
+                "Migration completed with FAILURES: %s tables succeeded, %s tables FAILED",
+                tables_migrated,
+                tables_failed,
+            )
+            logger.warning("FAILED TABLES: %s", ", ".join(failed_tables_list))
+        else:
+            logger.info(
+                "Migration completed SUCCESSFULLY: %s tables migrated",
+                tables_migrated,
+            )
+
         logger.info(
-            "Migration summary: tables=%s, rows=%s, duration=%.2fs, rps=%s",
-            tables_migrated,
+            "Migration stats: rows=%s, duration=%.2fs, rps=%s",
             total_rows,
             duration_seconds,
             rows_per_second,
@@ -1136,6 +1159,9 @@ def mssql_to_postgres_migration():
         )
 
         logger.info("Validation DAG has been triggered to verify data integrity.")
+
+        if tables_failed > 0:
+            return f"Migration completed with {tables_failed} failures. Check logs for details."
         return "Migration complete. Check validation DAG for results."
 
     final_status = generate_migration_summary()
