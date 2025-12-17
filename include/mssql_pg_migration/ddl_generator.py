@@ -347,11 +347,11 @@ class DDLGenerator:
             column['data_type']
         ]
 
-        # Add NOT NULL constraint
-        # Skip NOT NULL for TEXT columns as source data may have integrity issues
-        # (e.g., SQL Server nvarchar(max) columns with NULL values despite NOT NULL constraint)
-        if not column.get('is_nullable', True) and column['data_type'].upper() != 'TEXT':
-            parts.append('NOT NULL')
+        # Skip NOT NULL constraints during migration
+        # SQL Server often has NULLs in NOT NULL columns (data integrity issues)
+        # Add NOT NULL after migration if needed: ALTER TABLE ... ALTER COLUMN ... SET NOT NULL
+        # if not column.get('is_nullable', True):
+        #     parts.append('NOT NULL')
 
         # Add default value if present
         if column.get('default_value'):
