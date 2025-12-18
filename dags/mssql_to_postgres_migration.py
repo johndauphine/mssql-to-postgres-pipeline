@@ -150,9 +150,9 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             description="Whether to create foreign key constraints"
         ),
         "use_unlogged_tables": Param(
-            default=True,
+            default=False,
             type="boolean",
-            description="Create tables as UNLOGGED during load for faster bulk inserts (converts to LOGGED after)"
+            description="Create tables as UNLOGGED during load (requires slow SET LOGGED conversion after - not recommended for large datasets)"
         ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
