@@ -177,14 +177,14 @@ class TestTypeMapping:
 class TestValidation:
     """Test validation utilities."""
 
-    @patch("mssql_pg_migration.validation.MsSqlHook")
+    @patch("mssql_pg_migration.validation.OdbcConnectionHelper")
     @patch("mssql_pg_migration.validation.PostgresHook")
-    def test_row_count_validation_success(self, mock_pg_hook, mock_mssql_hook):
+    def test_row_count_validation_success(self, mock_pg_hook, mock_odbc_helper):
         """Test successful row count validation."""
-        # Mock SQL Server connection
-        mock_mssql = MagicMock()
-        mock_mssql.get_first.return_value = (1000,)
-        mock_mssql_hook.return_value = mock_mssql
+        # Mock SQL Server connection via OdbcConnectionHelper
+        mock_odbc = MagicMock()
+        mock_odbc.get_first.return_value = (1000,)
+        mock_odbc_helper.return_value = mock_odbc
 
         # Mock PostgreSQL connection
         mock_pg = MagicMock()
@@ -203,14 +203,14 @@ class TestValidation:
         assert result["target_count"] == 1000
         assert result["row_difference"] == 0
 
-    @patch("mssql_pg_migration.validation.MsSqlHook")
+    @patch("mssql_pg_migration.validation.OdbcConnectionHelper")
     @patch("mssql_pg_migration.validation.PostgresHook")
-    def test_row_count_validation_failure(self, mock_pg_hook, mock_mssql_hook):
+    def test_row_count_validation_failure(self, mock_pg_hook, mock_odbc_helper):
         """Test failed row count validation."""
-        # Mock SQL Server connection
-        mock_mssql = MagicMock()
-        mock_mssql.get_first.return_value = (1000,)
-        mock_mssql_hook.return_value = mock_mssql
+        # Mock SQL Server connection via OdbcConnectionHelper
+        mock_odbc = MagicMock()
+        mock_odbc.get_first.return_value = (1000,)
+        mock_odbc_helper.return_value = mock_odbc
 
         # Mock PostgreSQL connection
         mock_pg = MagicMock()
