@@ -716,7 +716,7 @@ def send_custom_notification(
         fields: Optional list of {'title': ..., 'value': ...} dicts
 
     Usage:
-        from include.mssql_pg_migration.notifications import send_custom_notification
+        from mssql_pg_migration.notifications import send_custom_notification
         send_custom_notification(
             title="Migration Progress",
             message="Transferred 10M rows",

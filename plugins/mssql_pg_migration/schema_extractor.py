@@ -6,7 +6,7 @@ using system tables and information schema views.
 """
 
 from typing import List, Dict, Any, Optional
-from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 import logging
 
 logger = logging.getLogger(__name__)

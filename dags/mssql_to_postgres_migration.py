@@ -32,13 +32,13 @@ MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
 DEFAULT_CHUNK_SIZE = int(os.environ.get('DEFAULT_CHUNK_SIZE', '200000'))
 
 # Import our custom migration modules
-from include.mssql_pg_migration import (
+from mssql_pg_migration import (
     schema_extractor,
     ddl_generator,
     data_transfer,
     validation,
 )
-from include.mssql_pg_migration.notifications import (
+from mssql_pg_migration.notifications import (
     on_dag_failure,
     on_task_failure,
     send_success_notification,
@@ -374,7 +374,7 @@ def mssql_to_postgres_migration():
         fallback_tables = []  # P0.3: Tables that failed partitioning - will use regular transfer
 
         # Get MSSQL connection for querying partition boundaries
-        from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+        from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
         mssql_hook = OdbcConnectionHelper(odbc_conn_id=params["source_conn_id"])
 
         for table_info in created_tables:

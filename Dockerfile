@@ -38,5 +38,3 @@ ENV AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW=20
 # Migration parallelization (override via .env: MAX_PARTITIONS=4 for 16GB, 8 for 32GB)
 ENV MAX_PARTITIONS=8
 
-# Add /opt/airflow to PYTHONPATH for include module
-ENV PYTHONPATH="${PYTHONPATH}:/opt/airflow"

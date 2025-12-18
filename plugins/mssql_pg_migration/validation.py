@@ -6,7 +6,7 @@ including row count comparisons and data integrity checks.
 """
 
 from typing import Dict, Any, List, Optional, Tuple
-from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
 from psycopg2 import sql

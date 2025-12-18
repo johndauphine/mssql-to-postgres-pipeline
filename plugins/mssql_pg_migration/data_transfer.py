@@ -9,7 +9,7 @@ Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
 from typing import Dict, Any, Optional, List, Tuple, Iterable
-from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, date, time as dt_time
 from decimal import Decimal
