@@ -15,7 +15,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from airflow.models import DagBag
-from include.mssql_pg_migration import type_mapping, validation
+from mssql_pg_migration import type_mapping, validation
 
 
 class TestDAGValidation:
@@ -177,8 +177,8 @@ class TestTypeMapping:
 class TestValidation:
     """Test validation utilities."""
 
-    @patch("include.mssql_pg_migration.validation.MsSqlHook")
-    @patch("include.mssql_pg_migration.validation.PostgresHook")
+    @patch("mssql_pg_migration.validation.MsSqlHook")
+    @patch("mssql_pg_migration.validation.PostgresHook")
     def test_row_count_validation_success(self, mock_pg_hook, mock_mssql_hook):
         """Test successful row count validation."""
         # Mock SQL Server connection
@@ -203,8 +203,8 @@ class TestValidation:
         assert result["target_count"] == 1000
         assert result["row_difference"] == 0
 
-    @patch("include.mssql_pg_migration.validation.MsSqlHook")
-    @patch("include.mssql_pg_migration.validation.PostgresHook")
+    @patch("mssql_pg_migration.validation.MsSqlHook")
+    @patch("mssql_pg_migration.validation.PostgresHook")
     def test_row_count_validation_failure(self, mock_pg_hook, mock_mssql_hook):
         """Test failed row count validation."""
         # Mock SQL Server connection
@@ -275,7 +275,7 @@ class TestSchemaExtractor:
 
     def test_pattern_matching(self):
         """Test table name pattern matching."""
-        from include.mssql_pg_migration.schema_extractor import SchemaExtractor
+        from mssql_pg_migration.schema_extractor import SchemaExtractor
 
         # Create extractor without actual connection
         extractor = SchemaExtractor.__new__(SchemaExtractor)
@@ -292,7 +292,7 @@ class TestDDLGenerator:
 
     def test_identifier_quoting(self):
         """Test PostgreSQL identifier quoting."""
-        from include.mssql_pg_migration.ddl_generator import DDLGenerator
+        from mssql_pg_migration.ddl_generator import DDLGenerator
 
         generator = DDLGenerator.__new__(DDLGenerator)
 
@@ -311,7 +311,7 @@ class TestDDLGenerator:
 
     def test_drop_table_generation(self):
         """Test DROP TABLE statement generation."""
-        from include.mssql_pg_migration.ddl_generator import DDLGenerator
+        from mssql_pg_migration.ddl_generator import DDLGenerator
 
         generator = DDLGenerator.__new__(DDLGenerator)
 
@@ -323,7 +323,7 @@ class TestDDLGenerator:
 
     def test_truncate_table_generation(self):
         """Test TRUNCATE TABLE statement generation."""
-        from include.mssql_pg_migration.ddl_generator import DDLGenerator
+        from mssql_pg_migration.ddl_generator import DDLGenerator
 
         generator = DDLGenerator.__new__(DDLGenerator)
 

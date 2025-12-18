@@ -102,9 +102,10 @@ All DAGs must meet these criteria (enforced by tests/dags/test_dag_example.py):
 The project uses Apache Airflow 3.0.0 vanilla image (Dockerfile). When modifying dependencies:
 
 1. **Python packages**: Add to `requirements.txt`
-2. **System packages**: Add RUN commands to Dockerfile (e.g., FreeTDS for SQL Server)
+2. **System packages**: Add RUN commands to Dockerfile (e.g., Microsoft ODBC Driver for SQL Server)
 3. **Environment variables**: Configure in `.env` file
 4. **Connections**: Use `AIRFLOW_CONN_*` environment variables in `.env`
+5. **Shared modules**: Place in `plugins/` directory (auto-added to Python path by Airflow)
 
 ### Local Development Environment
 
@@ -175,9 +176,10 @@ pipeline_name()
 ### Project-Specific Considerations
 
 1. **MSSQL to PostgreSQL Migration**: When implementing ETL pipelines:
-   - Use appropriate provider packages (apache-airflow-providers-microsoft-mssql, apache-airflow-providers-postgres)
-   - Consider data type mappings between MSSQL and PostgreSQL
-   - Handle schema differences and naming conventions
+   - Uses pyodbc with Microsoft ODBC Driver 18 for SQL Server (not Airflow's mssql provider)
+   - Uses apache-airflow-providers-postgres for PostgreSQL connections
+   - Shared migration modules in `plugins/mssql_pg_migration/` handle type mapping, schema extraction, DDL generation, and data transfer
+   - Consider data type mappings between MSSQL and PostgreSQL (see `plugins/mssql_pg_migration/type_mapping.py`)
 
 2. **Error Handling**: Tasks should include proper exception handling and use Airflow's retry mechanism
 
