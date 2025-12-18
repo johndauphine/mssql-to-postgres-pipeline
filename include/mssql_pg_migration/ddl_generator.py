@@ -7,7 +7,7 @@ handling table creation, constraints, and indexes.
 
 from typing import Dict, Any, List, Optional
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from .type_mapping import map_column, map_table_schema
+from mssql_pg_migration.type_mapping import map_column, map_table_schema
 import logging
 
 logger = logging.getLogger(__name__)
