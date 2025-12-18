@@ -205,6 +205,10 @@ class DataTransfer:
 
         try:
             with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
+                # Disable statement timeout for the entire transfer operation
+                with postgres_conn.cursor() as cursor:
+                    cursor.execute("SET statement_timeout = 0")
+
                 # For partition transfers (not first partition), clean up any existing data
                 # This makes partition retries idempotent - prevents duplicate rows
                 # Detect both ROW_NUMBER partitions and keyset partitions
