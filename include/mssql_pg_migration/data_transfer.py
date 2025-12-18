@@ -236,6 +236,12 @@ class DataTransfer:
                         )
 
                     if first_pk and last_pk:
+                        # Log the PK bounds for debugging/verification
+                        pk_cols_str = ', '.join(pk_columns)
+                        first_pk_str = ', '.join(repr(v) for v in first_pk)
+                        last_pk_str = ', '.join(repr(v) for v in last_pk)
+                        logger.info(f"Partition PK bounds: ({pk_cols_str}) from ({first_pk_str}) to ({last_pk_str})")
+
                         deleted = self._delete_partition_data(
                             target_schema,
                             target_table,
@@ -245,6 +251,8 @@ class DataTransfer:
                         )
                         if deleted > 0:
                             logger.info(f"Deleted {deleted:,} existing rows from partition range")
+                        else:
+                            logger.info("No existing rows to delete (clean partition)")
                     else:
                         logger.warning("Could not determine partition PK bounds - skipping cleanup")
 
