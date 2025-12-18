@@ -207,18 +207,34 @@ class DataTransfer:
             with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
                 # For partition transfers (not first partition), clean up any existing data
                 # This makes partition retries idempotent - prevents duplicate rows
-                is_partition_transfer = use_row_number and start_row and end_row and not truncate_target
-                if is_partition_transfer and pk_columns:
+                # Detect both ROW_NUMBER partitions and keyset partitions
+                is_row_number_partition = use_row_number and start_row and end_row and not truncate_target
+                is_keyset_partition = where_clause and not truncate_target and not use_row_number
+
+                if (is_row_number_partition or is_keyset_partition) and pk_columns:
                     logger.info(f"Cleaning up existing partition data before transfer (idempotent retry)")
-                    first_pk, last_pk = self._get_partition_pk_bounds(
-                        mssql_conn,
-                        source_schema,
-                        source_table,
-                        pk_columns,
-                        start_row,
-                        end_row,
-                        where_clause
-                    )
+
+                    if is_row_number_partition:
+                        # ROW_NUMBER partition: get bounds from row range
+                        first_pk, last_pk = self._get_partition_pk_bounds(
+                            mssql_conn,
+                            source_schema,
+                            source_table,
+                            pk_columns,
+                            start_row,
+                            end_row,
+                            where_clause
+                        )
+                    else:
+                        # Keyset partition: get bounds from where_clause query
+                        first_pk, last_pk = self._get_keyset_partition_pk_bounds(
+                            mssql_conn,
+                            source_schema,
+                            source_table,
+                            pk_columns,
+                            where_clause
+                        )
+
                     if first_pk and last_pk:
                         deleted = self._delete_partition_data(
                             target_schema,
@@ -493,6 +509,62 @@ class DataTransfer:
                 return None, None
         except Exception as e:
             logger.warning(f"Could not get partition PK bounds: {e}")
+            return None, None
+
+    def _get_keyset_partition_pk_bounds(
+        self,
+        mssql_conn,
+        schema_name: str,
+        table_name: str,
+        pk_columns: List[str],
+        where_clause: str
+    ) -> Tuple[Optional[Tuple], Optional[Tuple]]:
+        """
+        Get the MIN and MAX PK values for a keyset partition.
+
+        For keyset partitions that use WHERE clause filtering (e.g., [Id] >= 1 AND [Id] <= 1000000),
+        this queries the source table to get the actual MIN and MAX PK values.
+
+        Args:
+            mssql_conn: Active MSSQL connection
+            schema_name: Source schema name
+            table_name: Source table name
+            pk_columns: Primary key column names
+            where_clause: WHERE clause defining the partition boundaries
+
+        Returns:
+            Tuple of (min_pk_tuple, max_pk_tuple), or (None, None) if no data
+        """
+        pk_cols_quoted = ', '.join([f'[{col}]' for col in pk_columns])
+
+        # Build MIN and MAX queries for each PK column
+        min_selects = ', '.join([f'MIN([{col}])' for col in pk_columns])
+        max_selects = ', '.join([f'MAX([{col}])' for col in pk_columns])
+
+        query = f"""
+        SELECT {min_selects}, {max_selects}
+        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        WHERE {where_clause}
+        """
+
+        try:
+            with mssql_conn.cursor() as cursor:
+                cursor.execute(query)
+                row = cursor.fetchone()
+
+                if row:
+                    num_pk_cols = len(pk_columns)
+                    min_values = row[:num_pk_cols]
+                    max_values = row[num_pk_cols:]
+
+                    # Check if any values are None (no data)
+                    if any(v is None for v in min_values) or any(v is None for v in max_values):
+                        return None, None
+
+                    return tuple(min_values), tuple(max_values)
+                return None, None
+        except Exception as e:
+            logger.warning(f"Could not get keyset partition PK bounds: {e}")
             return None, None
 
     def _delete_partition_data(
