@@ -352,7 +352,7 @@ def mssql_to_postgres_migration():
         return regular_tables
 
     @task
-    def prepare_large_table_partitions(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+    def prepare_large_table_partitions(created_tables: List[Dict[str, Any]], **context) -> Dict[str, Any]:
         """
         Create partitions for any large table (>1M rows) using NTILE-based boundaries.
 
@@ -362,9 +362,16 @@ def mssql_to_postgres_migration():
         - Guarantees balanced partitions
 
         For composite PKs, uses ROW_NUMBER with row ranges instead.
+
+        P0.3 FIX: Returns both partitions and any tables that failed partitioning.
+        Failed tables are sent back to regular transfer as a fallback.
+
+        Returns:
+            Dict with 'partitions' list and 'fallback_tables' list
         """
         params = context["params"]
         partitions = []
+        fallback_tables = []  # P0.3: Tables that failed partitioning - will use regular transfer
 
         # Get MSSQL connection for querying partition boundaries
         from include.mssql_pg_migration.odbc_helper import OdbcConnectionHelper
@@ -390,7 +397,9 @@ def mssql_to_postgres_migration():
                 safe_table_name = validate_sql_identifier(table_name, "table name")
                 safe_source_schema = validate_sql_identifier(source_schema, "schema name")
             except ValueError as e:
-                logger.error(f"Invalid SQL identifier during table validation: {e}")
+                # P0.3: Fall back to regular transfer instead of skipping
+                logger.warning(f"Invalid SQL identifier during table validation: {e} - falling back to regular transfer")
+                fallback_tables.append(table_info)
                 continue
 
             # Get primary key columns info from schema extraction
@@ -434,7 +443,9 @@ def mssql_to_postgres_migration():
                     }
 
             if not pk_columns_info.get('columns'):
-                logger.error(f"Could not determine ordering column for {safe_table_name}, skipping")
+                # P0.3: Fall back to regular transfer instead of skipping
+                logger.warning(f"Could not determine ordering column for {safe_table_name} - falling back to regular transfer")
+                fallback_tables.append(table_info)
                 continue
 
             pk_columns = pk_columns_info['columns']
@@ -451,7 +462,9 @@ def mssql_to_postgres_migration():
                     continue
 
             if not safe_pk_columns:
-                logger.error(f"No valid PK columns for {safe_table_name}, skipping")
+                # P0.3: Fall back to regular transfer instead of skipping
+                logger.warning(f"No valid PK columns for {safe_table_name} - falling back to regular transfer")
+                fallback_tables.append(table_info)
                 continue
 
             partition_count = get_partition_count(row_count)
@@ -501,11 +514,15 @@ def mssql_to_postgres_migration():
                 try:
                     boundaries = mssql_hook.get_records(boundaries_query)
                 except Exception as e:
-                    logger.error(f"Error querying NTILE boundaries for {safe_table_name}: {e}")
+                    # P0.3: Fall back to regular transfer instead of skipping
+                    logger.warning(f"Error querying NTILE boundaries for {safe_table_name}: {e} - falling back to regular transfer")
+                    fallback_tables.append(table_info)
                     continue
 
                 if not boundaries:
-                    logger.warning(f"No partition boundaries returned for {safe_table_name}, skipping")
+                    # P0.3: Fall back to regular transfer instead of skipping
+                    logger.warning(f"No partition boundaries returned for {safe_table_name} - falling back to regular transfer")
+                    fallback_tables.append(table_info)
                     continue
 
                 logger.info(f"  NTILE returned {len(boundaries)} partitions")
@@ -554,7 +571,16 @@ def mssql_to_postgres_migration():
         # Calculate total number of partitioned tables
         partitioned_tables = len(set(p['table_name'] for p in partitions)) if partitions else 0
         logger.info(f"Total: {len(partitions)} partitions across {partitioned_tables} large tables")
-        return partitions
+
+        # P0.3: Log and return fallback tables for regular transfer
+        if fallback_tables:
+            fallback_names = [t['table_name'] for t in fallback_tables]
+            logger.warning(f"P0.3 FALLBACK: {len(fallback_tables)} large tables will use regular transfer: {', '.join(fallback_names)}")
+
+        return {
+            'partitions': partitions,
+            'fallback_tables': fallback_tables
+        }
 
     @task(max_active_tis_per_dagrun=MAX_PARALLEL_TRANSFERS)
     def transfer_table_data(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
@@ -938,8 +964,33 @@ def mssql_to_postgres_migration():
     created_tables = create_target_tables(schema_data, schema_status)
 
     # Prepare transfer tasks - partition any large tables (>5M rows)
-    regular_tables = prepare_regular_tables(created_tables)
-    large_table_partitions = prepare_large_table_partitions(created_tables)
+    regular_tables_initial = prepare_regular_tables(created_tables)
+    large_table_result = prepare_large_table_partitions(created_tables)
+
+    # P0.3: Extract partitions and fallback tables from partition planning result
+    @task
+    def get_partitions(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract partitions from partition planning result."""
+        return result.get('partitions', [])
+
+    @task
+    def merge_with_fallback(
+        regular_tables: List[Dict[str, Any]],
+        partition_result: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        P0.3: Merge fallback tables (large tables that failed partitioning)
+        with regular tables for transfer.
+        """
+        fallback_tables = partition_result.get('fallback_tables', [])
+        if fallback_tables:
+            fallback_names = [t['table_name'] for t in fallback_tables]
+            logger.info(f"P0.3: Adding {len(fallback_tables)} fallback tables to regular transfer: {', '.join(fallback_names)}")
+        return regular_tables + fallback_tables
+
+    # Merge regular tables with any fallback tables from partition failures
+    regular_tables = merge_with_fallback(regular_tables_initial, large_table_result)
+    large_table_partitions = get_partitions(large_table_result)
 
     # Split partitions into first (truncates) and remaining (no truncate)
     @task
@@ -1105,6 +1156,51 @@ def mssql_to_postgres_migration():
     # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
     logged_status = convert_tables_to_logged(transfer_results)
 
+    # P2.2: Reset sequences for SERIAL/BIGSERIAL columns after data load
+    @task(trigger_rule="all_done")
+    def reset_sequences(
+        tables_schema: List[Dict[str, Any]],
+        transfer_results: List[Dict[str, Any]],
+        **context
+    ) -> str:
+        """
+        P2.2: Reset sequences for SERIAL/BIGSERIAL columns to MAX(column) value.
+
+        After COPY loading explicit values into SERIAL columns, the sequences need
+        to be advanced to prevent duplicate key errors on future inserts.
+
+        Args:
+            tables_schema: Original table schemas with column definitions
+            transfer_results: Results from data transfers
+
+        Returns:
+            Status message
+        """
+        params = context["params"]
+        target_schema = params["target_schema"]
+
+        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+
+        # Only reset sequences for successfully transferred tables
+        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
+        sequences_reset = 0
+
+        for table_schema in tables_schema:
+            table_name = table_schema["table_name"]
+            if table_name not in successful_tables:
+                continue
+
+            try:
+                reset_count = generator.reset_sequences(table_schema, target_schema)
+                sequences_reset += reset_count
+            except Exception as e:
+                logger.warning(f"Could not reset sequences for {table_name}: {str(e)}")
+
+        logger.info(f"P2.2: Reset {sequences_reset} sequences for SERIAL/BIGSERIAL columns")
+        return f"Reset {sequences_reset} sequences"
+
+    seq_status = reset_sequences(schema_data, transfer_results)
+
     # Create primary keys after data load (much faster than during inserts)
     pk_status = create_primary_keys(schema_data, transfer_results)
 
@@ -1114,8 +1210,8 @@ def mssql_to_postgres_migration():
     # Create foreign keys after indexes are created
     fk_status = create_foreign_keys(schema_data, transfer_results)
 
-    # Task order: convert_to_logged -> create_primary_keys -> create_indexes -> create_foreign_keys
-    logged_status >> pk_status >> index_status >> fk_status
+    # Task order: convert_to_logged -> reset_sequences -> create_primary_keys -> create_indexes -> create_foreign_keys
+    logged_status >> seq_status >> pk_status >> index_status >> fk_status
 
     # Trigger validation DAG instead of internal validation (avoids XCom bug)
     trigger_validation = TriggerDagRunOperator(

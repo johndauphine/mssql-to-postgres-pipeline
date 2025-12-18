@@ -310,6 +310,61 @@ class DDLGenerator:
 
         return ddl_statements
 
+    def reset_sequences(self, table_schema: Dict[str, Any], target_schema: str = 'public') -> int:
+        """
+        P2.2: Reset sequences for SERIAL/BIGSERIAL columns to MAX(column) value.
+
+        After COPY loading explicit values into SERIAL columns, the sequences need
+        to be advanced to prevent duplicate key errors on future inserts.
+
+        Args:
+            table_schema: Table schema information (must be mapped)
+            target_schema: Target PostgreSQL schema name
+
+        Returns:
+            Number of sequences reset
+        """
+        mapped_schema = map_table_schema(table_schema)
+        table_name = mapped_schema['table_name']
+        reset_count = 0
+
+        # Find SERIAL/BIGSERIAL columns (identity columns from SQL Server)
+        serial_columns = [
+            col['column_name'] for col in mapped_schema['columns']
+            if col.get('data_type', '').upper() in ('SERIAL', 'BIGSERIAL')
+        ]
+
+        if not serial_columns:
+            return 0
+
+        with self.postgres_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                for col_name in serial_columns:
+                    try:
+                        # Use pg_get_serial_sequence to get the sequence name
+                        # Then setval to MAX(col) value
+                        # The third argument 'true' means the next nextval will return MAX(col)+1
+                        # Note: pg_get_serial_sequence requires quoted identifier format: "schema"."table"
+                        quoted_table = f'"{target_schema}"."{table_name}"'
+                        reset_sql = f"""
+                        SELECT setval(
+                            pg_get_serial_sequence('{quoted_table}', '{col_name}'),
+                            COALESCE((SELECT MAX("{col_name}") FROM "{target_schema}"."{table_name}"), 1),
+                            true
+                        )
+                        """
+                        cursor.execute(reset_sql)
+                        result = cursor.fetchone()
+                        if result:
+                            logger.info(f"P2.2: Reset sequence for {table_name}.{col_name} to {result[0]}")
+                            reset_count += 1
+                    except Exception as e:
+                        # Log warning but don't fail - sequence might not exist for some edge cases
+                        logger.warning(f"Could not reset sequence for {table_name}.{col_name}: {e}")
+            conn.commit()
+
+        return reset_count
+
     def execute_ddl(self, ddl_statements: List[str], transaction: bool = True) -> None:
         """
         Execute DDL statements in PostgreSQL.

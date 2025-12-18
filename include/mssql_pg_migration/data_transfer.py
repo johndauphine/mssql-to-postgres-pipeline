@@ -27,6 +27,21 @@ from psycopg2 import sql
 logger = logging.getLogger(__name__)
 
 
+def _is_strict_consistency_mode() -> bool:
+    """
+    P0.4: Check if strict consistency mode is enabled.
+
+    When STRICT_CONSISTENCY=true, NOLOCK hints are disabled for correctness-first runs.
+    NOLOCK can cause missing rows, duplicates, and inconsistent reads under concurrent writes.
+
+    Returns:
+        True if strict consistency mode is enabled
+    """
+    import os
+    val = os.environ.get('STRICT_CONSISTENCY', '').lower()
+    return val in ('true', '1', 'yes', 'on')
+
+
 class DataTransfer:
     """Handle data transfer from SQL Server to PostgreSQL."""
 
@@ -152,6 +167,10 @@ class DataTransfer:
         """
         start_time = time.time()
         logger.info(f"Starting transfer: {source_schema}.{source_table} -> {target_schema}.{target_table}")
+
+        # P0.4: Log strict consistency mode status
+        if _is_strict_consistency_mode():
+            logger.info("P0.4 STRICT_CONSISTENCY mode ENABLED - NOLOCK hints disabled for data integrity")
 
         # Get source row count
         source_row_count = self._get_row_count(source_schema, source_table, is_source=True, where_clause=where_clause)
@@ -482,6 +501,9 @@ class DataTransfer:
         Returns:
             Tuple of (first_pk_tuple, last_pk_tuple), or (None, None) if no data
         """
+        # P0.4: Conditionally use NOLOCK based on strict consistency mode
+        table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+
         pk_cols_quoted = ', '.join([f'[{col}]' for col in pk_columns])
         order_by = ', '.join([f'[{col}]' for col in pk_columns])
 
@@ -489,7 +511,7 @@ class DataTransfer:
         inner_query = f"""
         SELECT {pk_cols_quoted},
                ROW_NUMBER() OVER (ORDER BY {order_by}) as _rn
-        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        FROM [{schema_name}].[{table_name}]{table_hint}
         """
         if where_clause:
             inner_query += f"\nWHERE {where_clause}"
@@ -547,6 +569,9 @@ class DataTransfer:
         Returns:
             Tuple of (min_pk_tuple, max_pk_tuple), or (None, None) if no data
         """
+        # P0.4: Conditionally use NOLOCK based on strict consistency mode
+        table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+
         pk_cols_quoted = ', '.join([f'[{col}]' for col in pk_columns])
 
         # Build MIN and MAX queries for each PK column
@@ -555,7 +580,7 @@ class DataTransfer:
 
         query = f"""
         SELECT {min_selects}, {max_selects}
-        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        FROM [{schema_name}].[{table_name}]{table_hint}
         WHERE {where_clause}
         """
 
@@ -762,10 +787,13 @@ class DataTransfer:
     ) -> Tuple[List[Tuple[Any, ...]], Optional[Any]]:
         """Read rows using keyset pagination with deterministic ordering."""
 
+        # P0.4: Conditionally use NOLOCK based on strict consistency mode
+        table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+
         quoted_columns = ', '.join([f'[{col}]' for col in columns])
         base_query = f"""
         SELECT TOP {limit} {quoted_columns}
-        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        FROM [{schema_name}].[{table_name}]{table_hint}
         """
         order_by = f"ORDER BY [{pk_column}]"
 
@@ -830,6 +858,9 @@ class DataTransfer:
         Returns:
             List of rows
         """
+        # P0.4: Conditionally use NOLOCK based on strict consistency mode
+        table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+
         quoted_columns = ', '.join([f'[{col}]' for col in columns])
         order_by = ', '.join([f'[{col}]' for col in order_by_columns])
 
@@ -837,7 +868,7 @@ class DataTransfer:
         inner_query = f"""
         SELECT {quoted_columns},
                ROW_NUMBER() OVER (ORDER BY {order_by}) as _rn
-        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        FROM [{schema_name}].[{table_name}]{table_hint}
         """
         if where_clause:
             inner_query += f"\nWHERE {where_clause}"
@@ -883,8 +914,10 @@ class DataTransfer:
             return 0
 
         # Use safe identifier quoting for schema, table, and columns
+        # P0.1 FIX: Use \N as NULL marker to distinguish NULL from empty strings
+        # The \N marker is PostgreSQL's default and unlikely to appear in real data
         quoted_columns = sql.SQL(', ').join([sql.Identifier(col) for col in columns])
-        copy_sql = sql.SQL('COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E\'\\t\', QUOTE \'"\', NULL \'\')').format(
+        copy_sql = sql.SQL('COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E\'\\t\', QUOTE \'"\', NULL \'\\N\')').format(
             sql.Identifier(schema_name),
             sql.Identifier(table_name),
             quoted_columns
@@ -897,9 +930,16 @@ class DataTransfer:
         return len(rows)
 
     def _normalize_value(self, value: Any) -> Any:
-        """Normalize Python values for COPY consumption."""
+        """
+        Normalize Python values for COPY consumption.
+
+        P0.1 FIX: NULL values are represented as the literal string '\\N' which
+        PostgreSQL COPY interprets as NULL (via NULL '\\N' option). Empty strings
+        remain as empty strings and are properly distinguished from NULL.
+        """
         if value is None:
-            return ''
+            # Return the NULL marker - COPY will interpret this as NULL
+            return '\\N'
 
         if isinstance(value, datetime):
             return value.isoformat(sep=' ')
@@ -912,12 +952,11 @@ class DataTransfer:
         if isinstance(value, bool):
             return 't' if value else 'f'
         if isinstance(value, (bytes, bytearray, memoryview)):
-            try:
-                return bytes(value).decode('utf-8', 'ignore')
-            except Exception:
-                return ''
+            # P0.2 FIX: Emit bytea in PostgreSQL hex format for correct binary transfer
+            # Previously decoded as UTF-8 with 'ignore' which silently corrupted data
+            return '\\x' + bytes(value).hex()
         if isinstance(value, float) and not math.isfinite(value):
-            return ''
+            return '\\N'  # Return NULL for non-finite floats (NaN, Inf)
 
         return value
 
