@@ -205,6 +205,33 @@ class DataTransfer:
 
         try:
             with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
+                # For partition transfers (not first partition), clean up any existing data
+                # This makes partition retries idempotent - prevents duplicate rows
+                is_partition_transfer = use_row_number and start_row and end_row and not truncate_target
+                if is_partition_transfer and pk_columns:
+                    logger.info(f"Cleaning up existing partition data before transfer (idempotent retry)")
+                    first_pk, last_pk = self._get_partition_pk_bounds(
+                        mssql_conn,
+                        source_schema,
+                        source_table,
+                        pk_columns,
+                        start_row,
+                        end_row,
+                        where_clause
+                    )
+                    if first_pk and last_pk:
+                        deleted = self._delete_partition_data(
+                            target_schema,
+                            target_table,
+                            pk_columns,
+                            first_pk,
+                            last_pk
+                        )
+                        if deleted > 0:
+                            logger.info(f"Deleted {deleted:,} existing rows from partition range")
+                    else:
+                        logger.warning("Could not determine partition PK bounds - skipping cleanup")
+
                 if use_row_number:
                     # ROW_NUMBER mode: process in chunks within the specified row range
                     current_start = start_row if start_row else 1
@@ -395,6 +422,140 @@ class DataTransfer:
             with conn.cursor() as cursor:
                 cursor.execute(query)
             conn.commit()
+        finally:
+            if conn:
+                conn.close()
+
+    def _get_partition_pk_bounds(
+        self,
+        mssql_conn,
+        schema_name: str,
+        table_name: str,
+        pk_columns: List[str],
+        start_row: int,
+        end_row: int,
+        where_clause: Optional[str] = None
+    ) -> Tuple[Optional[Tuple], Optional[Tuple]]:
+        """
+        Get the first and last PK values for a partition's row range.
+
+        This is used to make partition transfers idempotent by identifying
+        which rows to delete before re-inserting.
+
+        Args:
+            mssql_conn: Active MSSQL connection
+            schema_name: Source schema name
+            table_name: Source table name
+            pk_columns: Primary key column names
+            start_row: First row number in partition (1-indexed)
+            end_row: Last row number in partition
+            where_clause: Optional WHERE clause for filtering
+
+        Returns:
+            Tuple of (first_pk_tuple, last_pk_tuple), or (None, None) if no data
+        """
+        pk_cols_quoted = ', '.join([f'[{col}]' for col in pk_columns])
+        order_by = ', '.join([f'[{col}]' for col in pk_columns])
+
+        # Build inner query with optional WHERE clause
+        inner_query = f"""
+        SELECT {pk_cols_quoted},
+               ROW_NUMBER() OVER (ORDER BY {order_by}) as _rn
+        FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
+        """
+        if where_clause:
+            inner_query += f"\nWHERE {where_clause}"
+
+        # Get first PK in partition
+        first_query = f"""
+        SELECT TOP 1 {pk_cols_quoted}
+        FROM ({inner_query}) sub
+        WHERE _rn = ?
+        """
+
+        # Get last PK in partition
+        last_query = f"""
+        SELECT TOP 1 {pk_cols_quoted}
+        FROM ({inner_query}) sub
+        WHERE _rn = ?
+        """
+
+        try:
+            with mssql_conn.cursor() as cursor:
+                cursor.execute(first_query, (start_row,))
+                first_row = cursor.fetchone()
+
+                cursor.execute(last_query, (end_row,))
+                last_row = cursor.fetchone()
+
+                if first_row and last_row:
+                    return tuple(first_row), tuple(last_row)
+                return None, None
+        except Exception as e:
+            logger.warning(f"Could not get partition PK bounds: {e}")
+            return None, None
+
+    def _delete_partition_data(
+        self,
+        schema_name: str,
+        table_name: str,
+        pk_columns: List[str],
+        first_pk: Tuple,
+        last_pk: Tuple
+    ) -> int:
+        """
+        Delete rows from target table within a PK range.
+
+        Uses PostgreSQL tuple comparison for composite PKs:
+        WHERE (col1, col2) >= (val1, val2) AND (col1, col2) <= (val3, val4)
+
+        Args:
+            schema_name: Target schema name
+            table_name: Target table name
+            pk_columns: Primary key column names
+            first_pk: First PK tuple (inclusive)
+            last_pk: Last PK tuple (inclusive)
+
+        Returns:
+            Number of rows deleted
+        """
+        # Build tuple comparison for composite PKs
+        pk_tuple = sql.SQL('({})').format(
+            sql.SQL(', ').join([sql.Identifier(col) for col in pk_columns])
+        )
+
+        # Build placeholders for values
+        placeholders = sql.SQL('({})').format(
+            sql.SQL(', ').join([sql.Placeholder() for _ in pk_columns])
+        )
+
+        query = sql.SQL('DELETE FROM {}.{} WHERE {} >= {} AND {} <= {}').format(
+            sql.Identifier(schema_name),
+            sql.Identifier(table_name),
+            pk_tuple,
+            placeholders,
+            pk_tuple,
+            placeholders
+        )
+
+        # Combine first and last PK values for the query
+        params = list(first_pk) + list(last_pk)
+
+        conn = None
+        try:
+            conn = self.postgres_hook.get_conn()
+            with conn.cursor() as cursor:
+                # Disable statement timeout for large deletes
+                cursor.execute("SET statement_timeout = 0")
+                cursor.execute(query, params)
+                deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+        except Exception as e:
+            logger.error(f"Error deleting partition data: {e}")
+            if conn:
+                conn.rollback()
+            raise
         finally:
             if conn:
                 conn.close()
