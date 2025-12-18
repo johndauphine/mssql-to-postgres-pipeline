@@ -367,6 +367,8 @@ class DataTransfer:
         try:
             conn = self.postgres_hook.get_conn()
             with conn.cursor() as cursor:
+                # Disable statement timeout for COUNT on large tables
+                cursor.execute("SET statement_timeout = 0")
                 cursor.execute(query)
                 count = cursor.fetchone()[0] or 0
         finally:
