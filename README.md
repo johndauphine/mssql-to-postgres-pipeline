@@ -56,7 +56,7 @@ Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parall
 1. **Schema Extraction**: Queries SQL Server system catalogs to discover all tables, columns, data types, indexes, and constraints
 2. **DDL Generation**: Converts SQL Server schemas to PostgreSQL-compatible DDL with proper type mappings
 3. **Table Creation**: Creates target tables in PostgreSQL (drops existing tables first)
-4. **Data Transfer**: Streams data using keyset pagination with direct pymssql connections and PostgreSQL COPY protocol
+4. **Data Transfer**: Streams data using keyset pagination with pyodbc connections and PostgreSQL COPY protocol
 5. **Foreign Key Creation**: Adds foreign key constraints after all data is loaded
 6. **Validation**: Triggers standalone validation DAG that compares source and target row counts
 
@@ -74,7 +74,7 @@ The pipeline uses a streaming architecture optimized for large datasets:
 ### Validation DAG
 
 A standalone `validate_migration_env` DAG handles validation separately to avoid XCom serialization issues with large result sets. This DAG:
-- Uses direct database connections (psycopg2, pymssql)
+- Uses direct database connections (psycopg2, pyodbc)
 - Compares row counts between source and target for all tables
 - Can be triggered independently for ad-hoc validation
 
@@ -97,7 +97,7 @@ Migrate any SQL Server database to PostgreSQL in 3 steps:
 ```bash
 # 1. Configure your databases
 cp .env.example .env
-# Edit .env to set connection strings (AIRFLOW_CONN_MSSQL_SOURCE, AIRFLOW_CONN_POSTGRES_TARGET)
+# Edit .env to set connection strings
 
 # 2. Start the stack
 docker-compose up -d
@@ -127,9 +127,8 @@ See [Configuration](#configuration) for details on connecting to remote database
 2. Configure your environment:
    ```bash
    cp .env.example .env
-   # Edit .env with:
-   #   - Resource settings for your machine (RAM presets: 16GB/32GB/64GB)
-   #   - Database connection strings (AIRFLOW_CONN_MSSQL_SOURCE, AIRFLOW_CONN_POSTGRES_TARGET)
+   # Edit .env with your database connection strings
+   # See Configuration section for connection string formats
    ```
 
 3. Start the full stack (Airflow + databases):
@@ -161,11 +160,11 @@ Configuration is managed through the `.env` file which contains:
 Edit `.env` to configure your source and target databases using Airflow connection URIs:
 
 ```bash
-# SOURCE: SQL Server
-AIRFLOW_CONN_MSSQL_SOURCE='mssql://sa:YourStrong@Passw0rd@mssql-server:1433/StackOverflow2010'
-# Examples for remote databases:
-# AIRFLOW_CONN_MSSQL_SOURCE='mssql://user:pass@192.168.1.100:1433/MyDatabase'
-# AIRFLOW_CONN_MSSQL_SOURCE='mssql://user:pass@myserver.database.windows.net:1433/MyDatabase'
+# SOURCE: SQL Server (uses generic:// type for pyodbc)
+# With SQL Server authentication:
+AIRFLOW_CONN_MSSQL_SOURCE='generic://sa:YourStrong%40Passw0rd@mssql-server:1433/StackOverflow2010'
+# With Windows/Kerberos authentication (no credentials):
+# AIRFLOW_CONN_MSSQL_SOURCE='generic://myserver.company.com:1433/MyDatabase'
 
 # TARGET: PostgreSQL
 AIRFLOW_CONN_POSTGRES_TARGET='postgresql://postgres:PostgresPassword123@postgres-target:5432/stackoverflow'
@@ -173,7 +172,9 @@ AIRFLOW_CONN_POSTGRES_TARGET='postgresql://postgres:PostgresPassword123@postgres
 # AIRFLOW_CONN_POSTGRES_TARGET='postgresql://user:pass@mydb.abc123.rds.amazonaws.com:5432/mydb'
 ```
 
-Connection string format: `<type>://<user>:<password>@<host>:<port>/<database>`
+Connection string formats:
+- SQL Server: `generic://<user>:<password>@<host>:<port>/<database>` (URL-encode special chars like @ → %40)
+- PostgreSQL: `postgresql://<user>:<password>@<host>:<port>/<database>`
 
 Connections are automatically loaded from environment variables when Airflow starts.
 
@@ -213,7 +214,7 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
            MOVE 'YourDatabase_log' TO '/var/opt/mssql/data/YourDatabase_log.ldf'"
 
 # 3. Update .env with the database name in connection string
-# AIRFLOW_CONN_MSSQL_SOURCE='mssql://sa:YourStrong@Passw0rd@mssql-server:1433/YourDatabase'
+# AIRFLOW_CONN_MSSQL_SOURCE='generic://sa:YourStrong%40Passw0rd@mssql-server:1433/YourDatabase'
 ```
 
 > **Note**: Logical file names in the MOVE clause vary by backup. Use `RESTORE FILELISTONLY` to discover them.
@@ -271,19 +272,20 @@ mssql-to-postgres-pipeline/
 ├── dags/
 │   ├── mssql_to_postgres_migration.py   # Main migration DAG
 │   └── validate_migration_env.py        # Standalone validation DAG
-├── include/
-│   └── mssql_pg_migration/
+├── plugins/
+│   └── mssql_pg_migration/              # Shared migration modules (auto-loaded by Airflow)
 │       ├── schema_extractor.py          # SQL Server schema discovery
 │       ├── type_mapping.py              # Data type conversion logic
 │       ├── ddl_generator.py             # PostgreSQL DDL generation
 │       ├── data_transfer.py             # Streaming data transfer with keyset pagination
-│       └── validation.py                # Migration validation
+│       ├── validation.py                # Migration validation
+│       ├── odbc_helper.py               # SQL Server ODBC connection helper
+│       └── notifications.py             # Slack/email notifications
 ├── tests/
 │   └── dags/
-│       └── test_dag_example.py          # DAG validation tests
-├── docs/
-│   ├── HANDOFF_NOTES.md                 # Session handoff documentation
-│   └── *.md                             # Additional technical documentation
+│       ├── test_dag_example.py          # DAG validation tests
+│       └── test_mssql_pg_migration.py   # Migration-specific tests
+├── docs/                                # Technical documentation
 ├── docker-compose.yml                   # Full stack (Airflow + databases)
 ├── Dockerfile                           # Apache Airflow 3.0 image
 ├── requirements.txt                     # Python dependencies
@@ -348,11 +350,10 @@ Large validation results can cause XCom serialization issues. The pipeline uses 
 ## Dependencies
 
 - Apache Airflow 3.0.0 (vanilla)
-- apache-airflow-providers-microsoft-mssql >= 3.8.0
 - apache-airflow-providers-postgres >= 5.12.0
-- pymssql >= 2.2.0
+- pyodbc >= 5.0.0
 - psycopg2-binary >= 2.9.9
-- FreeTDS development libraries (for SQL Server connectivity)
+- Microsoft ODBC Driver 18 for SQL Server (installed in Docker image)
 
 ## License
 
