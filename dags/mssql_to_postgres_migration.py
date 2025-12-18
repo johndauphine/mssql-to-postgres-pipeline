@@ -742,7 +742,7 @@ def mssql_to_postgres_migration():
         **context
     ) -> str:
         """
-        Convert UNLOGGED tables to LOGGED after data transfer.
+        Convert UNLOGGED tables to LOGGED after data transfer (parallelized).
 
         This ensures data durability after bulk loading is complete.
 
@@ -752,6 +752,8 @@ def mssql_to_postgres_migration():
         Returns:
             Status message
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         params = context["params"]
 
         if not params.get("use_unlogged_tables", True):
@@ -759,20 +761,31 @@ def mssql_to_postgres_migration():
             return "Tables already logged"
 
         target_schema = params["target_schema"]
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+        target_conn_id = params["target_conn_id"]
 
         # Convert successfully transferred tables to LOGGED
         successful_tables = [r["table_name"] for r in transfer_results if r.get("success", False)]
-        converted_count = 0
 
-        for table_name in successful_tables:
+        def convert_table(table_name: str) -> bool:
+            """Convert a single table to LOGGED."""
             try:
-                set_logged_ddl = generator.generate_set_logged(table_name, target_schema)
-                generator.execute_ddl([set_logged_ddl], transaction=False)
-                converted_count += 1
+                # Each thread needs its own generator/connection
+                gen = ddl_generator.DDLGenerator(target_conn_id)
+                set_logged_ddl = gen.generate_set_logged(table_name, target_schema)
+                gen.execute_ddl([set_logged_ddl], transaction=False)
                 logger.info(f"✓ Converted {table_name} to LOGGED")
+                return True
             except Exception as e:
                 logger.warning(f"Could not convert {table_name} to LOGGED: {str(e)}")
+                return False
+
+        # Parallelize SET LOGGED operations (4 workers to avoid overloading PostgreSQL)
+        converted_count = 0
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(convert_table, t): t for t in successful_tables}
+            for future in as_completed(futures):
+                if future.result():
+                    converted_count += 1
 
         logger.info(f"Converted {converted_count} tables to LOGGED for durability")
         return f"Converted {converted_count} tables to LOGGED"
@@ -1164,7 +1177,7 @@ def mssql_to_postgres_migration():
         **context
     ) -> str:
         """
-        P2.2: Reset sequences for SERIAL/BIGSERIAL columns to MAX(column) value.
+        P2.2: Reset sequences for SERIAL/BIGSERIAL columns to MAX(column) value (parallelized).
 
         After COPY loading explicit values into SERIAL columns, the sequences need
         to be advanced to prevent duplicate key errors on future inserts.
@@ -1176,25 +1189,38 @@ def mssql_to_postgres_migration():
         Returns:
             Status message
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         params = context["params"]
         target_schema = params["target_schema"]
-
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+        target_conn_id = params["target_conn_id"]
 
         # Only reset sequences for successfully transferred tables
         successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
-        sequences_reset = 0
 
-        for table_schema in tables_schema:
+        # Filter tables that need sequence reset
+        tables_to_process = [
+            ts for ts in tables_schema
+            if ts["table_name"] in successful_tables
+        ]
+
+        def reset_table_sequences(table_schema: Dict[str, Any]) -> int:
+            """Reset sequences for a single table."""
             table_name = table_schema["table_name"]
-            if table_name not in successful_tables:
-                continue
-
             try:
-                reset_count = generator.reset_sequences(table_schema, target_schema)
-                sequences_reset += reset_count
+                # Each thread needs its own generator/connection
+                gen = ddl_generator.DDLGenerator(target_conn_id)
+                return gen.reset_sequences(table_schema, target_schema)
             except Exception as e:
                 logger.warning(f"Could not reset sequences for {table_name}: {str(e)}")
+                return 0
+
+        # Parallelize sequence reset operations (4 workers)
+        sequences_reset = 0
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(reset_table_sequences, ts) for ts in tables_to_process]
+            for future in as_completed(futures):
+                sequences_reset += future.result()
 
         logger.info(f"P2.2: Reset {sequences_reset} sequences for SERIAL/BIGSERIAL columns")
         return f"Reset {sequences_reset} sequences"
@@ -1210,8 +1236,9 @@ def mssql_to_postgres_migration():
     # Create foreign keys after indexes are created
     fk_status = create_foreign_keys(schema_data, transfer_results)
 
-    # Task order: convert_to_logged -> reset_sequences -> create_primary_keys -> create_indexes -> create_foreign_keys
-    logged_status >> seq_status >> pk_status >> index_status >> fk_status
+    # Task order: convert_to_logged and reset_sequences run in parallel,
+    # then create_primary_keys -> create_indexes -> create_foreign_keys
+    [logged_status, seq_status] >> pk_status >> index_status >> fk_status
 
     # Trigger validation DAG instead of internal validation (avoids XCom bug)
     trigger_validation = TriggerDagRunOperator(
