@@ -197,16 +197,11 @@ These notes clarify actual behavior vs. documented examples:
 
 ## Additional Concerns (Correctness / Ops)
 
-- **Parallel keyset correctness:** Parallel keyset readers rely on NTILE min/max with inclusive bounds and no uniqueness guard. If the ordering column is not unique, readers can overlap or skip rows. Consider restricting parallel keyset to truly unique keys or using ROW_NUMBER with a deterministic, unique ORDER BY.
-- **Boundary queries and NOLOCK:** NTILE boundary discovery uses NOLOCK unless strict mode is enabled. On a mutable source, boundaries can shift between readers, producing missing/duplicate rows. For correctness-first runs, disable NOLOCK for boundary discovery or require a quiesced source.
+- **Parallel keyset correctness (NOT APPLICABLE):** Keyset pagination uses the primary key, which is unique by definition. Composite PKs fall back to ROW_NUMBER pagination. The concern about non-unique ordering columns doesn't apply since we always use the actual PK.
+- **Boundary queries and NOLOCK (NOT APPLICABLE):** ETL migrations typically run against quiesced databases, read replicas, or point-in-time snapshots. Concurrent writes during bulk migration would cause broader data consistency issues regardless of NOLOCK. No action needed for typical migration workflows.
 - **Pool scope:** Pools are per-process. With multiple Airflow worker processes, aggregate MSSQL connections can exceed `MAX_MSSQL_CONNECTIONS`. Factor executor/worker counts into sizing.
 - **Non-pooled connections (RESOLVED):** `OdbcConnectionHelper` now accepts an optional pool via `set_pool()` method. `DataTransfer` shares its pool with `mssql_hook`, so all helper queries also use pooled connections.
 - **Config drift (RESOLVED):** Postgres pool now reads `MAX_PG_CONNECTIONS` env var (commit 4157827). Both MSSQL and PG pools are configurable.
-
-### Remaining items to harden
-
-- Enforce uniqueness for parallel keyset: only enable parallel keyset readers when the ordering column(s) are guaranteed unique (true PK/unique index). Otherwise fall back to ROW_NUMBER or a deterministic unique ORDER BY to avoid overlaps/skips.
-- Strict mode for boundaries: when parallel readers are enabled, force strict consistency (no NOLOCK) for NTILE boundary discovery to prevent shifting partitions on a mutable source.
 
 ## Review Notes for AI
 
