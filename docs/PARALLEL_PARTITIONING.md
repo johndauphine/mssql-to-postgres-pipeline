@@ -161,6 +161,23 @@ Parallel readers are active when:
 
 For small tables, sequential mode is always used.
 
+### Parallel Readers Benchmark
+
+Tested on StackOverflow 2010 dataset (19.3M rows, 10 tables):
+
+| PARALLEL_READERS | Migration Time | vs Baseline |
+|-----------------|----------------|-------------|
+| 1 (sequential) | 3 min 57 sec | baseline |
+| **2 (recommended)** | **3 min 11 sec** | **20% faster** |
+| 3 | 3 min 31 sec | 11% faster |
+
+**Key findings:**
+- 2 parallel readers provides optimal throughput improvement
+- 3+ readers shows diminishing returns due to:
+  - SQL Server connection overhead
+  - Increased resource contention
+  - PostgreSQL writer becomes the bottleneck
+
 ## Configuration
 
 ### Environment Variables
