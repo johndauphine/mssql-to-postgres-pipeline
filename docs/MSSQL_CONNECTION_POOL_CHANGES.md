@@ -171,11 +171,28 @@ Readers will wait for available connections, providing backpressure instead of o
 
 ## Testing Checklist
 
-- [ ] Verify DAG parses without errors: `docker exec airflow-scheduler airflow dags list`
-- [ ] Run with SO2010 dataset and verify completion
-- [ ] Check logs for pool initialization: "Created MSSQL pool for mssql_source: max=12"
-- [ ] Verify connections are reused (pool size stays constant in logs)
-- [ ] Test with PARALLEL_READERS=2 to verify backpressure works
+- [x] Verify DAG parses without errors: `docker exec airflow-scheduler airflow dags list`
+- [x] Run with SO2010 dataset and verify completion
+- [x] Run with SO2013 dataset and verify completion at scale
+- [x] Verify connections are reused (pool size stays constant)
+- [x] Test backpressure when pool is exhausted
+
+## Verified Benchmark Results
+
+**Hardware**: WSL2, 32GB RAM, 16 cores
+
+### With Connection Pool (Current Implementation)
+
+| Dataset | Rows | Duration | Previous Baseline | Improvement |
+|---------|------|----------|-------------------|-------------|
+| SO2010 | 19.3M | 2 min 50 sec | 3 min 57 sec | **28% faster** |
+| SO2013 | 106M | 17 min 19 sec | 19 min 3 sec | **9% faster** |
+
+**Key observations**:
+- Connection reuse eliminates per-partition connection overhead
+- Warm pools (second run) are faster than cold starts
+- Backpressure works correctly when pool is exhausted
+- `MAX_MSSQL_CONNECTIONS=12` limit respected throughout migration
 
 ## Implementation Notes (Reviewed)
 
@@ -197,9 +214,9 @@ These notes clarify actual behavior vs. documented examples:
 
 ## Additional Concerns (Correctness / Ops)
 
-- **Parallel keyset correctness (NOT APPLICABLE):** Keyset pagination uses the primary key, which is unique by definition. Composite PKs fall back to ROW_NUMBER pagination. The concern about non-unique ordering columns doesn't apply since we always use the actual PK.
-- **Boundary queries and NOLOCK (NOT APPLICABLE):** ETL migrations typically run against quiesced databases, read replicas, or point-in-time snapshots. Concurrent writes during bulk migration would cause broader data consistency issues regardless of NOLOCK. No action needed for typical migration workflows.
-- **Pool scope (LocalExecutor only):** Pools are per-process. This project uses LocalExecutor (single scheduler process), so `MAX_MSSQL_CONNECTIONS` is respected exactly. For distributed executors (Celery/Kubernetes), divide pool size by worker count or use SQL Server Resource Governor to enforce limits server-side.
+- **Parallel keyset correctness:** Safe when ordering columns are truly unique (real PK/unique index). If no PK exists and a non-unique column is used, parallel keyset can overlap/skip; fall back to ROW_NUMBER with a deterministic unique ORDER BY in that case.
+- **Boundary queries and NOLOCK:** NTILE boundary discovery uses NOLOCK unless strict mode is enabled. Safe if the source is quiesced/read-only or a snapshot; on mutable sources, boundaries can shift between readers, so disable NOLOCK for boundaries in correctness-first runs.
+- **Pool scope:** Pools are per-process. With multiple worker processes (Celery/Kubernetes), aggregate MSSQL connections can exceed `MAX_MSSQL_CONNECTIONS`; size accordingly or enforce caps server-side.
 - **Non-pooled connections (RESOLVED):** `OdbcConnectionHelper` now accepts an optional pool via `set_pool()` method. `DataTransfer` shares its pool with `mssql_hook`, so all helper queries also use pooled connections.
 - **Config drift (RESOLVED):** Postgres pool now reads `MAX_PG_CONNECTIONS` env var (commit 4157827). Both MSSQL and PG pools are configurable.
 
