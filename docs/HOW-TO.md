@@ -47,7 +47,6 @@ docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration \
 | `chunk_size` | `200000` | Rows per batch (tune for memory) |
 | `exclude_tables` | `[]` | Tables to skip (supports wildcards) |
 | `validate_samples` | `false` | Compare sample data, not just counts |
-| `create_foreign_keys` | `true` | Create FKs after data load |
 
 ## Monitor Progress
 

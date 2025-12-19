@@ -144,11 +144,6 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             type="boolean",
             description="Whether to validate sample data (slower)"
         ),
-        "create_foreign_keys": Param(
-            default=True,
-            type="boolean",
-            description="Whether to create foreign key constraints"
-        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
@@ -678,56 +673,6 @@ def mssql_to_postgres_migration():
 
         return result
 
-
-    @task(trigger_rule="all_done")
-    def create_foreign_keys(
-        tables_schema: List[Dict[str, Any]],
-        transfer_results: List[Dict[str, Any]],
-        **context
-    ) -> str:
-        """
-        Create foreign key constraints after all data is transferred.
-
-        Args:
-            tables_schema: Original table schemas with foreign key definitions
-            transfer_results: Results from data transfers
-
-        Returns:
-            Status message
-        """
-        params = context["params"]
-
-        if not params["create_foreign_keys"]:
-            logger.info("Skipping foreign key creation (disabled by parameter)")
-            return "Foreign keys skipped"
-
-        # Only create foreign keys for successfully transferred tables
-        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
-
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
-        fk_count = 0
-
-        for table_schema in tables_schema:
-            if table_schema["table_name"] not in successful_tables:
-                continue
-
-            if table_schema.get("foreign_keys"):
-                fk_statements = generator.generate_foreign_keys(
-                    table_schema,
-                    params["target_schema"]
-                )
-
-                for fk_ddl in fk_statements:
-                    try:
-                        generator.execute_ddl([fk_ddl], transaction=False)
-                        fk_count += 1
-                        logger.info(f"✓ Created foreign key for {table_schema['table_name']}")
-                    except Exception as e:
-                        logger.warning(f"Could not create foreign key: {str(e)}")
-
-        logger.info(f"Created {fk_count} foreign key constraints")
-        return f"Created {fk_count} foreign keys"
-
     @task(trigger_rule="all_done")
     def create_indexes(
         tables_schema: List[Dict[str, Any]],
@@ -1168,11 +1113,8 @@ def mssql_to_postgres_migration():
     # Create secondary indexes after PKs
     index_status = create_indexes(schema_data, transfer_results)
 
-    # Create foreign keys after indexes are created
-    fk_status = create_foreign_keys(schema_data, transfer_results)
-
-    # Task order: reset_sequences -> create_primary_keys -> create_indexes -> create_foreign_keys
-    seq_status >> pk_status >> index_status >> fk_status
+    # Task order: reset_sequences -> create_primary_keys -> create_indexes
+    seq_status >> pk_status >> index_status
 
     # Trigger validation DAG instead of internal validation (avoids XCom bug)
     trigger_validation = TriggerDagRunOperator(
@@ -1187,8 +1129,8 @@ def mssql_to_postgres_migration():
         },
     )
 
-    # Set task dependencies: trigger validation after foreign keys are created
-    fk_status >> trigger_validation
+    # Set task dependencies: trigger validation after indexes are created
+    index_status >> trigger_validation
 
     # Generate final report (simplified version without validation results)
     @task(trigger_rule="all_done")

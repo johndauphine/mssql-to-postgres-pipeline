@@ -50,15 +50,14 @@ See [docs/PARALLEL_PARTITIONING.md](docs/PARALLEL_PARTITIONING.md) for details o
 The pipeline executes as a single Airflow DAG with the following stages:
 
 ```
-Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parallel) -> Create Foreign Keys -> Validate -> Report
+Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parallel) -> Validate -> Report
 ```
 
 1. **Schema Extraction**: Queries SQL Server system catalogs to discover all tables, columns, data types, indexes, and constraints
 2. **DDL Generation**: Converts SQL Server schemas to PostgreSQL-compatible DDL with proper type mappings
 3. **Table Creation**: Creates target tables in PostgreSQL (drops existing tables first)
 4. **Data Transfer**: Streams data using keyset pagination with pyodbc connections and PostgreSQL COPY protocol
-5. **Foreign Key Creation**: Adds foreign key constraints after all data is loaded
-6. **Validation**: Triggers standalone validation DAG that compares source and target row counts
+5. **Validation**: Triggers standalone validation DAG that compares source and target row counts
 
 ## Architecture
 
@@ -238,7 +237,6 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
 | `chunk_size` | `200000` | Rows per batch during transfer (100-500,000) |
 | `exclude_tables` | `[]` | Table patterns to skip (supports wildcards) |
 | `validate_samples` | `false` | Enable sample data validation (slower) |
-| `create_foreign_keys` | `true` | Create foreign key constraints after transfer |
 
 ### Example: Trigger via CLI
 

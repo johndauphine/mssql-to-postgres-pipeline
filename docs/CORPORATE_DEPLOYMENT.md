@@ -148,7 +148,6 @@ The migration DAG accepts these parameters (via UI or `--conf`):
 | `target_schema` | `public` | Target schema in PostgreSQL |
 | `chunk_size` | `100000` | Rows per batch (100-500,000) |
 | `exclude_tables` | `[]` | Table patterns to skip (supports wildcards) |
-| `create_foreign_keys` | `true` | Create foreign key constraints after transfer |
 
 ### Environment Variables
 

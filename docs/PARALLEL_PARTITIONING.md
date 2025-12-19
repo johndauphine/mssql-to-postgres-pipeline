@@ -185,9 +185,6 @@ transfer_table_data[...]       ├──► get_remaining_partitions
                      create_indexes
                                │
                                ▼
-                     create_foreign_keys
-                               │
-                               ▼
                      trigger_validation_dag
 ```
 
