@@ -37,6 +37,11 @@ x-airflow-common:
     MAX_ACTIVE_TASKS: ${MAX_ACTIVE_TASKS:-16}
     PG_POOL_MINCONN: ${PG_POOL_MINCONN:-1}
     PG_POOL_MAXCONN: ${PG_POOL_MAXCONN:-8}
+    DEFAULT_CHUNK_SIZE: ${DEFAULT_CHUNK_SIZE:-200000}
+    PARALLEL_READERS: ${PARALLEL_READERS:-1}
+    READER_QUEUE_SIZE: ${READER_QUEUE_SIZE:-5}
+    # For validation DAG (must match database in AIRFLOW_CONN_MSSQL_SOURCE)
+    MSSQL_DATABASE: ${MSSQL_DATABASE:-StackOverflow2010}
     # For testing: set to comma-separated table names to simulate failures
     SIMULATE_FAILURE_TABLES: ${SIMULATE_FAILURE_TABLES:-}
 

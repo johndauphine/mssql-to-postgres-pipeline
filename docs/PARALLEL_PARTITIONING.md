@@ -163,9 +163,9 @@ For small tables, sequential mode is always used.
 
 ### Parallel Readers Benchmark
 
-Tested on StackOverflow 2010 dataset (19.3M rows, 10 tables):
-
 **Hardware:** Windows/WSL2, 32GB RAM, 16 cores
+
+#### Small Dataset: StackOverflow 2010 (19.3M rows, 10 tables)
 
 | PARALLEL_READERS | Migration Time | vs Baseline |
 |-----------------|----------------|-------------|
@@ -173,12 +173,22 @@ Tested on StackOverflow 2010 dataset (19.3M rows, 10 tables):
 | **2 (recommended)** | **3 min 11 sec** | **20% faster** |
 | 3 | 3 min 31 sec | 11% faster |
 
+#### Large Dataset: StackOverflow 2013 (106M rows, 9 tables)
+
+| PARALLEL_READERS | Migration Time | vs Baseline | SQL Connections |
+|-----------------|----------------|-------------|-----------------|
+| **1 (optimal)** | **19 min 3 sec** | **baseline** | 12 |
+| 2 | 22 min 49 sec | 20% slower | 24 |
+| 3 | 26 min 44 sec | 40% slower | 36 |
+
 **Key findings:**
-- 2 parallel readers provides optimal throughput improvement
-- 3+ readers shows diminishing returns due to:
-  - SQL Server connection overhead
-  - Increased resource contention
-  - PostgreSQL writer becomes the bottleneck
+- For **small datasets (<50M rows)**: 2 parallel readers provides ~20% improvement
+- For **large datasets (>50M rows)**: Sequential reads (PARALLEL_READERS=1) is optimal
+- The difference is due to:
+  - More concurrent partitions at larger scale (12 vs 4-8)
+  - Total SQL connections = PARALLEL_READERS × concurrent_partitions
+  - Connection overhead and contention dominate at higher connection counts
+  - Future enhancement: Global connection pool to limit total connections
 
 ## Configuration
 
