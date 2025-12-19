@@ -165,6 +165,8 @@ For small tables, sequential mode is always used.
 
 Tested on StackOverflow 2010 dataset (19.3M rows, 10 tables):
 
+**Hardware:** Windows/WSL2, 32GB RAM, 16 cores
+
 | PARALLEL_READERS | Migration Time | vs Baseline |
 |-----------------|----------------|-------------|
 | 1 (sequential) | 3 min 57 sec | baseline |
