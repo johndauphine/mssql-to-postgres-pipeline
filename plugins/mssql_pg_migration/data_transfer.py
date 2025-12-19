@@ -185,6 +185,123 @@ class ParallelReader:
                     pass
             self._reader_done()
 
+    def _keyset_reader_thread(
+        self,
+        reader_id: int,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        pk_column: str,
+        pk_index: int,
+        min_pk: Any,
+        max_pk: Any,
+        chunk_size: int,
+        base_where_clause: Optional[str],
+        read_func,
+    ) -> None:
+        """
+        Keyset reader thread - reads assigned PK range using keyset pagination.
+
+        Args:
+            reader_id: Reader identifier for logging
+            schema_name: Source schema
+            table_name: Source table
+            columns: Columns to select
+            pk_column: Primary key column name
+            pk_index: Index of PK column in columns list
+            min_pk: Minimum PK value for this reader (inclusive)
+            max_pk: Maximum PK value for this reader (inclusive)
+            chunk_size: Rows per chunk
+            base_where_clause: Optional base filter
+            read_func: Function to read a keyset chunk
+        """
+        conn = None
+        chunks_read = 0
+        total_rows = 0
+        try:
+            conn = self._create_mssql_connection()
+            last_key_value = None
+            is_first_chunk = True
+
+            while not self.cancel_event.is_set():
+                # Build WHERE clause for this reader's PK range
+                range_conditions = []
+                if base_where_clause:
+                    range_conditions.append(f"({base_where_clause})")
+
+                # For first chunk, start from min_pk
+                # For subsequent chunks, use keyset pagination (pk > last_key)
+                if is_first_chunk:
+                    range_conditions.append(f"[{pk_column}] >= ?")
+                    start_param = min_pk
+                    is_first_chunk = False
+                else:
+                    range_conditions.append(f"[{pk_column}] > ?")
+                    start_param = last_key_value
+
+                # Always limit to max_pk
+                range_conditions.append(f"[{pk_column}] <= ?")
+
+                where_clause = " AND ".join(range_conditions)
+
+                # Read chunk using keyset pagination
+                rows, new_last_key = read_func(
+                    conn,
+                    schema_name,
+                    table_name,
+                    columns,
+                    pk_column,
+                    start_param,
+                    chunk_size,
+                    pk_index,
+                    where_clause,
+                    max_pk,
+                )
+
+                if not rows:
+                    break
+
+                if self.cancel_event.is_set():
+                    break
+
+                chunks_read += 1
+                total_rows += len(rows)
+                last_key_value = new_last_key
+
+                # Put chunk in queue (blocks if full - backpressure)
+                try:
+                    self.chunk_queue.put(
+                        (reader_id, chunks_read, total_rows, rows),
+                        timeout=30.0
+                    )
+                except queue.Full:
+                    if self.cancel_event.is_set():
+                        break
+                    self.chunk_queue.put(
+                        (reader_id, chunks_read, total_rows, rows),
+                        timeout=60.0
+                    )
+
+                # Stop if we've reached the end of our range
+                if new_last_key is None or new_last_key >= max_pk:
+                    break
+
+            logger.debug(
+                f"Keyset reader {reader_id} finished "
+                f"(pk {min_pk}-{max_pk}, {total_rows:,} rows in {chunks_read} chunks)"
+            )
+
+        except Exception as e:
+            logger.error(f"Keyset reader {reader_id} error: {e}")
+            self._set_error(e)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._reader_done()
+
     def start_readers(
         self,
         schema_name: str,
@@ -243,6 +360,59 @@ class ParallelReader:
                 r_end,
                 chunk_size,
                 where_clause,
+                read_func,
+            )
+            self.futures.append(future)
+
+    def start_keyset_readers(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        pk_column: str,
+        pk_index: int,
+        pk_boundaries: List[Tuple[Any, Any]],
+        chunk_size: int,
+        base_where_clause: Optional[str],
+        read_func,
+    ) -> None:
+        """
+        Launch keyset reader threads with pre-computed PK boundaries.
+
+        Each reader handles a specific PK range using keyset pagination.
+
+        Args:
+            schema_name: Source schema
+            table_name: Source table
+            columns: Columns to select
+            pk_column: Primary key column name
+            pk_index: Index of PK column in columns list
+            pk_boundaries: List of (min_pk, max_pk) tuples for each reader
+            chunk_size: Rows per chunk
+            base_where_clause: Optional base filter
+            read_func: Function to read a keyset chunk
+        """
+        self.executor = ThreadPoolExecutor(max_workers=self.num_readers)
+        self.futures = []
+
+        for i, (min_pk, max_pk) in enumerate(pk_boundaries):
+            logger.info(
+                f"Starting keyset reader {i+1}/{len(pk_boundaries)} "
+                f"for pk range {min_pk}-{max_pk}"
+            )
+
+            future = self.executor.submit(
+                self._keyset_reader_thread,
+                i + 1,
+                schema_name,
+                table_name,
+                columns,
+                pk_column,
+                pk_index,
+                min_pk,
+                max_pk,
+                chunk_size,
+                base_where_clause,
                 read_func,
             )
             self.futures.append(future)
@@ -647,47 +817,129 @@ class DataTransfer:
 
                             postgres_conn.commit()
                 else:
-                    # Keyset mode: original implementation
-                    last_key_value = None
-                    while rows_transferred < source_row_count:
-                        chunk_start_time = time.time()
+                    # Keyset mode: check if parallel readers are enabled
+                    num_readers, queue_size = _get_parallel_reader_config()
 
-                        rows, last_key_value = self._read_chunk_keyset(
+                    if num_readers > 1 and source_row_count >= chunk_size * 2:
+                        # Use parallel keyset readers
+                        logger.info(
+                            f"Using {num_readers} parallel keyset readers "
+                            f"(queue_size={queue_size}) for {source_row_count:,} rows"
+                        )
+
+                        # Get balanced PK boundaries using NTILE
+                        pk_boundaries = self._get_pk_ntile_boundaries(
                             mssql_conn,
                             source_schema,
                             source_table,
-                            columns,
                             pk_column,
-                            last_key_value,
-                            chunk_size,
-                            pk_index,
+                            num_readers,
                             where_clause,
                         )
 
-                        if not rows:
-                            break
+                        if pk_boundaries and len(pk_boundaries) > 1:
+                            parallel_reader = ParallelReader(
+                                mssql_config=self._mssql_config,
+                                num_readers=len(pk_boundaries),
+                                queue_size=queue_size,
+                            )
 
-                        rows_written = self._write_chunk(
-                            rows,
-                            target_schema,
-                            target_table,
-                            columns,
-                            postgres_conn
-                        )
+                            try:
+                                parallel_reader.start_keyset_readers(
+                                    schema_name=source_schema,
+                                    table_name=source_table,
+                                    columns=columns,
+                                    pk_column=pk_column,
+                                    pk_index=pk_index,
+                                    pk_boundaries=pk_boundaries,
+                                    chunk_size=chunk_size,
+                                    base_where_clause=where_clause,
+                                    read_func=self._read_chunk_keyset_bounded,
+                                )
 
-                        rows_transferred += rows_written
-                        chunks_processed += 1
+                                # Writer consumes chunks from queue
+                                for reader_id, chunk_num, reader_total, rows in parallel_reader.get_chunks():
+                                    chunk_start_time = time.time()
 
-                        chunk_time = time.time() - chunk_start_time
-                        rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+                                    rows_written = self._write_chunk(
+                                        rows,
+                                        target_schema,
+                                        target_table,
+                                        columns,
+                                        postgres_conn
+                                    )
 
-                        logger.info(
-                            f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
-                            f"({rows_transferred:,}/{source_row_count:,} total) "
-                            f"at {rows_per_second:,.0f} rows/sec"
-                        )
+                                    rows_transferred += rows_written
+                                    chunks_processed += 1
 
-                        postgres_conn.commit()
+                                    chunk_time = time.time() - chunk_start_time
+                                    rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+
+                                    logger.info(
+                                        f"Chunk {chunks_processed} (reader {reader_id}): "
+                                        f"Transferred {rows_written:,} rows "
+                                        f"({rows_transferred:,}/{source_row_count:,} total) "
+                                        f"at {rows_per_second:,.0f} rows/sec"
+                                    )
+
+                                    postgres_conn.commit()
+                            finally:
+                                parallel_reader.shutdown()
+                        else:
+                            # Fall back to sequential if NTILE failed
+                            logger.warning(
+                                "Could not compute NTILE boundaries, falling back to sequential"
+                            )
+                            num_readers = 1  # Force sequential mode below
+
+                    if num_readers == 1 or source_row_count < chunk_size * 2:
+                        # Sequential keyset mode
+                        if num_readers > 1:
+                            logger.info(
+                                f"Row count {source_row_count:,} too small for parallel readers, "
+                                f"using sequential keyset mode"
+                            )
+
+                        last_key_value = None
+                        while rows_transferred < source_row_count:
+                            chunk_start_time = time.time()
+
+                            rows, last_key_value = self._read_chunk_keyset(
+                                mssql_conn,
+                                source_schema,
+                                source_table,
+                                columns,
+                                pk_column,
+                                last_key_value,
+                                chunk_size,
+                                pk_index,
+                                where_clause,
+                            )
+
+                            if not rows:
+                                break
+
+                            rows_written = self._write_chunk(
+                                rows,
+                                target_schema,
+                                target_table,
+                                columns,
+                                postgres_conn
+                            )
+
+                            rows_transferred += rows_written
+                            chunks_processed += 1
+
+                            chunk_time = time.time() - chunk_start_time
+                            rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+
+                            logger.info(
+                                f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
+                                f"({rows_transferred:,}/{source_row_count:,} total) "
+                                f"at {rows_per_second:,.0f} rows/sec"
+                            )
+
+                            postgres_conn.commit()
 
         except Exception as e:
             error_msg = f"Error transferring data: {str(e)}"
@@ -1094,6 +1346,134 @@ class DataTransfer:
             target = max(requested_chunk, 100_000)
 
         return min(max(target, 5_000), 200_000)
+
+    def _get_pk_ntile_boundaries(
+        self,
+        mssql_conn,
+        schema_name: str,
+        table_name: str,
+        pk_column: str,
+        num_partitions: int,
+        where_clause: Optional[str] = None
+    ) -> List[Tuple[Any, Any]]:
+        """
+        Get balanced PK boundaries using NTILE for parallel readers.
+
+        Uses NTILE to divide rows into equal groups by row count (not by PK value),
+        ensuring balanced distribution even with sparse PKs.
+
+        Args:
+            mssql_conn: Active MSSQL connection
+            schema_name: Source schema name
+            table_name: Source table name
+            pk_column: Primary key column name
+            num_partitions: Number of partitions to create
+            where_clause: Optional filter
+
+        Returns:
+            List of (min_pk, max_pk) tuples for each partition
+        """
+        table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+
+        # Build NTILE query to get partition boundaries
+        inner_where = f"\nWHERE {where_clause}" if where_clause else ""
+
+        query = f"""
+        WITH numbered AS (
+            SELECT [{pk_column}],
+                   NTILE({num_partitions}) OVER (ORDER BY [{pk_column}]) as partition_id
+            FROM [{schema_name}].[{table_name}]{table_hint}{inner_where}
+        )
+        SELECT partition_id,
+               MIN([{pk_column}]) as min_pk,
+               MAX([{pk_column}]) as max_pk,
+               COUNT(*) as row_count
+        FROM numbered
+        GROUP BY partition_id
+        ORDER BY partition_id
+        """
+
+        try:
+            with mssql_conn.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+
+                if not rows:
+                    return []
+
+                boundaries = []
+                for row in rows:
+                    partition_id, min_pk, max_pk, row_count = row
+                    boundaries.append((min_pk, max_pk))
+                    logger.debug(
+                        f"NTILE partition {partition_id}: pk {min_pk}-{max_pk}, "
+                        f"{row_count:,} rows"
+                    )
+
+                return boundaries
+
+        except Exception as e:
+            logger.warning(f"Could not get NTILE boundaries: {e}")
+            return []
+
+    def _read_chunk_keyset_bounded(
+        self,
+        conn,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        pk_column: str,
+        start_key: Any,
+        limit: int,
+        pk_index: int,
+        where_clause: str,
+        max_pk: Any,
+    ) -> Tuple[List[Tuple[Any, ...]], Optional[Any]]:
+        """
+        Read rows using keyset pagination within a bounded PK range.
+
+        This is used by parallel keyset readers to read within their assigned range.
+
+        Args:
+            conn: MSSQL connection
+            schema_name: Source schema
+            table_name: Source table
+            columns: Columns to select
+            pk_column: Primary key column
+            start_key: Starting PK value (inclusive for first call, exclusive after)
+            limit: Max rows to fetch
+            pk_index: Index of PK column in columns list
+            where_clause: WHERE clause including PK range conditions
+            max_pk: Maximum PK value (for logging)
+
+        Returns:
+            Tuple of (rows, last_key_value)
+        """
+        table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+
+        quoted_columns = ', '.join([f'[{col}]' for col in columns])
+        query = f"""
+        SELECT TOP {limit} {quoted_columns}
+        FROM [{schema_name}].[{table_name}]{table_hint}
+        WHERE {where_clause}
+        ORDER BY [{pk_column}]
+        """
+
+        try:
+            with conn.cursor() as cursor:
+                # Execute with both start and max pk parameters
+                cursor.execute(query, (start_key, max_pk))
+                rows = cursor.fetchall()
+
+                if not rows:
+                    return [], None
+
+                next_key = rows[-1][pk_index]
+                return rows, next_key
+
+        except Exception as e:
+            logger.error(f"Error reading keyset chunk (pk >= {start_key}): {e}")
+            raise
 
     def _read_chunk_keyset(
         self,

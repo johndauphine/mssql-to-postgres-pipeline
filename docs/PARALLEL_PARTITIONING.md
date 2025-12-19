@@ -151,12 +151,15 @@ READER_QUEUE_SIZE=5     # Max chunks buffered in queue (default: 5)
 
 ### When Parallel Readers Are Used
 
-Parallel readers are only active when:
+Parallel readers are active when:
 1. `PARALLEL_READERS > 1` is set in environment
-2. The transfer uses ROW_NUMBER pagination (partitions, composite PKs)
-3. The row count is at least 2x the chunk_size
+2. The row count is at least 2x the chunk_size (default: 400K+ rows)
 
-For small tables or keyset pagination, sequential mode is always used.
+**Supported pagination modes:**
+- **Keyset pagination** (single-column PKs): Uses NTILE to compute balanced PK boundaries
+- **ROW_NUMBER pagination** (composite PKs): Divides row ranges among readers
+
+For small tables, sequential mode is always used.
 
 ## Configuration
 
