@@ -199,7 +199,7 @@ These notes clarify actual behavior vs. documented examples:
 
 - **Parallel keyset correctness (NOT APPLICABLE):** Keyset pagination uses the primary key, which is unique by definition. Composite PKs fall back to ROW_NUMBER pagination. The concern about non-unique ordering columns doesn't apply since we always use the actual PK.
 - **Boundary queries and NOLOCK (NOT APPLICABLE):** ETL migrations typically run against quiesced databases, read replicas, or point-in-time snapshots. Concurrent writes during bulk migration would cause broader data consistency issues regardless of NOLOCK. No action needed for typical migration workflows.
-- **Pool scope:** Pools are per-process. With multiple Airflow worker processes, aggregate MSSQL connections can exceed `MAX_MSSQL_CONNECTIONS`. Factor executor/worker counts into sizing.
+- **Pool scope (LocalExecutor only):** Pools are per-process. This project uses LocalExecutor (single scheduler process), so `MAX_MSSQL_CONNECTIONS` is respected exactly. For distributed executors (Celery/Kubernetes), divide pool size by worker count or use SQL Server Resource Governor to enforce limits server-side.
 - **Non-pooled connections (RESOLVED):** `OdbcConnectionHelper` now accepts an optional pool via `set_pool()` method. `DataTransfer` shares its pool with `mssql_hook`, so all helper queries also use pooled connections.
 - **Config drift (RESOLVED):** Postgres pool now reads `MAX_PG_CONNECTIONS` env var (commit 4157827). Both MSSQL and PG pools are configurable.
 
