@@ -21,17 +21,21 @@ class OdbcConnectionHelper:
 
     This class provides the same methods as MsSqlHook (get_records, get_first, run)
     but uses pyodbc directly instead of requiring the MSSQL provider.
+
+    Optionally uses a connection pool for better resource management.
     """
 
-    def __init__(self, odbc_conn_id: str):
+    def __init__(self, odbc_conn_id: str, pool=None):
         """
         Initialize the ODBC connection helper.
 
         Args:
             odbc_conn_id: Airflow connection ID for the database
+            pool: Optional MssqlConnectionPool for connection reuse
         """
         self.conn_id = odbc_conn_id
         self._conn_config = None
+        self._pool = pool
 
     def _get_connection_config(self) -> dict:
         """
@@ -76,15 +80,42 @@ class OdbcConnectionHelper:
         config = self._get_connection_config()
         return ';'.join([f"{k}={v}" for k, v in config.items() if v])
 
+    def set_pool(self, pool) -> None:
+        """
+        Set the connection pool for this helper.
+
+        Args:
+            pool: MssqlConnectionPool instance
+        """
+        self._pool = pool
+
     def get_conn(self) -> pyodbc.Connection:
         """
         Get a pyodbc connection to the database.
 
+        If a pool is configured, acquires from pool. Otherwise creates a new connection.
+
         Returns:
             pyodbc Connection object
         """
+        if self._pool:
+            return self._pool.acquire()
         conn_str = self._build_connection_string()
         return pyodbc.connect(conn_str)
+
+    def release_conn(self, conn: pyodbc.Connection) -> None:
+        """
+        Release a connection back to the pool or close it.
+
+        Args:
+            conn: Connection to release
+        """
+        if conn is None:
+            return
+        if self._pool:
+            self._pool.release(conn)
+        else:
+            conn.close()
 
     def get_records(
         self,
@@ -122,8 +153,7 @@ class OdbcConnectionHelper:
                 logger.error(f"Parameters: {parameters}")
             raise
         finally:
-            if conn:
-                conn.close()
+            self.release_conn(conn)
 
     def get_first(
         self,
@@ -161,8 +191,7 @@ class OdbcConnectionHelper:
                 logger.error(f"Parameters: {parameters}")
             raise
         finally:
-            if conn:
-                conn.close()
+            self.release_conn(conn)
 
     def run(
         self,
@@ -204,8 +233,7 @@ class OdbcConnectionHelper:
                 conn.rollback()
             raise
         finally:
-            if conn:
-                conn.close()
+            self.release_conn(conn)
 
     def get_connection(self, conn_id: str):
         """

@@ -696,6 +696,9 @@ class DataTransfer:
         # Initialize shared MSSQL connection pool for this connection ID
         self._init_mssql_pool()
 
+        # Share the pool with mssql_hook so OdbcConnectionHelper uses pooled connections
+        self.mssql_hook.set_pool(self._get_mssql_pool())
+
     def _init_mssql_pool(self) -> None:
         """Initialize shared MSSQL connection pool for this connection ID."""
         conn_id = self._mssql_conn_id

@@ -183,7 +183,7 @@ These notes clarify actual behavior vs. documented examples:
 
 - **Process-local pool:** The pool is shared within a Python process, not cluster-wide. Each Airflow worker process creates its own pool. With LocalExecutor (single process), this works as expected. With CeleryExecutor/KubernetesExecutor (multiple workers), aggregate connections = `MAX_MSSQL_CONNECTIONS × worker_count`.
 
-- **All MSSQL connections use pool (FIXED):** The `_mssql_connection()` context manager now uses the pool. All MSSQL operations in `DataTransfer` go through the pool. Note: `OdbcConnectionHelper` (used for simple queries like row counts) still creates direct connections but these are short-lived.
+- **All MSSQL connections use pool (FIXED):** The `_mssql_connection()` context manager and `OdbcConnectionHelper` now use the pool. All MSSQL operations in `DataTransfer` go through the pool.
 
 - **Validation overhead:** Connection validation runs `SELECT 1` on every acquire. This adds ~1ms latency but ensures stale connections are replaced. No env flag to disable.
 
@@ -194,6 +194,19 @@ These notes clarify actual behavior vs. documented examples:
 - **Shutdown:** Pool `close()` exists but Airflow doesn't call it. Connections are closed on process exit. For long-running workers, connections may accumulate if many pools are created for different conn_ids.
 
 - **Postgres pool sizing (FIXED):** PostgreSQL pool is now configurable via `MAX_PG_CONNECTIONS` env var (default: 8). Both pools use consistent `min_conn = max(1, max_conn // 4)` sizing.
+
+## Additional Concerns (Correctness / Ops)
+
+- **Parallel keyset correctness:** Parallel keyset readers rely on NTILE min/max with inclusive bounds and no uniqueness guard. If the ordering column is not unique, readers can overlap or skip rows. Consider restricting parallel keyset to truly unique keys or using ROW_NUMBER with a deterministic, unique ORDER BY.
+- **Boundary queries and NOLOCK:** NTILE boundary discovery uses NOLOCK unless strict mode is enabled. On a mutable source, boundaries can shift between readers, producing missing/duplicate rows. For correctness-first runs, disable NOLOCK for boundary discovery or require a quiesced source.
+- **Pool scope:** Pools are per-process. With multiple Airflow worker processes, aggregate MSSQL connections can exceed `MAX_MSSQL_CONNECTIONS`. Factor executor/worker counts into sizing.
+- **Non-pooled connections (RESOLVED):** `OdbcConnectionHelper` now accepts an optional pool via `set_pool()` method. `DataTransfer` shares its pool with `mssql_hook`, so all helper queries also use pooled connections.
+- **Config drift (RESOLVED):** Postgres pool now reads `MAX_PG_CONNECTIONS` env var (commit 4157827). Both MSSQL and PG pools are configurable.
+
+### Remaining items to harden
+
+- Enforce uniqueness for parallel keyset: only enable parallel keyset readers when the ordering column(s) are guaranteed unique (true PK/unique index). Otherwise fall back to ROW_NUMBER or a deterministic unique ORDER BY to avoid overlaps/skips.
+- Strict mode for boundaries: when parallel readers are enabled, force strict consistency (no NOLOCK) for NTILE boundary discovery to prevent shifting partitions on a mutable source.
 
 ## Review Notes for AI
 
