@@ -8,14 +8,17 @@ Uses direct pyodbc connections for keyset pagination to avoid issues with
 Airflow MSSQL hook's get_pandas_df method on large datasets.
 """
 
-from typing import Dict, Any, Optional, List, Tuple, Iterable
+from typing import Dict, Any, Optional, List, Tuple, Iterable, Iterator
 from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, date, time as dt_time
 from decimal import Decimal
 from io import StringIO, TextIOBase
+from concurrent.futures import ThreadPoolExecutor, Future
 import contextlib
 import logging
+import os
+import queue
 import threading
 import time
 import csv
@@ -25,6 +28,259 @@ from psycopg2 import pool as pg_pool
 from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
+
+
+def _get_parallel_reader_config() -> Tuple[int, int]:
+    """
+    Get parallel reader configuration from environment variables.
+
+    Returns:
+        Tuple of (num_readers, queue_size)
+    """
+    num_readers = int(os.environ.get('PARALLEL_READERS', '1'))
+    queue_size = int(os.environ.get('READER_QUEUE_SIZE', '5'))
+    return max(1, num_readers), max(1, queue_size)
+
+
+class ParallelReader:
+    """
+    Manages multiple SQL Server reader threads that feed a bounded queue.
+
+    Each reader thread has its own MSSQL connection (pyodbc connections are not
+    thread-safe) and reads a disjoint row range. Chunks are placed in a bounded
+    queue that the writer consumes.
+
+    Uses backpressure: if queue is full, readers block until writer consumes.
+    """
+
+    # Sentinel value to signal end of data
+    _DONE = object()
+
+    def __init__(
+        self,
+        mssql_config: Dict[str, str],
+        num_readers: int,
+        queue_size: int,
+    ):
+        """
+        Initialize the parallel reader manager.
+
+        Args:
+            mssql_config: MSSQL connection configuration dict
+            num_readers: Number of parallel reader threads
+            queue_size: Maximum chunks buffered in queue (backpressure)
+        """
+        self.mssql_config = mssql_config
+        self.num_readers = num_readers
+        self.chunk_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self.executor: Optional[ThreadPoolExecutor] = None
+        self.futures: List[Future] = []
+        self.cancel_event = threading.Event()
+        self.error: Optional[Exception] = None
+        self._error_lock = threading.Lock()
+        self._readers_done = 0
+        self._done_lock = threading.Lock()
+
+    def _create_mssql_connection(self) -> pyodbc.Connection:
+        """Create a new MSSQL connection for a reader thread."""
+        conn_str = ';'.join([f"{k}={v}" for k, v in self.mssql_config.items() if v])
+        return pyodbc.connect(conn_str)
+
+    def _set_error(self, error: Exception) -> None:
+        """Thread-safe error setter."""
+        with self._error_lock:
+            if self.error is None:
+                self.error = error
+                self.cancel_event.set()
+
+    def _reader_done(self) -> None:
+        """Signal that a reader has finished."""
+        with self._done_lock:
+            self._readers_done += 1
+            if self._readers_done >= self.num_readers:
+                # All readers done, signal end to consumer
+                self.chunk_queue.put(self._DONE)
+
+    def _reader_thread(
+        self,
+        reader_id: int,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        order_by_columns: List[str],
+        start_row: int,
+        end_row: int,
+        chunk_size: int,
+        where_clause: Optional[str],
+        read_func,
+    ) -> None:
+        """
+        Single reader thread - reads assigned row range and queues chunks.
+
+        Args:
+            reader_id: Reader identifier for logging
+            schema_name: Source schema
+            table_name: Source table
+            columns: Columns to select
+            order_by_columns: ORDER BY columns
+            start_row: First row to read (1-indexed)
+            end_row: Last row to read
+            chunk_size: Rows per chunk
+            where_clause: Optional filter
+            read_func: Function to read a chunk (from DataTransfer)
+        """
+        conn = None
+        try:
+            conn = self._create_mssql_connection()
+            current_start = start_row
+
+            while current_start <= end_row and not self.cancel_event.is_set():
+                current_end = min(current_start + chunk_size - 1, end_row)
+
+                # Read chunk using the provided read function
+                rows = read_func(
+                    conn,
+                    schema_name,
+                    table_name,
+                    columns,
+                    order_by_columns,
+                    current_start,
+                    current_end,
+                    where_clause,
+                )
+
+                if not rows:
+                    break
+
+                if self.cancel_event.is_set():
+                    break
+
+                # Put chunk in queue (blocks if full - backpressure)
+                try:
+                    self.chunk_queue.put(
+                        (reader_id, current_start, current_end, rows),
+                        timeout=30.0
+                    )
+                except queue.Full:
+                    if self.cancel_event.is_set():
+                        break
+                    # Retry once more
+                    self.chunk_queue.put(
+                        (reader_id, current_start, current_end, rows),
+                        timeout=60.0
+                    )
+
+                current_start = current_end + 1
+
+            logger.debug(f"Reader {reader_id} finished (rows {start_row}-{end_row})")
+
+        except Exception as e:
+            logger.error(f"Reader {reader_id} error: {e}")
+            self._set_error(e)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._reader_done()
+
+    def start_readers(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        order_by_columns: List[str],
+        total_start_row: int,
+        total_end_row: int,
+        chunk_size: int,
+        where_clause: Optional[str],
+        read_func,
+    ) -> None:
+        """
+        Launch reader threads for the specified row range.
+
+        Divides the row range equally among readers.
+
+        Args:
+            schema_name: Source schema
+            table_name: Source table
+            columns: Columns to select
+            order_by_columns: ORDER BY columns
+            total_start_row: First row of entire range
+            total_end_row: Last row of entire range
+            chunk_size: Rows per chunk
+            where_clause: Optional filter
+            read_func: Function to read a chunk
+        """
+        total_rows = total_end_row - total_start_row + 1
+        rows_per_reader = total_rows // self.num_readers
+
+        self.executor = ThreadPoolExecutor(max_workers=self.num_readers)
+        self.futures = []
+
+        for i in range(self.num_readers):
+            r_start = total_start_row + (i * rows_per_reader)
+            if i == self.num_readers - 1:
+                # Last reader gets remaining rows
+                r_end = total_end_row
+            else:
+                r_end = r_start + rows_per_reader - 1
+
+            logger.info(
+                f"Starting reader {i+1}/{self.num_readers} "
+                f"for rows {r_start:,}-{r_end:,}"
+            )
+
+            future = self.executor.submit(
+                self._reader_thread,
+                i + 1,
+                schema_name,
+                table_name,
+                columns,
+                order_by_columns,
+                r_start,
+                r_end,
+                chunk_size,
+                where_clause,
+                read_func,
+            )
+            self.futures.append(future)
+
+    def get_chunks(self) -> Iterator[Tuple[int, int, int, List[Tuple[Any, ...]]]]:
+        """
+        Generator that yields chunks from queue until all readers are done.
+
+        Yields:
+            Tuples of (reader_id, start_row, end_row, rows)
+
+        Raises:
+            Exception: If any reader encountered an error
+        """
+        while True:
+            try:
+                item = self.chunk_queue.get(timeout=5.0)
+            except queue.Empty:
+                # Check if we should stop
+                if self.cancel_event.is_set():
+                    break
+                continue
+
+            if item is self._DONE:
+                break
+
+            yield item
+
+        # Check for errors
+        if self.error:
+            raise self.error
+
+    def shutdown(self) -> None:
+        """Clean up resources."""
+        self.cancel_event.set()
+        if self.executor:
+            self.executor.shutdown(wait=True)
+            self.executor = None
 
 
 def _is_strict_consistency_mode() -> bool:
@@ -283,47 +539,113 @@ class DataTransfer:
                     # ROW_NUMBER mode: process in chunks within the specified row range
                     current_start = start_row if start_row else 1
                     final_end = end_row if end_row else source_row_count
+                    total_expected = final_end - current_start + 1
 
-                    while current_start <= final_end:
-                        chunk_start_time = time.time()
-                        current_end = min(current_start + chunk_size - 1, final_end)
+                    # Check if parallel readers are enabled
+                    num_readers, queue_size = _get_parallel_reader_config()
 
-                        rows = self._read_chunk_row_number(
-                            mssql_conn,
-                            source_schema,
-                            source_table,
-                            columns,
-                            order_by_columns,
-                            current_start,
-                            current_end,
-                            where_clause,
-                        )
-
-                        if not rows:
-                            break
-
-                        rows_written = self._write_chunk(
-                            rows,
-                            target_schema,
-                            target_table,
-                            columns,
-                            postgres_conn
-                        )
-
-                        rows_transferred += rows_written
-                        chunks_processed += 1
-                        current_start = current_end + 1
-
-                        chunk_time = time.time() - chunk_start_time
-                        rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
-
+                    if num_readers > 1 and total_expected >= chunk_size * 2:
+                        # Use parallel readers
                         logger.info(
-                            f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
-                            f"({rows_transferred:,}/{final_end - (start_row or 1) + 1:,} total) "
-                            f"at {rows_per_second:,.0f} rows/sec"
+                            f"Using {num_readers} parallel readers "
+                            f"(queue_size={queue_size}) for {total_expected:,} rows"
                         )
 
-                        postgres_conn.commit()
+                        parallel_reader = ParallelReader(
+                            mssql_config=self._mssql_config,
+                            num_readers=num_readers,
+                            queue_size=queue_size,
+                        )
+
+                        try:
+                            parallel_reader.start_readers(
+                                schema_name=source_schema,
+                                table_name=source_table,
+                                columns=columns,
+                                order_by_columns=order_by_columns,
+                                total_start_row=current_start,
+                                total_end_row=final_end,
+                                chunk_size=chunk_size,
+                                where_clause=where_clause,
+                                read_func=self._read_chunk_row_number,
+                            )
+
+                            # Writer consumes chunks from queue
+                            for reader_id, chunk_start, chunk_end, rows in parallel_reader.get_chunks():
+                                chunk_start_time = time.time()
+
+                                rows_written = self._write_chunk(
+                                    rows,
+                                    target_schema,
+                                    target_table,
+                                    columns,
+                                    postgres_conn
+                                )
+
+                                rows_transferred += rows_written
+                                chunks_processed += 1
+
+                                chunk_time = time.time() - chunk_start_time
+                                rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+
+                                logger.info(
+                                    f"Chunk {chunks_processed} (reader {reader_id}): "
+                                    f"Transferred {rows_written:,} rows "
+                                    f"({rows_transferred:,}/{total_expected:,} total) "
+                                    f"at {rows_per_second:,.0f} rows/sec"
+                                )
+
+                                postgres_conn.commit()
+                        finally:
+                            parallel_reader.shutdown()
+                    else:
+                        # Sequential mode (default or small row count)
+                        if num_readers > 1:
+                            logger.info(
+                                f"Row count {total_expected:,} too small for parallel readers, "
+                                f"using sequential mode"
+                            )
+
+                        while current_start <= final_end:
+                            chunk_start_time = time.time()
+                            current_end = min(current_start + chunk_size - 1, final_end)
+
+                            rows = self._read_chunk_row_number(
+                                mssql_conn,
+                                source_schema,
+                                source_table,
+                                columns,
+                                order_by_columns,
+                                current_start,
+                                current_end,
+                                where_clause,
+                            )
+
+                            if not rows:
+                                break
+
+                            rows_written = self._write_chunk(
+                                rows,
+                                target_schema,
+                                target_table,
+                                columns,
+                                postgres_conn
+                            )
+
+                            rows_transferred += rows_written
+                            chunks_processed += 1
+                            current_start = current_end + 1
+
+                            chunk_time = time.time() - chunk_start_time
+                            rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+
+                            logger.info(
+                                f"Chunk {chunks_processed}: Transferred {rows_written:,} rows "
+                                f"({rows_transferred:,}/{total_expected:,} total) "
+                                f"at {rows_per_second:,.0f} rows/sec"
+                            )
+
+                            postgres_conn.commit()
                 else:
                     # Keyset mode: original implementation
                     last_key_value = None

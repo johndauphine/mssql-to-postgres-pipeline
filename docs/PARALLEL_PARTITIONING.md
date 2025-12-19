@@ -107,6 +107,57 @@ NTILE(4) OVER (ORDER BY Id)
 -- Each partition gets exactly 25% of rows
 ```
 
+## Parallel Readers (Advanced)
+
+For additional throughput, you can enable parallel SQL Server readers within each partition. This overlaps read and write I/O operations for better utilization.
+
+### How Parallel Readers Work
+
+```
+Default (PARALLEL_READERS=1):
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ Read Chunk  │ ──► │ Write Chunk │ ──► │   Commit    │ ──► (repeat)
+│ (MSSQL)     │     │ (PG COPY)   │     │             │
+└─────────────┘     └─────────────┘     └─────────────┘
+     ~50%                ~50%
+   (blocked)          (blocked)
+
+With PARALLEL_READERS=2:
+┌──────────────┐
+│ Reader 1     │──┐
+│ (rows 1-25K) │  │
+└──────────────┘  │     ┌─────────────┐     ┌─────────────┐
+                  ├───► │   Queue     │ ──► │   Writer    │
+┌──────────────┐  │     │ (bounded)   │     │ (PG COPY)   │
+│ Reader 2     │──┘     └─────────────┘     └─────────────┘
+│ (rows 25K+)  │
+└──────────────┘
+```
+
+Each reader has its own SQL Server connection and reads a disjoint row range. The bounded queue provides backpressure to prevent memory exhaustion.
+
+### Enabling Parallel Readers
+
+```bash
+# .env file
+PARALLEL_READERS=2      # Number of concurrent SQL Server connections (default: 1)
+READER_QUEUE_SIZE=5     # Max chunks buffered in queue (default: 5)
+```
+
+**Recommendations:**
+- `PARALLEL_READERS=1`: Default, sequential reads (current behavior)
+- `PARALLEL_READERS=2`: Recommended for most workloads
+- `PARALLEL_READERS=3-4`: For high-bandwidth networks only
+
+### When Parallel Readers Are Used
+
+Parallel readers are only active when:
+1. `PARALLEL_READERS > 1` is set in environment
+2. The transfer uses ROW_NUMBER pagination (partitions, composite PKs)
+3. The row count is at least 2x the chunk_size
+
+For small tables or keyset pagination, sequential mode is always used.
+
 ## Configuration
 
 ### Environment Variables
@@ -114,6 +165,8 @@ NTILE(4) OVER (ORDER BY Id)
 ```bash
 # .env file
 MAX_PARTITIONS=8        # Maximum partitions per table (default: 8)
+PARALLEL_READERS=1      # SQL Server reader threads per partition (default: 1)
+READER_QUEUE_SIZE=5     # Max chunks buffered between readers and writer (default: 5)
 ```
 
 ### DAG Parameters
@@ -218,8 +271,8 @@ All partitions should have approximately equal row counts.
 
 ### Key Files
 - `dags/mssql_to_postgres_migration.py`: NTILE queries, partition logic
-- `include/mssql_pg_migration/data_transfer.py`: ROW_NUMBER pagination
-- `include/mssql_pg_migration/schema_extractor.py`: PK column detection
+- `plugins/mssql_pg_migration/data_transfer.py`: ROW_NUMBER pagination, parallel readers
+- `plugins/mssql_pg_migration/schema_extractor.py`: PK column detection
 
 ### NTILE Boundary Query
 ```python
