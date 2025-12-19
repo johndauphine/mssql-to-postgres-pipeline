@@ -149,11 +149,6 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             type="boolean",
             description="Whether to create foreign key constraints"
         ),
-        "use_unlogged_tables": Param(
-            default=False,
-            type="boolean",
-            description="Create tables as UNLOGGED during load (requires slow SET LOGGED conversion after - not recommended for large datasets)"
-        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
@@ -263,15 +258,13 @@ def mssql_to_postgres_migration():
         """
         params = context["params"]
         target_schema = params["target_schema"]
-        use_unlogged = params.get("use_unlogged_tables", True)
 
         generator = ddl_generator.DDLGenerator(params["target_conn_id"])
         created_tables = []
 
         for table_schema in tables_schema:
             table_name = table_schema["table_name"]
-            unlogged_msg = " (UNLOGGED)" if use_unlogged else ""
-            logger.info(f"Creating table {target_schema}.{table_name}{unlogged_msg}")
+            logger.info(f"Creating table {target_schema}.{table_name}")
 
             try:
                 # Remove PK constraint from CREATE TABLE - will be added after data load
@@ -280,8 +273,7 @@ def mssql_to_postgres_migration():
                 ddl_statements.append(generator.generate_create_table(
                     table_schema,
                     target_schema,
-                    include_constraints=False,  # Skip PK - added after data load
-                    unlogged=use_unlogged
+                    include_constraints=False  # Skip PK - added after data load
                 ))
 
                 # Execute DDL
@@ -737,60 +729,6 @@ def mssql_to_postgres_migration():
         return f"Created {fk_count} foreign keys"
 
     @task(trigger_rule="all_done")
-    def convert_tables_to_logged(
-        transfer_results: List[Dict[str, Any]],
-        **context
-    ) -> str:
-        """
-        Convert UNLOGGED tables to LOGGED after data transfer (parallelized).
-
-        This ensures data durability after bulk loading is complete.
-
-        Args:
-            transfer_results: Results from data transfers
-
-        Returns:
-            Status message
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        params = context["params"]
-
-        if not params.get("use_unlogged_tables", True):
-            logger.info("Tables were created as LOGGED, no conversion needed")
-            return "Tables already logged"
-
-        target_schema = params["target_schema"]
-        target_conn_id = params["target_conn_id"]
-
-        # Convert successfully transferred tables to LOGGED
-        successful_tables = [r["table_name"] for r in transfer_results if r.get("success", False)]
-
-        def convert_table(table_name: str) -> bool:
-            """Convert a single table to LOGGED."""
-            try:
-                # Each thread needs its own generator/connection
-                gen = ddl_generator.DDLGenerator(target_conn_id)
-                set_logged_ddl = gen.generate_set_logged(table_name, target_schema)
-                gen.execute_ddl([set_logged_ddl], transaction=False)
-                logger.info(f"✓ Converted {table_name} to LOGGED")
-                return True
-            except Exception as e:
-                logger.warning(f"Could not convert {table_name} to LOGGED: {str(e)}")
-                return False
-
-        # Parallelize SET LOGGED operations (4 workers to avoid overloading PostgreSQL)
-        converted_count = 0
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(convert_table, t): t for t in successful_tables}
-            for future in as_completed(futures):
-                if future.result():
-                    converted_count += 1
-
-        logger.info(f"Converted {converted_count} tables to LOGGED for durability")
-        return f"Converted {converted_count} tables to LOGGED"
-
-    @task(trigger_rule="all_done")
     def create_indexes(
         tables_schema: List[Dict[str, Any]],
         transfer_results: List[Dict[str, Any]],
@@ -1166,9 +1104,6 @@ def mssql_to_postgres_migration():
         remaining_partition_results=remaining_partition_results
     )
 
-    # Convert UNLOGGED tables to LOGGED after data transfer (for durability)
-    logged_status = convert_tables_to_logged(transfer_results)
-
     # P2.2: Reset sequences for SERIAL/BIGSERIAL columns after data load
     @task(trigger_rule="all_done")
     def reset_sequences(
@@ -1236,9 +1171,8 @@ def mssql_to_postgres_migration():
     # Create foreign keys after indexes are created
     fk_status = create_foreign_keys(schema_data, transfer_results)
 
-    # Task order: convert_to_logged and reset_sequences run in parallel,
-    # then create_primary_keys -> create_indexes -> create_foreign_keys
-    [logged_status, seq_status] >> pk_status >> index_status >> fk_status
+    # Task order: reset_sequences -> create_primary_keys -> create_indexes -> create_foreign_keys
+    seq_status >> pk_status >> index_status >> fk_status
 
     # Trigger validation DAG instead of internal validation (avoids XCom bug)
     trigger_validation = TriggerDagRunOperator(

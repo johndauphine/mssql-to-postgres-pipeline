@@ -149,7 +149,6 @@ The migration DAG accepts these parameters (via UI or `--conf`):
 | `chunk_size` | `100000` | Rows per batch (100-500,000) |
 | `exclude_tables` | `[]` | Table patterns to skip (supports wildcards) |
 | `create_foreign_keys` | `true` | Create foreign key constraints after transfer |
-| `use_unlogged_tables` | `true` | Use UNLOGGED tables during load (faster) |
 
 ### Environment Variables
 
@@ -318,7 +317,6 @@ NOTIFICATION_EMAIL_TO=data-team@corp.com
 - Increase `MAX_PARTITIONS` (more parallel tasks)
 - Increase `chunk_size` (larger batches)
 - Check network latency between Airflow and databases
-- Enable `use_unlogged_tables=true` for faster loads
 
 **Out of Memory**
 - Decrease `MAX_PARTITIONS` (fewer parallel tasks)

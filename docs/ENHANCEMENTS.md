@@ -533,11 +533,7 @@ Additional features from postgres-to-postgres-pipeline that can be added:
    - Dynamic partition count determination
    - Parallel partition processing
 
-2. **UNLOGGED Table Support**:
-   - Create tables without WAL for faster bulk loading
-   - Automatically convert to LOGGED after data load
-
-3. **Enhanced Configuration**:
+2. **Enhanced Configuration**:
    - Drop vs Truncate strategy
    - Table exclusion patterns
    - Chunk size optimization parameters

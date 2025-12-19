@@ -176,7 +176,7 @@ transfer_table_data[...]       ├──► get_remaining_partitions
                      collect_all_results
                                │
                                ▼
-                     convert_tables_to_logged
+                       reset_sequences
                                │
                                ▼
                      create_primary_keys
