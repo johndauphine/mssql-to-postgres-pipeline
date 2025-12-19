@@ -53,7 +53,7 @@ The pipeline executes as a single Airflow DAG with the following stages:
 Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parallel) -> Validate -> Report
 ```
 
-1. **Schema Extraction**: Queries SQL Server system catalogs to discover all tables, columns, data types, indexes, and constraints
+1. **Schema Extraction**: Queries SQL Server system catalogs to discover all tables, columns, data types, primary keys, and indexes
 2. **DDL Generation**: Converts SQL Server schemas to PostgreSQL-compatible DDL with proper type mappings
 3. **Table Creation**: Creates target tables in PostgreSQL (drops existing tables first)
 4. **Data Transfer**: Streams data using keyset pagination with pyodbc connections and PostgreSQL COPY protocol
