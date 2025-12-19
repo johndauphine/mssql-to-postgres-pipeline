@@ -249,7 +249,6 @@ def map_table_schema(table_schema: Dict[str, Any]) -> Dict[str, Any]:
         'columns': [],
         'primary_key': table_schema.get('primary_key', []),
         'indexes': [],
-        'foreign_keys': [],
     }
 
     # Map all columns
@@ -263,17 +262,6 @@ def map_table_schema(table_schema: Dict[str, Any]) -> Dict[str, Any]:
             'columns': index['columns'],
             'is_unique': index.get('is_unique', False),
             'is_clustered': False,  # PostgreSQL doesn't have clustered indexes like SQL Server
-        })
-
-    # Map foreign keys if present
-    for fk in table_schema.get('foreign_keys', []):
-        result['foreign_keys'].append({
-            'constraint_name': fk['constraint_name'],
-            'columns': fk['columns'],
-            'referenced_table': fk['referenced_table'],
-            'referenced_columns': fk['referenced_columns'],
-            'on_delete': fk.get('on_delete', 'NO ACTION'),
-            'on_update': fk.get('on_update', 'NO ACTION'),
         })
 
     return result

@@ -133,40 +133,6 @@ class DDLGenerator:
 
         return index_statements
 
-    def generate_foreign_keys(self, table_schema: Dict[str, Any], target_schema: str = 'public') -> List[str]:
-        """
-        Generate ALTER TABLE ADD CONSTRAINT statements for foreign keys.
-
-        Args:
-            table_schema: Table schema information
-            target_schema: Target PostgreSQL schema name
-
-        Returns:
-            List of ALTER TABLE DDL statements for foreign keys
-        """
-        mapped_schema = map_table_schema(table_schema)
-        table_name = mapped_schema['table_name']
-        fk_statements = []
-
-        for fk in mapped_schema.get('foreign_keys', []):
-            constraint_name = fk['constraint_name']
-            columns = ', '.join([self._quote_identifier(col) for col in fk['columns']])
-            ref_table = fk['referenced_table']
-            ref_columns = ', '.join([self._quote_identifier(col) for col in fk['referenced_columns']])
-
-            # Map referential actions
-            on_delete = fk.get('on_delete', 'NO ACTION')
-            on_update = fk.get('on_update', 'NO ACTION')
-
-            ddl = f"ALTER TABLE {self._quote_identifier(target_schema)}.{self._quote_identifier(table_name)} " \
-                  f"ADD CONSTRAINT {self._quote_identifier(constraint_name)} " \
-                  f"FOREIGN KEY ({columns}) " \
-                  f"REFERENCES {self._quote_identifier(target_schema)}.{self._quote_identifier(ref_table)} ({ref_columns}) " \
-                  f"ON DELETE {on_delete} ON UPDATE {on_update}"
-            fk_statements.append(ddl)
-
-        return fk_statements
-
     def generate_check_constraints(self, table_schema: Dict[str, Any], target_schema: str = 'public') -> List[str]:
         """
         Generate ALTER TABLE ADD CONSTRAINT statements for check constraints.
@@ -241,8 +207,7 @@ class DDLGenerator:
         table_schema: Dict[str, Any],
         target_schema: str = 'public',
         drop_if_exists: bool = True,
-        create_indexes: bool = True,
-        create_foreign_keys: bool = False  # Usually done after all tables are created
+        create_indexes: bool = True
     ) -> List[str]:
         """
         Generate complete DDL for a table including all objects.
@@ -252,7 +217,6 @@ class DDLGenerator:
             target_schema: Target PostgreSQL schema name
             drop_if_exists: Whether to include DROP TABLE statement
             create_indexes: Whether to include CREATE INDEX statements
-            create_foreign_keys: Whether to include foreign key constraints
 
         Returns:
             List of DDL statements in execution order
@@ -280,10 +244,6 @@ class DDLGenerator:
 
         # Create check constraints
         ddl_statements.extend(self.generate_check_constraints(table_schema, target_schema))
-
-        # Create foreign keys (if requested)
-        if create_foreign_keys:
-            ddl_statements.extend(self.generate_foreign_keys(table_schema, target_schema))
 
         return ddl_statements
 
@@ -455,13 +415,12 @@ def create_tables_ddl(
         drop_if_exists: Whether to include DROP statements
 
     Returns:
-        Dictionary with 'drops', 'creates', 'indexes', 'foreign_keys' lists
+        Dictionary with 'drops', 'creates', 'indexes' lists
     """
     result = {
         'drops': [],
         'creates': [],
         'indexes': [],
-        'foreign_keys': [],
     }
 
     # Temporary generator instance (connection not used for generation)
@@ -483,8 +442,5 @@ def create_tables_ddl(
 
         # Generate indexes
         result['indexes'].extend(generator.generate_indexes(table_schema, target_schema))
-
-        # Generate foreign keys (to be added after all tables are created)
-        result['foreign_keys'].extend(generator.generate_foreign_keys(table_schema, target_schema))
 
     return result

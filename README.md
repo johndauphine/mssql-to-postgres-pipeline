@@ -4,7 +4,7 @@ An Apache Airflow 3.0 pipeline for automated, full-refresh migrations from Micro
 
 ## Features
 
-- **Schema Discovery**: Automatically extract table structures, columns, indexes, and foreign keys from SQL Server
+- **Schema Discovery**: Automatically extract table structures, columns, and indexes from SQL Server
 - **Type Mapping**: Convert 30+ SQL Server data types to their PostgreSQL equivalents
 - **Streaming Data Transfer**: Move data efficiently using server-side cursors, keyset pagination, and PostgreSQL's COPY protocol
 - **Validation**: Standalone validation DAG verifies migration success through row count comparisons

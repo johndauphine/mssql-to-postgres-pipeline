@@ -330,63 +330,6 @@ class SchemaExtractor:
 
         return result
 
-    def get_foreign_keys(self, table_object_id: int) -> List[Dict[str, Any]]:
-        """
-        Get all foreign keys for a table.
-
-        Args:
-            table_object_id: SQL Server object_id of the table
-
-        Returns:
-            List of foreign key information dictionaries
-        """
-        query = """
-        SELECT
-            fk.name AS constraint_name,
-            STUFF((
-                SELECT ', ' + c1.name
-                FROM sys.foreign_key_columns fkc2
-                INNER JOIN sys.columns c1 ON fkc2.parent_object_id = c1.object_id AND fkc2.parent_column_id = c1.column_id
-                WHERE fkc2.constraint_object_id = fk.object_id
-                ORDER BY fkc2.constraint_column_id
-                FOR XML PATH('')
-            ), 1, 2, '') AS columns,
-            OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS referenced_schema,
-            OBJECT_NAME(fk.referenced_object_id) AS referenced_table,
-            STUFF((
-                SELECT ', ' + c2.name
-                FROM sys.foreign_key_columns fkc2
-                INNER JOIN sys.columns c2 ON fkc2.referenced_object_id = c2.object_id AND fkc2.referenced_column_id = c2.column_id
-                WHERE fkc2.constraint_object_id = fk.object_id
-                ORDER BY fkc2.constraint_column_id
-                FOR XML PATH('')
-            ), 1, 2, '') AS referenced_columns,
-            fk.delete_referential_action_desc AS on_delete,
-            fk.update_referential_action_desc AS on_update
-        FROM sys.foreign_keys fk
-        WHERE fk.parent_object_id = ?
-        """
-
-        foreign_keys = self.mssql_hook.get_records(query, parameters=[table_object_id])
-
-        result = []
-        for fk in foreign_keys:
-            # Handle bytes from FOR XML PATH
-            columns_str = fk[1].decode('utf-8') if isinstance(fk[1], bytes) else fk[1]
-            ref_columns_str = fk[4].decode('utf-8') if isinstance(fk[4], bytes) else fk[4]
-            fk_dict = {
-                'constraint_name': fk[0],
-                'columns': [col.strip() for col in columns_str.split(',')] if columns_str else [],
-                'referenced_schema': fk[2],
-                'referenced_table': fk[3],
-                'referenced_columns': [col.strip() for col in ref_columns_str.split(',')] if ref_columns_str else [],
-                'on_delete': fk[5].replace('_', ' ') if fk[5] else 'NO ACTION',  # Convert NO_ACTION to NO ACTION
-                'on_update': fk[6].replace('_', ' ') if fk[6] else 'NO ACTION',
-            }
-            result.append(fk_dict)
-
-        return result
-
     def get_check_constraints(self, table_object_id: int) -> List[Dict[str, Any]]:
         """
         Get all check constraints for a table.
@@ -453,7 +396,6 @@ class SchemaExtractor:
             'columns': self.get_columns(object_id),
             'primary_key': self.get_primary_key(object_id),
             'indexes': self.get_indexes(object_id),
-            'foreign_keys': self.get_foreign_keys(object_id),
             'check_constraints': self.get_check_constraints(object_id),
         }
 
@@ -490,7 +432,6 @@ class SchemaExtractor:
                 'primary_key': self.get_primary_key(table['object_id']),
                 'pk_columns': self.get_primary_key_columns(table['object_id']),
                 'indexes': self.get_indexes(table['object_id']),
-                'foreign_keys': self.get_foreign_keys(table['object_id']),
                 'check_constraints': self.get_check_constraints(table['object_id']),
             }
             result.append(table_schema)
