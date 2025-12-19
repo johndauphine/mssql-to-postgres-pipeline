@@ -200,6 +200,7 @@ MAX_PARTITIONS=8           # Maximum partitions per table (default: 8)
 PARALLEL_READERS=1         # SQL Server reader threads per partition (default: 1)
 READER_QUEUE_SIZE=5        # Max chunks buffered between readers and writer (default: 5)
 MAX_MSSQL_CONNECTIONS=12   # Maximum SQL Server connections in pool (default: 12)
+MAX_PG_CONNECTIONS=8       # Maximum PostgreSQL connections in pool (default: 8)
 ```
 
 ### MSSQL Connection Pool
@@ -221,6 +222,20 @@ The pool automatically manages connection lifecycle:
 |----------|----------------------|
 | Small (<50M rows) | 8-12 |
 | Large (>50M rows) | 12-16 |
+
+### PostgreSQL Connection Pool
+
+The pipeline also uses a connection pool for PostgreSQL writes.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `MAX_PG_CONNECTIONS` | Hard limit on concurrent psycopg2 connections | 8 |
+
+**Recommended settings:**
+| Workload | MAX_PG_CONNECTIONS |
+|----------|-------------------|
+| Default | 8 |
+| High parallelism (12+ partitions) | 12-16 |
 
 ### DAG Parameters
 

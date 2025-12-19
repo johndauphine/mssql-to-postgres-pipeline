@@ -193,7 +193,7 @@ These notes clarify actual behavior vs. documented examples:
 
 - **Shutdown:** Pool `close()` exists but Airflow doesn't call it. Connections are closed on process exit. For long-running workers, connections may accumulate if many pools are created for different conn_ids.
 
-- **Postgres pool sizing:** Only MSSQL pool is configurable. Postgres pool hardcoded at maxconn=8. Consider adding `MAX_PG_CONNECTIONS` env var.
+- **Postgres pool sizing (FIXED):** PostgreSQL pool is now configurable via `MAX_PG_CONNECTIONS` env var (default: 8). Both pools use consistent `min_conn = max(1, max_conn // 4)` sizing.
 
 ## Review Notes for AI
 

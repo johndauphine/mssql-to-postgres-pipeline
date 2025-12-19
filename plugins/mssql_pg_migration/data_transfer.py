@@ -680,15 +680,18 @@ class DataTransfer:
             with DataTransfer._pg_pool_lock:
                 if postgres_conn_id not in DataTransfer._postgres_pools:
                     pg_conn = self.postgres_hook.get_connection(postgres_conn_id)
+                    pg_max_conn = int(os.environ.get('MAX_PG_CONNECTIONS', '8'))
+                    pg_min_conn = max(1, pg_max_conn // 4)
                     DataTransfer._postgres_pools[postgres_conn_id] = pg_pool.ThreadedConnectionPool(
-                        minconn=1,
-                        maxconn=8,
+                        minconn=pg_min_conn,
+                        maxconn=pg_max_conn,
                         host=pg_conn.host,
                         port=pg_conn.port or 5432,
                         database=pg_conn.schema or pg_conn.login,
                         user=pg_conn.login,
                         password=pg_conn.password,
                     )
+                    logger.info(f"Created PostgreSQL pool for {postgres_conn_id}: max={pg_max_conn}")
 
         # Initialize shared MSSQL connection pool for this connection ID
         self._init_mssql_pool()
