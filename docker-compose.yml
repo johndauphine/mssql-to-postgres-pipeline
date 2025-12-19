@@ -40,6 +40,7 @@ x-airflow-common:
     DEFAULT_CHUNK_SIZE: ${DEFAULT_CHUNK_SIZE:-200000}
     PARALLEL_READERS: ${PARALLEL_READERS:-1}
     READER_QUEUE_SIZE: ${READER_QUEUE_SIZE:-5}
+    MAX_MSSQL_CONNECTIONS: ${MAX_MSSQL_CONNECTIONS:-12}
     # For validation DAG (must match database in AIRFLOW_CONN_MSSQL_SOURCE)
     MSSQL_DATABASE: ${MSSQL_DATABASE:-StackOverflow2010}
     # For testing: set to comma-separated table names to simulate failures

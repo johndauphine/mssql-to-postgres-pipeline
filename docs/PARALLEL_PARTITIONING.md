@@ -188,7 +188,7 @@ For small tables, sequential mode is always used.
   - More concurrent partitions at larger scale (12 vs 4-8)
   - Total SQL connections = PARALLEL_READERS × concurrent_partitions
   - Connection overhead and contention dominate at higher connection counts
-  - Future enhancement: Global connection pool to limit total connections
+  - **Solution**: Global MSSQL connection pool limits total connections regardless of partition count
 
 ## Configuration
 
@@ -196,10 +196,31 @@ For small tables, sequential mode is always used.
 
 ```bash
 # .env file
-MAX_PARTITIONS=8        # Maximum partitions per table (default: 8)
-PARALLEL_READERS=1      # SQL Server reader threads per partition (default: 1)
-READER_QUEUE_SIZE=5     # Max chunks buffered between readers and writer (default: 5)
+MAX_PARTITIONS=8           # Maximum partitions per table (default: 8)
+PARALLEL_READERS=1         # SQL Server reader threads per partition (default: 1)
+READER_QUEUE_SIZE=5        # Max chunks buffered between readers and writer (default: 5)
+MAX_MSSQL_CONNECTIONS=12   # Maximum SQL Server connections in pool (default: 12)
 ```
+
+### MSSQL Connection Pool
+
+The pipeline uses a global connection pool for SQL Server to limit total concurrent connections regardless of partition count or parallel reader settings.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `MAX_MSSQL_CONNECTIONS` | Hard limit on concurrent pyodbc connections | 12 |
+
+The pool automatically manages connection lifecycle:
+- Pre-warms minimum connections at startup (25% of max)
+- Validates connections before reuse
+- Replaces stale connections transparently
+- Blocks callers when pool is exhausted (with 120s timeout)
+
+**Recommended settings:**
+| Workload | MAX_MSSQL_CONNECTIONS |
+|----------|----------------------|
+| Small (<50M rows) | 8-12 |
+| Large (>50M rows) | 12-16 |
 
 ### DAG Parameters
 

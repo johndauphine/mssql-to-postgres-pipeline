@@ -30,6 +30,185 @@ from psycopg2 import sql
 logger = logging.getLogger(__name__)
 
 
+class MssqlConnectionPool:
+    """
+    Thread-safe connection pool for SQL Server pyodbc connections.
+
+    Since pyodbc connections are not thread-safe, this pool ensures each
+    connection is used by only one thread at a time. Uses a semaphore to
+    limit total connections and a queue for connection reuse.
+
+    Usage:
+        pool = MssqlConnectionPool(config, max_conn=12)
+        conn = pool.acquire()
+        try:
+            cursor = conn.cursor()
+            # use connection
+        finally:
+            pool.release(conn)
+    """
+
+    def __init__(
+        self,
+        mssql_config: Dict[str, str],
+        min_conn: int = 2,
+        max_conn: int = 12,
+        acquire_timeout: float = 120.0,
+    ):
+        """
+        Initialize the MSSQL connection pool.
+
+        Args:
+            mssql_config: ODBC connection config dict with keys like
+                          DRIVER, SERVER, DATABASE, UID, PWD, TrustServerCertificate
+            min_conn: Minimum connections to pre-create (warm start)
+            max_conn: Maximum concurrent connections (hard limit)
+            acquire_timeout: Seconds to wait when pool is exhausted
+        """
+        self._config = mssql_config
+        self._min_conn = min_conn
+        self._max_conn = max_conn
+        self._acquire_timeout = acquire_timeout
+
+        # Thread-safe queue for available connections (LIFO for reuse)
+        self._available: queue.Queue[pyodbc.Connection] = queue.Queue()
+
+        # Semaphore limits total concurrent connections
+        self._semaphore = threading.Semaphore(max_conn)
+
+        # Track all connections for cleanup
+        self._all_connections: List[pyodbc.Connection] = []
+        self._lock = threading.Lock()
+        self._closed = False
+
+        logger.info(f"Initializing MSSQL connection pool: min={min_conn}, max={max_conn}")
+
+        # Pre-warm pool with minimum connections
+        for _ in range(min_conn):
+            try:
+                conn = self._create_connection()
+                self._available.put(conn)
+            except Exception as e:
+                logger.warning(f"Failed to pre-warm MSSQL pool: {e}")
+
+    def _create_connection(self) -> pyodbc.Connection:
+        """Create a new pyodbc connection."""
+        conn_str = ';'.join([f"{k}={v}" for k, v in self._config.items() if v])
+        conn = pyodbc.connect(conn_str, timeout=30)
+        with self._lock:
+            self._all_connections.append(conn)
+        logger.debug(f"Created new MSSQL connection (pool size: {len(self._all_connections)})")
+        return conn
+
+    def _validate_connection(self, conn: pyodbc.Connection) -> bool:
+        """Check if connection is still valid."""
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            cursor.close()
+            return True
+        except Exception:
+            return False
+
+    def _close_connection(self, conn: pyodbc.Connection) -> None:
+        """Safely close a connection."""
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with self._lock:
+            if conn in self._all_connections:
+                self._all_connections.remove(conn)
+
+    def acquire(self) -> pyodbc.Connection:
+        """
+        Acquire a connection from the pool.
+
+        Blocks if all connections are in use until one becomes available
+        or acquire_timeout is reached.
+
+        Returns:
+            Active pyodbc connection
+
+        Raises:
+            TimeoutError: If no connection available within timeout
+            RuntimeError: If pool has been closed
+        """
+        if self._closed:
+            raise RuntimeError("Connection pool has been closed")
+
+        # Wait for available slot (blocks if pool exhausted)
+        acquired = self._semaphore.acquire(timeout=self._acquire_timeout)
+        if not acquired:
+            raise TimeoutError(
+                f"Could not acquire MSSQL connection within {self._acquire_timeout}s "
+                f"(pool max: {self._max_conn})"
+            )
+
+        try:
+            # Try to get existing connection from queue
+            try:
+                conn = self._available.get_nowait()
+                if self._validate_connection(conn):
+                    return conn
+                # Connection is stale, replace it
+                self._close_connection(conn)
+                return self._create_connection()
+            except queue.Empty:
+                # No available connection, create new one
+                return self._create_connection()
+        except Exception:
+            self._semaphore.release()
+            raise
+
+    def release(self, conn: pyodbc.Connection) -> None:
+        """
+        Return a connection to the pool.
+
+        Args:
+            conn: Connection to return (can be None, will be ignored)
+        """
+        if conn is None:
+            return
+
+        if self._closed:
+            self._close_connection(conn)
+            return
+
+        # Return connection to available queue
+        self._available.put(conn)
+        self._semaphore.release()
+
+    def close(self) -> None:
+        """Close all connections and shut down the pool."""
+        self._closed = True
+
+        # Drain and close available connections
+        while True:
+            try:
+                conn = self._available.get_nowait()
+                self._close_connection(conn)
+            except queue.Empty:
+                break
+
+        # Close any remaining connections
+        with self._lock:
+            for conn in list(self._all_connections):
+                self._close_connection(conn)
+
+        logger.info("MSSQL connection pool closed")
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        """Get pool statistics."""
+        return {
+            "total": len(self._all_connections),
+            "available": self._available.qsize(),
+            "max": self._max_conn,
+        }
+
+
 def _get_parallel_reader_config() -> Tuple[int, int]:
     """
     Get parallel reader configuration from environment variables.
@@ -46,9 +225,9 @@ class ParallelReader:
     """
     Manages multiple SQL Server reader threads that feed a bounded queue.
 
-    Each reader thread has its own MSSQL connection (pyodbc connections are not
-    thread-safe) and reads a disjoint row range. Chunks are placed in a bounded
-    queue that the writer consumes.
+    Each reader thread acquires a connection from the global MSSQL pool
+    (pyodbc connections are not thread-safe) and reads a disjoint row range.
+    Chunks are placed in a bounded queue that the writer consumes.
 
     Uses backpressure: if queue is full, readers block until writer consumes.
     """
@@ -58,7 +237,7 @@ class ParallelReader:
 
     def __init__(
         self,
-        mssql_config: Dict[str, str],
+        mssql_pool: MssqlConnectionPool,
         num_readers: int,
         queue_size: int,
     ):
@@ -66,11 +245,11 @@ class ParallelReader:
         Initialize the parallel reader manager.
 
         Args:
-            mssql_config: MSSQL connection configuration dict
+            mssql_pool: MSSQL connection pool to acquire connections from
             num_readers: Number of parallel reader threads
             queue_size: Maximum chunks buffered in queue (backpressure)
         """
-        self.mssql_config = mssql_config
+        self.mssql_pool = mssql_pool
         self.num_readers = num_readers
         self.chunk_queue: queue.Queue = queue.Queue(maxsize=queue_size)
         self.executor: Optional[ThreadPoolExecutor] = None
@@ -80,11 +259,6 @@ class ParallelReader:
         self._error_lock = threading.Lock()
         self._readers_done = 0
         self._done_lock = threading.Lock()
-
-    def _create_mssql_connection(self) -> pyodbc.Connection:
-        """Create a new MSSQL connection for a reader thread."""
-        conn_str = ';'.join([f"{k}={v}" for k, v in self.mssql_config.items() if v])
-        return pyodbc.connect(conn_str)
 
     def _set_error(self, error: Exception) -> None:
         """Thread-safe error setter."""
@@ -131,7 +305,7 @@ class ParallelReader:
         """
         conn = None
         try:
-            conn = self._create_mssql_connection()
+            conn = self.mssql_pool.acquire()
             current_start = start_row
 
             while current_start <= end_row and not self.cancel_event.is_set():
@@ -178,11 +352,7 @@ class ParallelReader:
             logger.error(f"Reader {reader_id} error: {e}")
             self._set_error(e)
         finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            self.mssql_pool.release(conn)
             self._reader_done()
 
     def _keyset_reader_thread(
@@ -219,7 +389,7 @@ class ParallelReader:
         chunks_read = 0
         total_rows = 0
         try:
-            conn = self._create_mssql_connection()
+            conn = self.mssql_pool.acquire()
             last_key_value = None
             is_first_chunk = True
 
@@ -295,11 +465,7 @@ class ParallelReader:
             logger.error(f"Keyset reader {reader_id} error: {e}")
             self._set_error(e)
         finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            self.mssql_pool.release(conn)
             self._reader_done()
 
     def start_readers(
@@ -471,8 +637,13 @@ def _is_strict_consistency_mode() -> bool:
 class DataTransfer:
     """Handle data transfer from SQL Server to PostgreSQL."""
 
+    # PostgreSQL connection pools (class-level, shared across instances)
     _postgres_pools: Dict[str, pg_pool.ThreadedConnectionPool] = {}
-    _pool_lock = threading.Lock()
+    _pg_pool_lock = threading.Lock()
+
+    # MSSQL connection pools (class-level, shared across instances)
+    _mssql_pools: Dict[str, MssqlConnectionPool] = {}
+    _mssql_pool_lock = threading.Lock()
 
     def __init__(self, mssql_conn_id: str, postgres_conn_id: str):
         """
@@ -484,6 +655,7 @@ class DataTransfer:
         """
         self.mssql_hook = OdbcConnectionHelper(odbc_conn_id=mssql_conn_id)
         self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+        self._mssql_conn_id = mssql_conn_id
         self._postgres_conn_id = postgres_conn_id
 
         # Get direct MSSQL connection parameters for keyset pagination
@@ -505,7 +677,7 @@ class DataTransfer:
 
         # Initialize shared PostgreSQL connection pool for this connection ID
         if postgres_conn_id not in DataTransfer._postgres_pools:
-            with DataTransfer._pool_lock:
+            with DataTransfer._pg_pool_lock:
                 if postgres_conn_id not in DataTransfer._postgres_pools:
                     pg_conn = self.postgres_hook.get_connection(postgres_conn_id)
                     DataTransfer._postgres_pools[postgres_conn_id] = pg_pool.ThreadedConnectionPool(
@@ -517,6 +689,31 @@ class DataTransfer:
                         user=pg_conn.login,
                         password=pg_conn.password,
                     )
+
+        # Initialize shared MSSQL connection pool for this connection ID
+        self._init_mssql_pool()
+
+    def _init_mssql_pool(self) -> None:
+        """Initialize shared MSSQL connection pool for this connection ID."""
+        conn_id = self._mssql_conn_id
+
+        if conn_id not in DataTransfer._mssql_pools:
+            with DataTransfer._mssql_pool_lock:
+                # Double-check after acquiring lock
+                if conn_id not in DataTransfer._mssql_pools:
+                    max_conn = int(os.environ.get('MAX_MSSQL_CONNECTIONS', '12'))
+                    min_conn = max(1, max_conn // 4)
+
+                    DataTransfer._mssql_pools[conn_id] = MssqlConnectionPool(
+                        mssql_config=self._mssql_config,
+                        min_conn=min_conn,
+                        max_conn=max_conn,
+                    )
+                    logger.info(f"Created MSSQL pool for {conn_id}: max={max_conn}")
+
+    def _get_mssql_pool(self) -> MssqlConnectionPool:
+        """Get the MSSQL pool for this connection ID."""
+        return DataTransfer._mssql_pools.get(self._mssql_conn_id)
 
     def _acquire_postgres_connection(self):
         pool = DataTransfer._postgres_pools.get(self._postgres_conn_id)
@@ -548,13 +745,18 @@ class DataTransfer:
 
     @contextlib.contextmanager
     def _mssql_connection(self):
-        # Build ODBC connection string from config dict
-        conn_str = ';'.join([f"{k}={v}" for k, v in self._mssql_config.items() if v])
-        conn = pyodbc.connect(conn_str)
+        """
+        Context manager for MSSQL connection from the pool.
+
+        Uses the global MSSQL connection pool for consistency and to limit
+        total concurrent connections.
+        """
+        pool = self._get_mssql_pool()
+        conn = pool.acquire()
         try:
             yield conn
         finally:
-            conn.close()
+            pool.release(conn)
 
     def transfer_table(
         self,
@@ -722,7 +924,7 @@ class DataTransfer:
                         )
 
                         parallel_reader = ParallelReader(
-                            mssql_config=self._mssql_config,
+                            mssql_pool=self._get_mssql_pool(),
                             num_readers=num_readers,
                             queue_size=queue_size,
                         )
@@ -839,7 +1041,7 @@ class DataTransfer:
 
                         if pk_boundaries and len(pk_boundaries) > 1:
                             parallel_reader = ParallelReader(
-                                mssql_config=self._mssql_config,
+                                mssql_pool=self._get_mssql_pool(),
                                 num_readers=len(pk_boundaries),
                                 queue_size=queue_size,
                             )
