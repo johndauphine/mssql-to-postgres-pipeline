@@ -75,16 +75,21 @@ For maximum throughput, a companion [Rust CLI tool](https://github.com/johndauph
 
 | Metric | Airflow Pipeline | Rust CLI | Difference |
 |--------|------------------|----------|------------|
-| Full Migration | 2.5 min (150s) | 61.7s | 59% faster |
-| Throughput | 125K rows/sec | 313K rows/sec | 2.5x faster |
-| Upsert Mode | ~125K rows/sec | 126-157K rows/sec | Comparable |
-| Memory Usage | ~2-4GB | ~50MB | 40-80x less |
+| Full Migration | 2.5 min (150s) | 61.7s | Rust 2.5x faster |
+| Full Throughput | 125K rows/sec | 313K rows/sec | Rust 2.5x faster |
+| Incremental Sync | ~65K rows/sec | ~80K rows/sec | Rust ~20% faster |
+| Memory Usage | ~2-4GB | ~50MB | Rust 40-80x less |
 
-**Why Rust is faster:**
-- UNLOGGED tables (+65% throughput)
+**Why the gap is smaller for incremental sync:**
+- Both use the same staging table + `IS DISTINCT FROM` pattern
+- PostgreSQL's upsert logic becomes the bottleneck, not I/O
+- Rust's advantages (binary COPY, async I/O) matter less when PostgreSQL is doing the heavy lifting
+
+**Why Rust is still faster overall:**
 - Binary COPY protocol (reduced serialization)
-- Higher parallelism (14 readers vs 1-2 per table)
+- Higher parallelism (8+ readers vs 1 per table)
 - Native async I/O (tokio vs Python threads)
+- UNLOGGED tables for full migration
 
 **When to use each:**
 - **Airflow Pipeline**: Scheduling, monitoring, UI, team visibility, complex workflows
