@@ -361,7 +361,7 @@ class DiffDetector:
             return existing
         except Exception as e:
             logger.error(f"Error finding existing PKs: {e}")
-            return set()
+            raise
         finally:
             if conn:
                 conn.close()
@@ -458,18 +458,21 @@ class DiffDetector:
         for i in range(0, len(pks), sub_batch_size):
             batch = pks[i:i + sub_batch_size]
 
-            # Build WHERE clause for this batch
+            # Build parameterized WHERE clause for this batch
             if len(pk_columns) == 1:
-                pk_values = ', '.join([self._format_pk_value(pk[0]) for pk in batch])
-                where_clause = f"[{pk_columns[0]}] IN ({pk_values})"
+                placeholders = ', '.join(['?' for _ in batch])
+                where_clause = f"[{pk_columns[0]}] IN ({placeholders})"
+                params = [pk[0] for pk in batch]
             else:
+                # Composite PK - use OR of AND conditions with parameters
                 conditions = []
+                params = []
                 for pk in batch:
                     pk_condition = ' AND '.join([
-                        f"[{col}] = {self._format_pk_value(val)}"
-                        for col, val in zip(pk_columns, pk)
+                        f"[{col}] = ?" for col in pk_columns
                     ])
                     conditions.append(f"({pk_condition})")
+                    params.extend(pk)
                 where_clause = ' OR '.join(conditions)
 
             query = f"""
@@ -478,7 +481,7 @@ class DiffDetector:
                 WHERE {where_clause}
             """
 
-            result = self.mssql_hook.get_records(query)
+            result = self.mssql_hook.get_records(query, params)
             if result:
                 for row in result:
                     all_hashes[tuple(row[:num_pk_cols])] = row[num_pk_cols]
@@ -556,25 +559,10 @@ class DiffDetector:
             return all_hashes
         except Exception as e:
             logger.error(f"Error getting target row hashes: {e}")
-            return {}
+            raise
         finally:
             if conn:
                 conn.close()
-
-    def _format_pk_value(self, value: Any) -> str:
-        """Format a PK value for SQL IN clause."""
-        if value is None:
-            return "NULL"
-        elif isinstance(value, str):
-            # Escape single quotes
-            escaped = value.replace("'", "''")
-            return f"'{escaped}'"
-        elif isinstance(value, (int, float)):
-            return str(value)
-        else:
-            # For other types (datetime, uuid, etc.), convert to string
-            escaped = str(value).replace("'", "''")
-            return f"'{escaped}'"
 
 
 def detect_table_changes(

@@ -16,6 +16,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Max error message length to store in database
+# Keeps error_message column manageable while preserving useful context
+MAX_ERROR_MESSAGE_LENGTH = 4000
 
 # State table DDL
 STATE_TABLE_DDL = """
@@ -179,7 +182,7 @@ class IncrementalStateManager:
                         checkpoint_batch_num = 0,
                         error_message = NULL,
                         retry_count = _migration_state.retry_count +
-                            CASE WHEN _migration_state.sync_status = 'failed' THEN 1 ELSE 0 END
+                            CASE WHEN _migration_state.sync_status IN ('failed', 'running') THEN 1 ELSE 0 END
                     RETURNING id
                     """,
                     (table_name, source_schema, target_schema, source_row_count)
@@ -303,9 +306,15 @@ class IncrementalStateManager:
                 if not last_pk_json:
                     return None
 
+                # Handle JSONB: psycopg2 returns dict for JSONB, but handle str for safety
+                if isinstance(last_pk_json, (str, bytes)):
+                    last_pk = json.loads(last_pk_json)
+                else:
+                    last_pk = last_pk_json
+
                 return {
                     'sync_id': sync_id,
-                    'last_pk': json.loads(last_pk_json) if isinstance(last_pk_json, str) else last_pk_json,
+                    'last_pk': last_pk,
                     'batch_num': batch_num,
                     'rows_inserted': inserted,
                     'rows_updated': updated,
@@ -390,7 +399,7 @@ class IncrementalStateManager:
                         error_message = %s
                     WHERE id = %s
                     """,
-                    (error[:4000] if error else None, sync_id)  # Truncate long errors
+                    (error[:MAX_ERROR_MESSAGE_LENGTH] if error else None, sync_id)
                 )
             conn.commit()
             logger.warning(f"Failed sync: sync_id={sync_id}, error={error[:100]}...")
@@ -521,6 +530,7 @@ class IncrementalStateManager:
         Check if a target table exists and has data.
 
         Used to determine if incremental mode is appropriate.
+        Uses a single query that returns False if table doesn't exist.
 
         Args:
             table_name: Name of the table
@@ -529,34 +539,27 @@ class IncrementalStateManager:
         Returns:
             True if table exists and has at least one row
         """
+        from psycopg2 import sql as psql
+        from psycopg2 import errors as psy_errors
+
         conn = None
         try:
             conn = self._hook.get_conn()
             with conn.cursor() as cursor:
-                # Check if table exists
-                cursor.execute(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_schema = %s AND table_name = %s
+                # Single query: check if table exists and has at least one row
+                # If table doesn't exist, psycopg2 raises UndefinedTable
+                try:
+                    cursor.execute(
+                        psql.SQL("SELECT EXISTS (SELECT 1 FROM {}.{} LIMIT 1)").format(
+                            psql.Identifier(target_schema),
+                            psql.Identifier(table_name)
+                        )
                     )
-                    """,
-                    (target_schema, table_name)
-                )
-                exists = cursor.fetchone()[0]
-
-                if not exists:
+                    return cursor.fetchone()[0]
+                except psy_errors.UndefinedTable:
+                    # Table does not exist
+                    conn.rollback()  # Clear the error state
                     return False
-
-                # Check if table has data (using LIMIT 1 for efficiency)
-                from psycopg2 import sql as psql
-                cursor.execute(
-                    psql.SQL("SELECT 1 FROM {}.{} LIMIT 1").format(
-                        psql.Identifier(target_schema),
-                        psql.Identifier(table_name)
-                    )
-                )
-                return cursor.fetchone() is not None
         except Exception as e:
             logger.warning(f"Error checking target table: {e}")
             return False

@@ -19,7 +19,7 @@ from airflow.decorators import dag, task
 from airflow.models.param import Param
 from pendulum import datetime
 from datetime import timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import logging
 import os
 
@@ -31,7 +31,7 @@ DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '10000
 # Import migration modules
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.incremental_state import IncrementalStateManager
-from mssql_pg_migration.diff_detector import DiffDetector, detect_table_changes
+from mssql_pg_migration.diff_detector import DiffDetector
 from mssql_pg_migration.data_transfer import transfer_incremental
 
 logger = logging.getLogger(__name__)
@@ -418,7 +418,7 @@ def mssql_to_postgres_incremental():
     sync_results = sync_table.expand(table_info=tables)
 
     # Collect results
-    summary = collect_results(sync_results)
+    collect_results(sync_results)
 
 
 # Instantiate the DAG

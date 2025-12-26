@@ -2026,6 +2026,11 @@ def upsert_rows(
     if not rows:
         return 0, 0
 
+    # Validate pk_columns are subset of columns
+    missing_pks = set(pk_columns) - set(columns)
+    if missing_pks:
+        raise ValueError(f"PK columns not in column list: {missing_pks}")
+
     # Build column lists
     all_cols = sql.SQL(', ').join([sql.Identifier(c) for c in columns])
     pk_cols = sql.SQL(', ').join([sql.Identifier(c) for c in pk_columns])
@@ -2089,11 +2094,11 @@ def upsert_rows(
             cursor.execute(query, params)
             results = cursor.fetchall()
 
-            # Count inserts vs updates
-            inserted = sum(1 for r in results if r[0])
-            updated = len(results) - inserted
+            # Count inserts vs updates (xmax = 0 means row was inserted)
+            inserted_count = sum(1 for r in results if r[0])
+            updated_count = len(results) - inserted_count
 
-            return inserted, updated
+            return inserted_count, updated_count
     except Exception as e:
         logger.error(f"Error upserting rows: {e}")
         raise
@@ -2246,9 +2251,13 @@ def _fetch_rows_by_pk(
     columns: List[str],
     pk_columns: List[str],
     pk_values: List[Tuple[Any, ...]],
+    sub_batch_size: int = 1000,
 ) -> List[Tuple[Any, ...]]:
     """
     Fetch rows from source table by primary key values.
+
+    Uses parameterized queries to prevent SQL injection.
+    Processes in sub-batches to avoid query complexity limits.
 
     Args:
         mssql_hook: ODBC connection helper
@@ -2257,6 +2266,7 @@ def _fetch_rows_by_pk(
         columns: Columns to fetch
         pk_columns: PK column names
         pk_values: List of PK tuples
+        sub_batch_size: Max PKs per query batch
 
     Returns:
         List of row tuples
@@ -2266,50 +2276,42 @@ def _fetch_rows_by_pk(
 
     table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
     cols = ', '.join([f'[{c}]' for c in columns])
+    all_rows = []
 
-    # Build WHERE clause
-    if len(pk_columns) == 1:
-        # Single PK - use IN clause
-        pk_col = pk_columns[0]
-        formatted_values = ', '.join([
-            _format_sql_value(pk[0]) for pk in pk_values
-        ])
-        where_clause = f"[{pk_col}] IN ({formatted_values})"
-    else:
-        # Composite PK - use OR of AND conditions
-        conditions = []
-        for pk in pk_values:
-            pk_condition = ' AND '.join([
-                f"[{col}] = {_format_sql_value(val)}"
-                for col, val in zip(pk_columns, pk)
-            ])
-            conditions.append(f"({pk_condition})")
-        where_clause = ' OR '.join(conditions)
+    # Process in sub-batches to avoid query complexity limits
+    for i in range(0, len(pk_values), sub_batch_size):
+        batch = pk_values[i:i + sub_batch_size]
 
-    query = f"""
-        SELECT {cols}
-        FROM [{schema}].[{table}]{table_hint}
-        WHERE {where_clause}
-    """
+        # Build parameterized WHERE clause
+        if len(pk_columns) == 1:
+            # Single PK - use IN clause with parameters
+            pk_col = pk_columns[0]
+            placeholders = ', '.join(['?' for _ in batch])
+            where_clause = f"[{pk_col}] IN ({placeholders})"
+            params = [pk[0] for pk in batch]
+        else:
+            # Composite PK - use OR of AND conditions with parameters
+            conditions = []
+            params = []
+            for pk in batch:
+                pk_condition = ' AND '.join([
+                    f"[{col}] = ?" for col in pk_columns
+                ])
+                conditions.append(f"({pk_condition})")
+                params.extend(pk)
+            where_clause = ' OR '.join(conditions)
 
-    result = mssql_hook.get_records(query)
-    return [tuple(row) for row in result] if result else []
+        query = f"""
+            SELECT {cols}
+            FROM [{schema}].[{table}]{table_hint}
+            WHERE {where_clause}
+        """
 
+        result = mssql_hook.get_records(query, params)
+        if result:
+            all_rows.extend([tuple(row) for row in result])
 
-def _format_sql_value(value: Any) -> str:
-    """Format a value for SQL WHERE clause."""
-    if value is None:
-        return "NULL"
-    elif isinstance(value, str):
-        escaped = value.replace("'", "''")
-        return f"N'{escaped}'"
-    elif isinstance(value, (int, float)):
-        return str(value)
-    elif isinstance(value, bool):
-        return '1' if value else '0'
-    else:
-        escaped = str(value).replace("'", "''")
-        return f"N'{escaped}'"
+    return all_rows
 
 
 class _CSVRowStream(TextIOBase):
