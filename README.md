@@ -20,6 +20,8 @@ An Apache Airflow 3.0 pipeline for automated migrations from Microsoft SQL Serve
 - Parallel readers for overlapped read/write I/O
 - State tracking table for sync progress and resumability
 
+**See Also**: [mssql-pg-migrate-rs](https://github.com/johndauphine/mssql-pg-migrate-rs) - High-performance Rust CLI (2.5x faster, 50MB memory)
+
 ## Features
 
 - **Full Migration**: Complete schema and data migration with automatic type mapping
