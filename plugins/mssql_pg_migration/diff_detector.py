@@ -39,7 +39,7 @@ class DiffDetector:
         self,
         mssql_conn_id: str,
         postgres_conn_id: str,
-        batch_size: int = 100000,
+        batch_size: int = 50000,
     ):
         """
         Initialize the diff detector.
@@ -305,6 +305,7 @@ class DiffDetector:
         table: str,
         pk_columns: List[str],
         source_pks: List[Tuple],
+        sub_batch_size: int = 5000,
     ) -> Set[Tuple]:
         """
         Find which source PKs exist in the target table.
@@ -314,6 +315,7 @@ class DiffDetector:
             table: Target table
             pk_columns: PK column names
             source_pks: List of PK tuples to check
+            sub_batch_size: Max PKs per query to avoid query complexity limits
 
         Returns:
             Set of PK tuples that exist in target
@@ -321,40 +323,42 @@ class DiffDetector:
         if not source_pks:
             return set()
 
+        existing = set()
         conn = None
         try:
             conn = self.postgres_hook.get_conn()
             with conn.cursor() as cursor:
-                # Build query with VALUES clause for efficiency
                 pk_cols_sql = sql.SQL(', ').join([sql.Identifier(c) for c in pk_columns])
-
-                # Create placeholders for VALUES
                 num_cols = len(pk_columns)
-                row_placeholder = sql.SQL('({})').format(
-                    sql.SQL(', ').join([sql.Placeholder()] * num_cols)
-                )
 
-                # Build the query
-                query = sql.SQL("""
-                    SELECT {pk_cols}
-                    FROM {schema}.{table}
-                    WHERE ({pk_cols}) IN (VALUES {values})
-                """).format(
-                    pk_cols=pk_cols_sql,
-                    schema=sql.Identifier(schema),
-                    table=sql.Identifier(table),
-                    values=sql.SQL(', ').join([row_placeholder] * len(source_pks))
-                )
+                # Process in sub-batches to avoid query complexity limits
+                for i in range(0, len(source_pks), sub_batch_size):
+                    batch = source_pks[i:i + sub_batch_size]
 
-                # Flatten the PK tuples for parameter binding
-                params = []
-                for pk in source_pks:
-                    params.extend(pk)
+                    row_placeholder = sql.SQL('({})').format(
+                        sql.SQL(', ').join([sql.Placeholder()] * num_cols)
+                    )
 
-                cursor.execute(query, params)
-                results = cursor.fetchall()
+                    query = sql.SQL("""
+                        SELECT {pk_cols}
+                        FROM {schema}.{table}
+                        WHERE ({pk_cols}) IN (VALUES {values})
+                    """).format(
+                        pk_cols=pk_cols_sql,
+                        schema=sql.Identifier(schema),
+                        table=sql.Identifier(table),
+                        values=sql.SQL(', ').join([row_placeholder] * len(batch))
+                    )
 
-                return {tuple(row) for row in results}
+                    params = []
+                    for pk in batch:
+                        params.extend(pk)
+
+                    cursor.execute(query, params)
+                    results = cursor.fetchall()
+                    existing.update(tuple(row) for row in results)
+
+            return existing
         except Exception as e:
             logger.error(f"Error finding existing PKs: {e}")
             return set()
@@ -419,54 +423,67 @@ class DiffDetector:
         pk_columns: List[str],
         compare_columns: List[str],
         pks: List[Tuple],
+        sub_batch_size: int = 1000,
     ) -> Dict[Tuple, str]:
         """
         Get row hashes from source for comparison.
 
-        Uses SQL Server HASHBYTES for consistent hashing.
+        Uses SQL Server HASHBYTES with MD5 for consistency with PostgreSQL.
+        Processes in sub-batches to avoid query complexity limits.
         """
         if not pks:
             return {}
 
         table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
         pk_cols = ', '.join([f'[{col}]' for col in pk_columns])
-
-        # Build hash expression: HASHBYTES('SHA2_256', CONCAT(...))
-        concat_cols = ' + '.join([
-            f"ISNULL(CAST([{col}] AS NVARCHAR(MAX)), '')"
-            for col in compare_columns
-        ])
-        hash_expr = f"CONVERT(VARCHAR(64), HASHBYTES('SHA2_256', {concat_cols}), 2)"
-
-        # Build WHERE clause for PKs
-        if len(pk_columns) == 1:
-            pk_values = ', '.join([self._format_pk_value(pk[0]) for pk in pks])
-            where_clause = f"[{pk_columns[0]}] IN ({pk_values})"
-        else:
-            # Composite PK - use OR of AND conditions
-            conditions = []
-            for pk in pks:
-                pk_condition = ' AND '.join([
-                    f"[{col}] = {self._format_pk_value(val)}"
-                    for col, val in zip(pk_columns, pk)
-                ])
-                conditions.append(f"({pk_condition})")
-            where_clause = ' OR '.join(conditions)
-
-        query = f"""
-            SELECT {pk_cols}, {hash_expr} as row_hash
-            FROM [{schema}].[{table}]{table_hint}
-            WHERE {where_clause}
-        """
-
-        result = self.mssql_hook.get_records(query)
-
-        # Build dict mapping PK tuple -> hash
         num_pk_cols = len(pk_columns)
-        return {
-            tuple(row[:num_pk_cols]): row[num_pk_cols]
-            for row in result
-        } if result else {}
+
+        # Build hash expression: HASHBYTES('MD5', CONCAT(...))
+        # Use MD5 to match PostgreSQL's MD5() function
+        # Use pipe delimiter and explicit formatting for consistency
+        # IMPORTANT: Use VARCHAR (not NVARCHAR) so byte encoding matches PostgreSQL UTF-8
+        col_exprs = []
+        for col in compare_columns:
+            # Use CONVERT style 126 for datetime (ISO format) for consistent formatting
+            # Convert to VARCHAR (single-byte) for consistent hashing with PostgreSQL
+            col_exprs.append(
+                f"ISNULL(CONVERT(VARCHAR(MAX), [{col}], 126), '')"
+            )
+        concat_cols = " + '|' + ".join(col_exprs)
+        hash_expr = f"LOWER(CONVERT(VARCHAR(32), HASHBYTES('MD5', CONVERT(VARCHAR(MAX), {concat_cols})), 2))"
+
+        all_hashes = {}
+
+        # Process in sub-batches
+        for i in range(0, len(pks), sub_batch_size):
+            batch = pks[i:i + sub_batch_size]
+
+            # Build WHERE clause for this batch
+            if len(pk_columns) == 1:
+                pk_values = ', '.join([self._format_pk_value(pk[0]) for pk in batch])
+                where_clause = f"[{pk_columns[0]}] IN ({pk_values})"
+            else:
+                conditions = []
+                for pk in batch:
+                    pk_condition = ' AND '.join([
+                        f"[{col}] = {self._format_pk_value(val)}"
+                        for col, val in zip(pk_columns, pk)
+                    ])
+                    conditions.append(f"({pk_condition})")
+                where_clause = ' OR '.join(conditions)
+
+            query = f"""
+                SELECT {pk_cols}, {hash_expr} as row_hash
+                FROM [{schema}].[{table}]{table_hint}
+                WHERE {where_clause}
+            """
+
+            result = self.mssql_hook.get_records(query)
+            if result:
+                for row in result:
+                    all_hashes[tuple(row[:num_pk_cols])] = row[num_pk_cols]
+
+        return all_hashes
 
     def _get_target_row_hashes(
         self,
@@ -475,58 +492,68 @@ class DiffDetector:
         pk_columns: List[str],
         compare_columns: List[str],
         pks: List[Tuple],
+        sub_batch_size: int = 5000,
     ) -> Dict[Tuple, str]:
         """
         Get row hashes from target for comparison.
 
         Uses PostgreSQL MD5 for consistent hashing.
+        Processes in sub-batches to avoid query complexity limits.
         """
         if not pks:
             return {}
 
+        all_hashes = {}
         conn = None
         try:
             conn = self.postgres_hook.get_conn()
             with conn.cursor() as cursor:
-                # Build hash expression: MD5(col1 || col2 || ...)
-                concat_cols = " || ".join([
-                    f"COALESCE({sql.Identifier(col).as_string(conn)}::TEXT, '')"
-                    for col in compare_columns
-                ])
+                # Build hash expression: MD5(col1 || '|' || col2 || ...)
+                # Use pipe delimiter for consistency with SQL Server
+                # Replace space with T in timestamps to match SQL Server CONVERT 126 format
+                col_exprs = []
+                for col in compare_columns:
+                    col_id = sql.Identifier(col).as_string(conn)
+                    # Replace first space with T for ISO timestamp format
+                    col_exprs.append(
+                        f"COALESCE(REGEXP_REPLACE({col_id}::TEXT, '^(\\d{{4}}-\\d{{2}}-\\d{{2}}) ', '\\1T'), '')"
+                    )
+                concat_cols = " || '|' || ".join(col_exprs)
 
                 pk_cols_sql = sql.SQL(', ').join([sql.Identifier(c) for c in pk_columns])
-
-                # Build VALUES clause for PK filter
                 num_cols = len(pk_columns)
-                row_placeholder = sql.SQL('({})').format(
-                    sql.SQL(', ').join([sql.Placeholder()] * num_cols)
-                )
 
-                query = sql.SQL("""
-                    SELECT {pk_cols}, MD5({hash_expr}) as row_hash
-                    FROM {schema}.{table}
-                    WHERE ({pk_cols}) IN (VALUES {values})
-                """).format(
-                    pk_cols=pk_cols_sql,
-                    hash_expr=sql.SQL(concat_cols),
-                    schema=sql.Identifier(schema),
-                    table=sql.Identifier(table),
-                    values=sql.SQL(', ').join([row_placeholder] * len(pks))
-                )
+                # Process in sub-batches
+                for i in range(0, len(pks), sub_batch_size):
+                    batch = pks[i:i + sub_batch_size]
 
-                # Flatten params
-                params = []
-                for pk in pks:
-                    params.extend(pk)
+                    row_placeholder = sql.SQL('({})').format(
+                        sql.SQL(', ').join([sql.Placeholder()] * num_cols)
+                    )
 
-                cursor.execute(query, params)
-                results = cursor.fetchall()
+                    query = sql.SQL("""
+                        SELECT {pk_cols}, MD5({hash_expr}) as row_hash
+                        FROM {schema}.{table}
+                        WHERE ({pk_cols}) IN (VALUES {values})
+                    """).format(
+                        pk_cols=pk_cols_sql,
+                        hash_expr=sql.SQL(concat_cols),
+                        schema=sql.Identifier(schema),
+                        table=sql.Identifier(table),
+                        values=sql.SQL(', ').join([row_placeholder] * len(batch))
+                    )
 
-                # Build dict mapping PK tuple -> hash
-                return {
-                    tuple(row[:num_cols]): row[num_cols]
-                    for row in results
-                } if results else {}
+                    params = []
+                    for pk in batch:
+                        params.extend(pk)
+
+                    cursor.execute(query, params)
+                    results = cursor.fetchall()
+                    if results:
+                        for row in results:
+                            all_hashes[tuple(row[:num_cols])] = row[num_cols]
+
+            return all_hashes
         except Exception as e:
             logger.error(f"Error getting target row hashes: {e}")
             return {}

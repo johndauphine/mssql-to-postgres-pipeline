@@ -1870,6 +1870,33 @@ class DataTransfer:
 
         return value
 
+    def _normalize_value_for_insert(self, value: Any) -> Any:
+        """
+        Normalize Python values for parameterized INSERT/UPDATE queries.
+
+        Unlike _normalize_value (for COPY), this preserves Python None for NULL
+        so psycopg2 parameter binding works correctly.
+        """
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return value
+        if isinstance(value, dt_time):
+            return value
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+
+        return value
+
 
 def transfer_table_data(
     mssql_conn_id: str,
@@ -2156,9 +2183,9 @@ def transfer_incremental(
                 if not rows:
                     continue
 
-                # Normalize values for PostgreSQL
+                # Normalize values for PostgreSQL INSERT (not COPY)
                 normalized_rows = [
-                    tuple(transfer._normalize_value(v) for v in row)
+                    tuple(transfer._normalize_value_for_insert(v) for v in row)
                     for row in rows
                 ]
 
