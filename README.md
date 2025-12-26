@@ -66,6 +66,29 @@ See [docs/PARALLEL_PARTITIONING.md](docs/PARALLEL_PARTITIONING.md) for details o
 | PostLinks | 149,313 |
 | LinkTypes | 3 |
 
+### Comparison with Rust CLI
+
+For maximum throughput, a companion [Rust CLI tool](https://github.com/johndauphine/mssql-pg-migrate-rs) is available:
+
+| Metric | Airflow Pipeline | Rust CLI | Difference |
+|--------|------------------|----------|------------|
+| Full Migration | 2.5 min (150s) | 61.7s | 59% faster |
+| Throughput | 125K rows/sec | 313K rows/sec | 2.5x faster |
+| Upsert Mode | ~125K rows/sec | 126-157K rows/sec | Comparable |
+| Memory Usage | ~2-4GB | ~50MB | 40-80x less |
+
+**Why Rust is faster:**
+- UNLOGGED tables (+65% throughput)
+- Binary COPY protocol (reduced serialization)
+- Higher parallelism (14 readers vs 1-2 per table)
+- Native async I/O (tokio vs Python threads)
+
+**When to use each:**
+- **Airflow Pipeline**: Scheduling, monitoring, UI, team visibility, complex workflows
+- **Rust CLI**: Maximum speed, resource-constrained environments, CI/CD pipelines
+
+The Rust CLI can also be called from Airflow via BashOperator for best of both worlds.
+
 ## How It Works
 
 The pipeline executes as a single Airflow DAG with the following stages:
