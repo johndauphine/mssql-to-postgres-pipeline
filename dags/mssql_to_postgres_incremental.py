@@ -33,6 +33,8 @@ import os
 # Configuration from environment
 MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
 MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
+# Batch size increased from 10K to 100K for staging table approach which uses bulk COPY.
+# Environments with very wide rows may need to lower via DEFAULT_INCREMENTAL_BATCH_SIZE env var.
 DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '100000'))
 
 # Import migration modules
