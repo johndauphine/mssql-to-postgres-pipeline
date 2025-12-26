@@ -2104,6 +2104,404 @@ def upsert_rows(
         raise
 
 
+def upsert_from_staging(
+    postgres_conn,
+    staging_schema: str,
+    staging_table: str,
+    target_schema: str,
+    target_table: str,
+    columns: List[str],
+    pk_columns: List[str],
+) -> Tuple[int, int]:
+    """
+    Upsert from staging table using IS DISTINCT FROM for efficient change detection.
+
+    This is the key optimization over hash-based comparison:
+    - PostgreSQL's IS DISTINCT FROM handles NULL-safe comparison
+    - Only rows that actually changed are updated (via WHERE clause)
+    - The optimizer can use indexes efficiently
+
+    The approach:
+    1. INSERT from staging ON CONFLICT DO UPDATE
+    2. WHERE clause checks if any non-PK column IS DISTINCT FROM EXCLUDED
+    3. Only rows with actual changes trigger updates
+
+    Args:
+        postgres_conn: Active PostgreSQL connection
+        staging_schema: Schema containing staging table
+        staging_table: Staging table name (with new data)
+        target_schema: Target schema name
+        target_table: Target table name
+        columns: List of all column names
+        pk_columns: List of primary key column names
+
+    Returns:
+        Tuple of (inserted_count, updated_count)
+    """
+    # Build column lists
+    all_cols = sql.SQL(', ').join([sql.Identifier(c) for c in columns])
+    pk_cols = sql.SQL(', ').join([sql.Identifier(c) for c in pk_columns])
+
+    # Non-PK columns for UPDATE SET and WHERE clause
+    non_pk_columns = [c for c in columns if c not in pk_columns]
+
+    if non_pk_columns:
+        # UPDATE SET clause
+        update_set = sql.SQL(', ').join([
+            sql.SQL('{} = EXCLUDED.{}').format(
+                sql.Identifier(c), sql.Identifier(c)
+            )
+            for c in non_pk_columns
+        ])
+
+        # WHERE clause: only update if at least one column IS DISTINCT FROM
+        # This is the key optimization - skip updates for unchanged rows
+        where_conditions = sql.SQL(' OR ').join([
+            sql.SQL('{}.{} IS DISTINCT FROM EXCLUDED.{}').format(
+                sql.Identifier(target_table),
+                sql.Identifier(c),
+                sql.Identifier(c)
+            )
+            for c in non_pk_columns
+        ])
+
+        query = sql.SQL("""
+            INSERT INTO {target_schema}.{target_table} ({columns})
+            SELECT {columns} FROM {staging_schema}.{staging_table}
+            ON CONFLICT ({pk}) DO UPDATE SET {update_set}
+            WHERE {where_clause}
+            RETURNING (xmax = 0) AS inserted
+        """).format(
+            target_schema=sql.Identifier(target_schema),
+            target_table=sql.Identifier(target_table),
+            columns=all_cols,
+            staging_schema=sql.Identifier(staging_schema),
+            staging_table=sql.Identifier(staging_table),
+            pk=pk_cols,
+            update_set=update_set,
+            where_clause=where_conditions,
+        )
+    else:
+        # All columns are PK - do nothing on conflict
+        query = sql.SQL("""
+            INSERT INTO {target_schema}.{target_table} ({columns})
+            SELECT {columns} FROM {staging_schema}.{staging_table}
+            ON CONFLICT ({pk}) DO NOTHING
+            RETURNING (xmax = 0) AS inserted
+        """).format(
+            target_schema=sql.Identifier(target_schema),
+            target_table=sql.Identifier(target_table),
+            columns=all_cols,
+            staging_schema=sql.Identifier(staging_schema),
+            staging_table=sql.Identifier(staging_table),
+            pk=pk_cols,
+        )
+
+    try:
+        with postgres_conn.cursor() as cursor:
+            cursor.execute(query)
+            results = cursor.fetchall()
+
+            # Count inserts vs updates (xmax = 0 means row was inserted)
+            inserted_count = sum(1 for r in results if r[0])
+            updated_count = len(results) - inserted_count
+
+            return inserted_count, updated_count
+    except Exception as e:
+        logger.error(f"Error upserting from staging: {e}")
+        raise
+
+
+def _create_staging_table(
+    postgres_conn,
+    schema_name: str,
+    source_table: str,
+    staging_table: str,
+) -> None:
+    """
+    Create an UNLOGGED staging table with same structure as source.
+
+    UNLOGGED tables don't write to WAL, making them much faster for
+    temporary data that doesn't need to survive a crash.
+    """
+    query = sql.SQL("""
+        CREATE UNLOGGED TABLE {schema}.{staging}
+        (LIKE {schema}.{source} INCLUDING DEFAULTS)
+    """).format(
+        schema=sql.Identifier(schema_name),
+        staging=sql.Identifier(staging_table),
+        source=sql.Identifier(source_table),
+    )
+
+    with postgres_conn.cursor() as cursor:
+        cursor.execute(query)
+
+
+def _drop_staging_table(
+    postgres_conn,
+    schema_name: str,
+    staging_table: str,
+) -> None:
+    """Drop the staging table if it exists."""
+    query = sql.SQL("DROP TABLE IF EXISTS {schema}.{table}").format(
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(staging_table),
+    )
+
+    with postgres_conn.cursor() as cursor:
+        cursor.execute(query)
+
+
+def _write_to_staging(
+    postgres_conn,
+    schema_name: str,
+    table_name: str,
+    columns: List[str],
+    rows: List[Tuple[Any, ...]],
+    normalize_value,
+) -> int:
+    """
+    Write rows to staging table using COPY for speed.
+
+    Args:
+        postgres_conn: PostgreSQL connection
+        schema_name: Schema name
+        table_name: Table name (staging table)
+        columns: Column names
+        rows: Rows to write
+        normalize_value: Value normalization function
+
+    Returns:
+        Number of rows written
+    """
+    if not rows:
+        return 0
+
+    quoted_columns = sql.SQL(', ').join([sql.Identifier(col) for col in columns])
+    copy_sql = sql.SQL(
+        "COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '\\N')"
+    ).format(
+        sql.Identifier(schema_name),
+        sql.Identifier(table_name),
+        quoted_columns
+    )
+
+    stream = _CSVRowStream(rows, normalize_value)
+    with postgres_conn.cursor() as cursor:
+        cursor.copy_expert(copy_sql, stream)
+
+    return len(rows)
+
+
+def transfer_incremental_staging(
+    mssql_conn_id: str,
+    postgres_conn_id: str,
+    table_info: Dict[str, Any],
+    chunk_size: int = 100000,
+) -> Dict[str, Any]:
+    """
+    Transfer table data using staging table pattern for efficient incremental sync.
+
+    This approach is significantly faster than hash-based change detection:
+    1. Create UNLOGGED temp staging table (fast, no WAL)
+    2. COPY all source rows to staging (bulk load)
+    3. Upsert from staging using INSERT...ON CONFLICT with IS DISTINCT FROM
+    4. Drop staging table
+
+    The IS DISTINCT FROM clause ensures only rows that actually changed
+    are updated, eliminating the need for expensive hash comparisons.
+
+    Args:
+        mssql_conn_id: SQL Server connection ID
+        postgres_conn_id: PostgreSQL connection ID
+        table_info: Table information including schema, columns, and pk_columns
+        chunk_size: Rows per chunk for COPY to staging
+
+    Returns:
+        Transfer result dictionary with rows_inserted, rows_updated, etc.
+    """
+    import uuid
+
+    start_time = time.time()
+
+    source_schema = table_info.get('source_schema', 'dbo')
+    source_table = table_info['table_name']
+    target_schema = table_info.get('target_schema', 'public')
+    target_table = table_info.get('target_table', source_table)
+    columns = table_info.get('columns', [])
+    pk_columns = table_info.get('pk_columns', [])
+
+    # Handle pk_columns as dict from schema extractor
+    if isinstance(pk_columns, dict):
+        pk_columns = [col['name'] for col in pk_columns.get('columns', [])]
+
+    transfer = DataTransfer(mssql_conn_id, postgres_conn_id)
+
+    # Get columns if not provided
+    if not columns:
+        columns = transfer._get_table_columns(source_schema, source_table)
+
+    # Get source row count
+    source_count = transfer._get_row_count(source_schema, source_table, is_source=True)
+
+    logger.info(
+        f"Staging table sync: {source_schema}.{source_table} -> {target_schema}.{target_table}, "
+        f"{source_count:,} source rows"
+    )
+
+    if source_count == 0:
+        return {
+            'table_name': source_table,
+            'source_table': f"{source_schema}.{source_table}",
+            'target_table': f"{target_schema}.{target_table}",
+            'rows_transferred': 0,
+            'rows_inserted': 0,
+            'rows_updated': 0,
+            'rows_unchanged': 0,
+            'elapsed_time_seconds': time.time() - start_time,
+            'success': True,
+            'errors': [],
+        }
+
+    total_inserted = 0
+    total_updated = 0
+    rows_copied = 0
+    errors = []
+
+    # Generate unique staging table name
+    staging_table = f"_staging_{source_table}_{uuid.uuid4().hex[:8]}"
+
+    try:
+        with transfer._postgres_connection() as postgres_conn:
+            # Disable statement timeout
+            with postgres_conn.cursor() as cursor:
+                cursor.execute("SET statement_timeout = 0")
+
+            # Step 1: Create staging table (UNLOGGED for speed)
+            logger.info(f"Creating staging table: {target_schema}.{staging_table}")
+            _create_staging_table(
+                postgres_conn, target_schema, target_table, staging_table
+            )
+            postgres_conn.commit()
+
+            # Step 2: Copy source data to staging in chunks
+            logger.info(f"Copying {source_count:,} rows to staging table...")
+
+            pk_column = pk_columns[0] if pk_columns else columns[0]
+            pk_index = columns.index(pk_column) if pk_column in columns else 0
+
+            with transfer._mssql_connection() as mssql_conn:
+                last_key_value = None
+                chunks_processed = 0
+
+                while rows_copied < source_count:
+                    chunk_start_time = time.time()
+
+                    rows, last_key_value = transfer._read_chunk_keyset(
+                        mssql_conn,
+                        source_schema,
+                        source_table,
+                        columns,
+                        pk_column,
+                        last_key_value,
+                        chunk_size,
+                        pk_index,
+                    )
+
+                    if not rows:
+                        break
+
+                    # Write chunk to staging table
+                    rows_written = _write_to_staging(
+                        postgres_conn,
+                        target_schema,
+                        staging_table,
+                        columns,
+                        rows,
+                        transfer._normalize_value,
+                    )
+
+                    rows_copied += rows_written
+                    chunks_processed += 1
+                    postgres_conn.commit()
+
+                    chunk_time = time.time() - chunk_start_time
+                    rows_per_second = rows_written / chunk_time if chunk_time > 0 else 0
+
+                    if chunks_processed % 10 == 0:
+                        logger.info(
+                            f"Staging progress: {rows_copied:,}/{source_count:,} rows "
+                            f"({rows_per_second:,.0f} rows/sec)"
+                        )
+
+            # Step 3: Upsert from staging to target
+            logger.info(f"Upserting {rows_copied:,} rows from staging to target...")
+            upsert_start = time.time()
+
+            total_inserted, total_updated = upsert_from_staging(
+                postgres_conn,
+                target_schema,
+                staging_table,
+                target_schema,
+                target_table,
+                columns,
+                pk_columns,
+            )
+            postgres_conn.commit()
+
+            upsert_time = time.time() - upsert_start
+            logger.info(
+                f"Upsert complete: {total_inserted:,} inserted, {total_updated:,} updated "
+                f"in {upsert_time:.2f}s"
+            )
+
+            # Step 4: Drop staging table
+            _drop_staging_table(postgres_conn, target_schema, staging_table)
+            postgres_conn.commit()
+
+    except Exception as e:
+        error_msg = f"Error in staging transfer: {str(e)}"
+        logger.error(error_msg)
+        errors.append(error_msg)
+
+        # Cleanup staging table on error
+        try:
+            with transfer._postgres_connection() as cleanup_conn:
+                _drop_staging_table(cleanup_conn, target_schema, staging_table)
+                cleanup_conn.commit()
+        except Exception:
+            pass
+
+    elapsed_time = time.time() - start_time
+    total_rows = total_inserted + total_updated
+    rows_unchanged = rows_copied - total_rows
+
+    result = {
+        'table_name': source_table,
+        'source_table': f"{source_schema}.{source_table}",
+        'target_table': f"{target_schema}.{target_table}",
+        'rows_transferred': total_rows,
+        'rows_inserted': total_inserted,
+        'rows_updated': total_updated,
+        'rows_unchanged': rows_unchanged,
+        'rows_copied_to_staging': rows_copied,
+        'elapsed_time_seconds': elapsed_time,
+        'avg_rows_per_second': rows_copied / elapsed_time if elapsed_time > 0 else 0,
+        'success': len(errors) == 0,
+        'errors': errors,
+    }
+
+    if result['success']:
+        logger.info(
+            f"Staging sync complete: {total_inserted:,} inserted, {total_updated:,} updated, "
+            f"{rows_unchanged:,} unchanged in {elapsed_time:.2f}s"
+        )
+    else:
+        logger.error(f"Staging sync failed: {errors}")
+
+    return result
+
+
 def transfer_incremental(
     mssql_conn_id: str,
     postgres_conn_id: str,

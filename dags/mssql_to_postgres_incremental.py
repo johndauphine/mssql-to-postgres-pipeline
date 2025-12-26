@@ -2,15 +2,22 @@
 SQL Server to PostgreSQL Incremental Migration DAG
 
 This DAG performs incremental data synchronization from SQL Server to PostgreSQL.
-It uses a full-diff comparison strategy:
 
+Default mode (use_staging=True):
+Uses a staging table pattern for efficient sync:
+1. COPY all source rows to an UNLOGGED staging table
+2. Upsert from staging using INSERT...ON CONFLICT with IS DISTINCT FROM
+3. Only rows that actually changed are updated (PostgreSQL handles comparison)
+
+Legacy mode (use_staging=False):
+Uses hash-based comparison (slower):
 1. Compare source vs target primary keys to find new rows
-2. Optionally compare row hashes to find changed rows
-3. Upsert only new/changed rows (ignores deletes - append-only)
+2. Optionally compare MD5 hashes to find changed rows
+3. Upsert only new/changed rows
 
 Requires:
 - Target tables already exist (run full migration first)
-- Tables must have primary keys for diff detection
+- Tables must have primary keys for upsert operations
 
 State is tracked in _migration_state table in target database.
 """
@@ -26,13 +33,15 @@ import os
 # Configuration from environment
 MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
 MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
-DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '10000'))
+# Batch size increased from 10K to 100K for staging table approach which uses bulk COPY.
+# Environments with very wide rows may need to lower via DEFAULT_INCREMENTAL_BATCH_SIZE env var.
+DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '100000'))
 
 # Import migration modules
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.incremental_state import IncrementalStateManager
 from mssql_pg_migration.diff_detector import DiffDetector
-from mssql_pg_migration.data_transfer import transfer_incremental
+from mssql_pg_migration.data_transfer import transfer_incremental, transfer_incremental_staging
 
 logger = logging.getLogger(__name__)
 
@@ -84,24 +93,29 @@ logger = logging.getLogger(__name__)
             type="array",
             description="List of table patterns to exclude"
         ),
+        "use_staging": Param(
+            default=True,
+            type="boolean",
+            description="Use staging table pattern (fast). Set False for legacy hash-based comparison."
+        ),
         "detect_changes": Param(
             default=False,
             type="boolean",
-            description="Compare row hashes to detect changes (slower but finds updates)"
+            description="[Legacy mode only] Compare row hashes to detect changes"
         ),
         "batch_size": Param(
             default=DEFAULT_BATCH_SIZE,
             type="integer",
-            minimum=100,
-            maximum=100000,
-            description="Rows per batch for upsert operations"
+            minimum=1000,
+            maximum=500000,
+            description="Rows per batch for COPY to staging (or upsert in legacy mode)"
         ),
         "diff_batch_size": Param(
             default=100000,
             type="integer",
             minimum=10000,
             maximum=1000000,
-            description="PKs per batch during diff detection"
+            description="[Legacy mode only] PKs per batch during diff detection"
         ),
     },
     tags=["migration", "mssql", "postgres", "etl", "incremental"],
@@ -223,8 +237,15 @@ def mssql_to_postgres_incremental():
         """
         Sync a single table incrementally.
 
+        Default (use_staging=True):
         1. Start sync in state table
-        2. Detect new/changed rows via diff
+        2. COPY all source rows to staging table
+        3. Upsert from staging with IS DISTINCT FROM (only changed rows update)
+        4. Update state with results
+
+        Legacy (use_staging=False):
+        1. Start sync in state table
+        2. Detect new/changed rows via diff (optionally with hash comparison)
         3. Transfer only those rows via upsert
         4. Update state with results
 
@@ -237,17 +258,17 @@ def mssql_to_postgres_incremental():
         params = context["params"]
         source_conn_id = params["source_conn_id"]
         target_conn_id = params["target_conn_id"]
-        detect_changes = params.get("detect_changes", False)
+        use_staging = params.get("use_staging", True)
         batch_size = params.get("batch_size", DEFAULT_BATCH_SIZE)
-        diff_batch_size = params.get("diff_batch_size", 100000)
 
         table_name = table_info["table_name"]
         source_schema = table_info["source_schema"]
         target_schema = table_info["target_schema"]
-        pk_columns = table_info["pk_columns"]
-        columns = table_info.get("columns", [])
 
-        logger.info(f"Starting incremental sync for {source_schema}.{table_name}")
+        logger.info(
+            f"Starting incremental sync for {source_schema}.{table_name} "
+            f"(mode: {'staging' if use_staging else 'legacy'})"
+        )
 
         # Initialize state tracking
         state_manager = IncrementalStateManager(target_conn_id)
@@ -259,91 +280,137 @@ def mssql_to_postgres_incremental():
         )
 
         try:
-            # Detect changes
-            detector = DiffDetector(source_conn_id, target_conn_id, diff_batch_size)
-
-            # Determine columns to compare for change detection
-            compare_columns = None
-            if detect_changes:
-                # Compare all non-PK columns
-                compare_columns = [c for c in columns if c not in pk_columns]
-
-            diff_result = detector.detect_changes(
-                source_schema=source_schema,
-                source_table=table_name,
-                target_schema=target_schema,
-                target_table=table_name,
-                pk_columns=pk_columns,
-                compare_columns=compare_columns,
-            )
-
-            new_count = diff_result["new_count"]
-            changed_count = diff_result["changed_count"]
-            unchanged_count = diff_result["unchanged_count"]
-
-            logger.info(
-                f"{table_name}: {new_count:,} new, {changed_count:,} changed, "
-                f"{unchanged_count:,} unchanged"
-            )
-
-            # If no changes, mark complete and return early
-            if new_count == 0 and changed_count == 0:
-                state_manager.complete_sync(
-                    sync_id=sync_id,
-                    rows_inserted=0,
-                    rows_updated=0,
-                    rows_unchanged=unchanged_count,
-                    target_row_count=diff_result.get("target_count"),
+            if use_staging:
+                # Staging table approach - fast, handles change detection via IS DISTINCT FROM
+                transfer_result = transfer_incremental_staging(
+                    mssql_conn_id=source_conn_id,
+                    postgres_conn_id=target_conn_id,
+                    table_info=table_info,
+                    chunk_size=batch_size,
                 )
+
+                rows_inserted = transfer_result["rows_inserted"]
+                rows_updated = transfer_result["rows_updated"]
+                rows_unchanged = transfer_result.get("rows_unchanged", 0)
+
+                # Update state
+                if transfer_result["success"]:
+                    state_manager.complete_sync(
+                        sync_id=sync_id,
+                        rows_inserted=rows_inserted,
+                        rows_updated=rows_updated,
+                        rows_unchanged=rows_unchanged,
+                    )
+                else:
+                    state_manager.fail_sync(
+                        sync_id=sync_id,
+                        error="; ".join(transfer_result.get("errors", ["Unknown error"])),
+                    )
+
                 return {
                     "table_name": table_name,
-                    "status": "no_changes",
-                    "new_count": 0,
-                    "changed_count": 0,
-                    "unchanged_count": unchanged_count,
-                    "rows_inserted": 0,
-                    "rows_updated": 0,
-                    "success": True,
+                    "status": "synced" if transfer_result["success"] else "failed",
+                    "rows_inserted": rows_inserted,
+                    "rows_updated": rows_updated,
+                    "unchanged_count": rows_unchanged,
+                    "rows_copied_to_staging": transfer_result.get("rows_copied_to_staging", 0),
+                    "elapsed_seconds": transfer_result.get("elapsed_time_seconds", 0),
+                    "success": transfer_result["success"],
+                    "errors": transfer_result.get("errors", []),
                 }
 
-            # Combine new and changed PKs for transfer
-            pks_to_sync = diff_result["new_pks"] + diff_result["changed_pks"]
-
-            # Transfer rows
-            transfer_result = transfer_incremental(
-                mssql_conn_id=source_conn_id,
-                postgres_conn_id=target_conn_id,
-                table_info=table_info,
-                pk_values=pks_to_sync,
-                batch_size=batch_size,
-            )
-
-            # Update state
-            if transfer_result["success"]:
-                state_manager.complete_sync(
-                    sync_id=sync_id,
-                    rows_inserted=transfer_result["rows_inserted"],
-                    rows_updated=transfer_result["rows_updated"],
-                    rows_unchanged=unchanged_count,
-                )
             else:
-                state_manager.fail_sync(
-                    sync_id=sync_id,
-                    error="; ".join(transfer_result.get("errors", ["Unknown error"])),
+                # Legacy hash-based approach
+                detect_changes = params.get("detect_changes", False)
+                diff_batch_size = params.get("diff_batch_size", 100000)
+                pk_columns = table_info["pk_columns"]
+                columns = table_info.get("columns", [])
+
+                # Detect changes
+                detector = DiffDetector(source_conn_id, target_conn_id, diff_batch_size)
+
+                # Determine columns to compare for change detection
+                compare_columns = None
+                if detect_changes:
+                    # Compare all non-PK columns
+                    compare_columns = [c for c in columns if c not in pk_columns]
+
+                diff_result = detector.detect_changes(
+                    source_schema=source_schema,
+                    source_table=table_name,
+                    target_schema=target_schema,
+                    target_table=table_name,
+                    pk_columns=pk_columns,
+                    compare_columns=compare_columns,
                 )
 
-            return {
-                "table_name": table_name,
-                "status": "synced" if transfer_result["success"] else "failed",
-                "new_count": new_count,
-                "changed_count": changed_count,
-                "unchanged_count": unchanged_count,
-                "rows_inserted": transfer_result["rows_inserted"],
-                "rows_updated": transfer_result["rows_updated"],
-                "elapsed_seconds": transfer_result.get("elapsed_time_seconds", 0),
-                "success": transfer_result["success"],
-                "errors": transfer_result.get("errors", []),
-            }
+                new_count = diff_result["new_count"]
+                changed_count = diff_result["changed_count"]
+                unchanged_count = diff_result["unchanged_count"]
+
+                logger.info(
+                    f"{table_name}: {new_count:,} new, {changed_count:,} changed, "
+                    f"{unchanged_count:,} unchanged"
+                )
+
+                # If no changes, mark complete and return early
+                if new_count == 0 and changed_count == 0:
+                    state_manager.complete_sync(
+                        sync_id=sync_id,
+                        rows_inserted=0,
+                        rows_updated=0,
+                        rows_unchanged=unchanged_count,
+                        target_row_count=diff_result.get("target_count"),
+                    )
+                    return {
+                        "table_name": table_name,
+                        "status": "no_changes",
+                        "new_count": 0,
+                        "changed_count": 0,
+                        "unchanged_count": unchanged_count,
+                        "rows_inserted": 0,
+                        "rows_updated": 0,
+                        "success": True,
+                    }
+
+                # Combine new and changed PKs for transfer
+                pks_to_sync = diff_result["new_pks"] + diff_result["changed_pks"]
+
+                # Transfer rows
+                transfer_result = transfer_incremental(
+                    mssql_conn_id=source_conn_id,
+                    postgres_conn_id=target_conn_id,
+                    table_info=table_info,
+                    pk_values=pks_to_sync,
+                    batch_size=batch_size,
+                )
+
+                # Update state
+                if transfer_result["success"]:
+                    state_manager.complete_sync(
+                        sync_id=sync_id,
+                        rows_inserted=transfer_result["rows_inserted"],
+                        rows_updated=transfer_result["rows_updated"],
+                        rows_unchanged=unchanged_count,
+                    )
+                else:
+                    state_manager.fail_sync(
+                        sync_id=sync_id,
+                        error="; ".join(transfer_result.get("errors", ["Unknown error"])),
+                    )
+
+                return {
+                    "table_name": table_name,
+                    "status": "synced" if transfer_result["success"] else "failed",
+                    "new_count": new_count,
+                    "changed_count": changed_count,
+                    "unchanged_count": unchanged_count,
+                    "rows_inserted": transfer_result["rows_inserted"],
+                    "rows_updated": transfer_result["rows_updated"],
+                    "elapsed_seconds": transfer_result.get("elapsed_time_seconds", 0),
+                    "success": transfer_result["success"],
+                    "errors": transfer_result.get("errors", []),
+                }
 
         except Exception as e:
             error_msg = str(e)
