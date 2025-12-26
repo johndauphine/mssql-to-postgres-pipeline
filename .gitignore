@@ -15,3 +15,6 @@ stackoverflow_db/
 
 .mcp.json
 logs/
+
+# Migration state directory
+~/.mssql-pg-migrate/

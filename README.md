@@ -1,15 +1,36 @@
 # SQL Server to PostgreSQL Migration Pipeline
 
-An Apache Airflow 3.0 pipeline for automated, full-refresh migrations from Microsoft SQL Server to PostgreSQL. Uses Docker Compose with LocalExecutor for reliable orchestration and flexible deployment.
+An Apache Airflow 3.0 pipeline for automated migrations from Microsoft SQL Server to PostgreSQL. Supports both full-refresh and incremental sync modes. Uses Docker Compose with LocalExecutor for reliable orchestration and flexible deployment.
+
+## Project Status
+
+**Current Version**: Production-ready with full-refresh and incremental sync support
+
+| Component | Status |
+|-----------|--------|
+| Full Migration | Stable - tested with 100M+ rows |
+| Incremental Sync | Stable - full-diff with hash-based change detection |
+| Parallel Partitioning | Stable - NTILE-based for all PK types |
+| Connection Pooling | Stable - thread-safe pools for MSSQL and PostgreSQL |
+| Validation | Stable - standalone DAG with row count comparison |
+
+**Recent Updates**:
+- Added incremental loading with full-diff comparison
+- Implemented connection pooling for SQL Server and PostgreSQL
+- Parallel readers for overlapped read/write I/O
+- State tracking table for sync progress and resumability
 
 ## Features
 
+- **Full Migration**: Complete schema and data migration with automatic type mapping
+- **Incremental Sync**: Detect and sync only new/changed rows using PK comparison and optional hash-based change detection
 - **Schema Discovery**: Automatically extract table structures, columns, and indexes from SQL Server
 - **Type Mapping**: Convert 30+ SQL Server data types to their PostgreSQL equivalents
 - **Streaming Data Transfer**: Move data efficiently using server-side cursors, keyset pagination, and PostgreSQL's COPY protocol
 - **Validation**: Standalone validation DAG verifies migration success through row count comparisons
 - **Parallelization**: Transfer multiple tables concurrently using Airflow's dynamic task mapping
 - **Large Table Partitioning**: Automatically partitions tables >5M rows into parallel chunks by primary key range
+- **State Tracking**: Track sync progress in `_migration_state` table for resumability and monitoring
 
 ## Performance
 
@@ -59,6 +80,21 @@ Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parall
 4. **Data Transfer**: Streams data using keyset pagination with pyodbc connections and PostgreSQL COPY protocol
 5. **Validation**: Triggers standalone validation DAG that compares source and target row counts
 
+### Incremental Sync Mode
+
+For ongoing synchronization, the pipeline supports incremental loading with full-diff comparison:
+
+1. **Diff Detection**: Compares source and target primary keys to identify new/changed rows
+2. **Hash-Based Change Detection**: Uses MD5 hashing to detect modified rows (optional)
+3. **Upsert Operations**: Inserts new rows and updates changed rows in a single pass
+4. **State Tracking**: The `_migration_state` table tracks sync progress, row counts, and errors
+5. **Resumability**: Interrupted syncs can resume from the last checkpoint
+
+Incremental sync is ideal for:
+- Regular data synchronization (daily/hourly)
+- Large tables where full refresh is too slow
+- Near-real-time replication scenarios
+
 ## Architecture
 
 ### Data Transfer Approach
@@ -66,9 +102,10 @@ Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parall
 The pipeline uses a streaming architecture optimized for large datasets:
 
 - **Keyset Pagination**: Uses primary key ordering instead of OFFSET/FETCH for efficient chunking of large tables
-- **Direct Database Connections**: Uses pymssql and psycopg2 directly to avoid Airflow hook limitations with large datasets
+- **Connection Pooling**: Thread-safe pools for both SQL Server (pyodbc) and PostgreSQL (psycopg2) connections with automatic lifecycle management
 - **PostgreSQL COPY Protocol**: Bulk loads data for maximum throughput
 - **Server-Side Cursors**: Streams rows without loading entire result sets into memory
+- **Parallel Readers**: Optional concurrent SQL Server readers overlap read/write I/O for improved throughput
 
 ### Validation DAG
 
@@ -153,6 +190,7 @@ See [Configuration](#configuration) for details on connecting to remote database
 Configuration is managed through the `.env` file which contains:
 - Resource settings (memory limits, parallelism)
 - Database connection strings
+- Performance tuning parameters
 
 ### Database Connections
 
@@ -188,6 +226,30 @@ The `.env` file contains resource presets for different machine sizes:
 | 64GB+ | High performance settings |
 
 Uncomment the appropriate preset section in `.env` for your machine.
+
+### Performance Tuning
+
+Fine-tune parallelism and connection pooling with these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_PARALLEL_TRANSFERS` | `8` | Concurrent table transfers |
+| `DEFAULT_CHUNK_SIZE` | `200000` | Rows per batch during transfer |
+| `MAX_PARTITIONS` | `8` | Maximum partitions for large tables |
+| `MAX_MSSQL_CONNECTIONS` | `12` | SQL Server connection pool size |
+| `MAX_PG_CONNECTIONS` | `8` | PostgreSQL connection pool size |
+| `PARALLEL_READERS` | `1` | Concurrent SQL Server readers per partition |
+| `READER_QUEUE_SIZE` | `5` | Buffer size between readers and writer |
+| `STRICT_CONSISTENCY` | `false` | Disable NOLOCK hints for strict consistency |
+
+**Connection Pool Recommendations:**
+- Small datasets (<50M rows): `MAX_MSSQL_CONNECTIONS=8-12`
+- Large datasets (>50M rows): `MAX_MSSQL_CONNECTIONS=12-16`
+
+**Parallel Readers:**
+- `PARALLEL_READERS=1`: Default, sequential reads
+- `PARALLEL_READERS=2`: ~20% faster for small datasets (<50M rows)
+- For large datasets, sequential reads (1) is optimal due to connection overhead
 
 ### Applying Configuration Changes
 
@@ -344,6 +406,15 @@ if not column.get('is_nullable', True) and column['data_type'].upper() != 'TEXT'
 ### XCom Serialization
 
 Large validation results can cause XCom serialization issues. The pipeline uses a separate validation DAG with direct database connections to avoid this.
+
+### Consistency vs Performance Trade-off
+
+By default, the pipeline uses `WITH (NOLOCK)` hints for faster reads from SQL Server. This may cause inconsistencies under concurrent writes:
+
+- **Default mode**: Fast but may miss/duplicate rows if source data changes during migration
+- **Strict mode**: Set `STRICT_CONSISTENCY=true` to disable NOLOCK hints for guaranteed consistency (slower)
+
+Use strict mode for production migrations where data accuracy is critical.
 
 ## Dependencies
 
