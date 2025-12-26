@@ -1967,6 +1967,324 @@ def parallel_transfer_tables(
     return results
 
 
+def upsert_rows(
+    postgres_conn,
+    schema_name: str,
+    table_name: str,
+    columns: List[str],
+    pk_columns: List[str],
+    rows: List[Tuple[Any, ...]],
+) -> Tuple[int, int]:
+    """
+    Upsert rows using INSERT...ON CONFLICT DO UPDATE.
+
+    Uses PostgreSQL's INSERT ... ON CONFLICT to efficiently handle
+    both inserts and updates in a single statement.
+
+    The function uses the xmax system column trick to count inserts vs updates:
+    - xmax = 0 means the row was inserted
+    - xmax > 0 means the row was updated
+
+    Args:
+        postgres_conn: Active PostgreSQL connection
+        schema_name: Target schema name
+        table_name: Target table name
+        columns: List of all column names
+        pk_columns: List of primary key column names
+        rows: List of row tuples to upsert
+
+    Returns:
+        Tuple of (inserted_count, updated_count)
+    """
+    if not rows:
+        return 0, 0
+
+    # Build column lists
+    all_cols = sql.SQL(', ').join([sql.Identifier(c) for c in columns])
+    pk_cols = sql.SQL(', ').join([sql.Identifier(c) for c in pk_columns])
+
+    # Non-PK columns for UPDATE SET clause
+    non_pk_columns = [c for c in columns if c not in pk_columns]
+
+    if non_pk_columns:
+        update_set = sql.SQL(', ').join([
+            sql.SQL('{} = EXCLUDED.{}').format(
+                sql.Identifier(c), sql.Identifier(c)
+            )
+            for c in non_pk_columns
+        ])
+    else:
+        # If all columns are PK, just do nothing on conflict
+        update_set = None
+
+    # Build placeholders for VALUES
+    row_placeholder = sql.SQL('({})').format(
+        sql.SQL(', ').join([sql.Placeholder()] * len(columns))
+    )
+
+    # Build the upsert query
+    if update_set:
+        query = sql.SQL("""
+            INSERT INTO {schema}.{table} ({columns})
+            VALUES {values}
+            ON CONFLICT ({pk}) DO UPDATE SET {update_set}
+            RETURNING (xmax = 0) AS inserted
+        """).format(
+            schema=sql.Identifier(schema_name),
+            table=sql.Identifier(table_name),
+            columns=all_cols,
+            values=sql.SQL(', ').join([row_placeholder] * len(rows)),
+            pk=pk_cols,
+            update_set=update_set,
+        )
+    else:
+        # All columns are PK - do nothing on conflict
+        query = sql.SQL("""
+            INSERT INTO {schema}.{table} ({columns})
+            VALUES {values}
+            ON CONFLICT ({pk}) DO NOTHING
+            RETURNING (xmax = 0) AS inserted
+        """).format(
+            schema=sql.Identifier(schema_name),
+            table=sql.Identifier(table_name),
+            columns=all_cols,
+            values=sql.SQL(', ').join([row_placeholder] * len(rows)),
+            pk=pk_cols,
+        )
+
+    # Flatten row tuples for parameter binding
+    params = []
+    for row in rows:
+        params.extend(row)
+
+    try:
+        with postgres_conn.cursor() as cursor:
+            cursor.execute(query, params)
+            results = cursor.fetchall()
+
+            # Count inserts vs updates
+            inserted = sum(1 for r in results if r[0])
+            updated = len(results) - inserted
+
+            return inserted, updated
+    except Exception as e:
+        logger.error(f"Error upserting rows: {e}")
+        raise
+
+
+def transfer_incremental(
+    mssql_conn_id: str,
+    postgres_conn_id: str,
+    table_info: Dict[str, Any],
+    pk_values: List[Tuple[Any, ...]],
+    batch_size: int = 10000,
+) -> Dict[str, Any]:
+    """
+    Transfer specific rows (by PK) for incremental loading.
+
+    Fetches rows from source by PK and upserts into target.
+
+    Args:
+        mssql_conn_id: SQL Server connection ID
+        postgres_conn_id: PostgreSQL connection ID
+        table_info: Table information including schema, columns, and pk_columns
+        pk_values: List of PK tuples to transfer
+        batch_size: Rows per batch for upsert
+
+    Returns:
+        Transfer result dictionary
+    """
+    import time
+
+    if not pk_values:
+        return {
+            'table_name': table_info.get('table_name', 'unknown'),
+            'rows_transferred': 0,
+            'rows_inserted': 0,
+            'rows_updated': 0,
+            'success': True,
+            'errors': [],
+        }
+
+    start_time = time.time()
+    transfer = DataTransfer(mssql_conn_id, postgres_conn_id)
+
+    source_schema = table_info.get('source_schema', 'dbo')
+    source_table = table_info['table_name']
+    target_schema = table_info.get('target_schema', 'public')
+    target_table = table_info.get('target_table', source_table)
+    columns = table_info.get('columns', [])
+    pk_columns = table_info.get('pk_columns', [])
+
+    # Handle pk_columns as dict from schema extractor
+    if isinstance(pk_columns, dict):
+        pk_columns = [col['name'] for col in pk_columns.get('columns', [])]
+
+    # Get columns if not provided
+    if not columns:
+        columns = transfer._get_table_columns(source_schema, source_table)
+
+    logger.info(
+        f"Incremental transfer: {source_schema}.{source_table} -> {target_schema}.{target_table}, "
+        f"{len(pk_values):,} rows to sync"
+    )
+
+    total_inserted = 0
+    total_updated = 0
+    errors = []
+
+    try:
+        with transfer._postgres_connection() as postgres_conn:
+            # Disable statement timeout
+            with postgres_conn.cursor() as cursor:
+                cursor.execute("SET statement_timeout = 0")
+
+            # Process in batches
+            for i in range(0, len(pk_values), batch_size):
+                batch_pks = pk_values[i:i + batch_size]
+
+                # Fetch rows from source by PK
+                rows = _fetch_rows_by_pk(
+                    transfer.mssql_hook,
+                    source_schema,
+                    source_table,
+                    columns,
+                    pk_columns,
+                    batch_pks,
+                )
+
+                if not rows:
+                    continue
+
+                # Normalize values for PostgreSQL
+                normalized_rows = [
+                    tuple(transfer._normalize_value(v) for v in row)
+                    for row in rows
+                ]
+
+                # Upsert into target
+                inserted, updated = upsert_rows(
+                    postgres_conn,
+                    target_schema,
+                    target_table,
+                    columns,
+                    pk_columns,
+                    normalized_rows,
+                )
+
+                total_inserted += inserted
+                total_updated += updated
+                postgres_conn.commit()
+
+                logger.debug(
+                    f"Batch {i // batch_size + 1}: {inserted} inserted, {updated} updated"
+                )
+
+    except Exception as e:
+        error_msg = f"Error in incremental transfer: {str(e)}"
+        logger.error(error_msg)
+        errors.append(error_msg)
+
+    elapsed_time = time.time() - start_time
+    total_rows = total_inserted + total_updated
+
+    result = {
+        'table_name': source_table,
+        'source_table': f"{source_schema}.{source_table}",
+        'target_table': f"{target_schema}.{target_table}",
+        'rows_transferred': total_rows,
+        'rows_inserted': total_inserted,
+        'rows_updated': total_updated,
+        'elapsed_time_seconds': elapsed_time,
+        'avg_rows_per_second': total_rows / elapsed_time if elapsed_time > 0 else 0,
+        'success': len(errors) == 0,
+        'errors': errors,
+    }
+
+    if result['success']:
+        logger.info(
+            f"Incremental transfer complete: {total_inserted:,} inserted, "
+            f"{total_updated:,} updated in {elapsed_time:.2f}s"
+        )
+    else:
+        logger.error(f"Incremental transfer failed: {errors}")
+
+    return result
+
+
+def _fetch_rows_by_pk(
+    mssql_hook: OdbcConnectionHelper,
+    schema: str,
+    table: str,
+    columns: List[str],
+    pk_columns: List[str],
+    pk_values: List[Tuple[Any, ...]],
+) -> List[Tuple[Any, ...]]:
+    """
+    Fetch rows from source table by primary key values.
+
+    Args:
+        mssql_hook: ODBC connection helper
+        schema: Source schema
+        table: Source table
+        columns: Columns to fetch
+        pk_columns: PK column names
+        pk_values: List of PK tuples
+
+    Returns:
+        List of row tuples
+    """
+    if not pk_values:
+        return []
+
+    table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
+    cols = ', '.join([f'[{c}]' for c in columns])
+
+    # Build WHERE clause
+    if len(pk_columns) == 1:
+        # Single PK - use IN clause
+        pk_col = pk_columns[0]
+        formatted_values = ', '.join([
+            _format_sql_value(pk[0]) for pk in pk_values
+        ])
+        where_clause = f"[{pk_col}] IN ({formatted_values})"
+    else:
+        # Composite PK - use OR of AND conditions
+        conditions = []
+        for pk in pk_values:
+            pk_condition = ' AND '.join([
+                f"[{col}] = {_format_sql_value(val)}"
+                for col, val in zip(pk_columns, pk)
+            ])
+            conditions.append(f"({pk_condition})")
+        where_clause = ' OR '.join(conditions)
+
+    query = f"""
+        SELECT {cols}
+        FROM [{schema}].[{table}]{table_hint}
+        WHERE {where_clause}
+    """
+
+    result = mssql_hook.get_records(query)
+    return [tuple(row) for row in result] if result else []
+
+
+def _format_sql_value(value: Any) -> str:
+    """Format a value for SQL WHERE clause."""
+    if value is None:
+        return "NULL"
+    elif isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"N'{escaped}'"
+    elif isinstance(value, (int, float)):
+        return str(value)
+    elif isinstance(value, bool):
+        return '1' if value else '0'
+    else:
+        escaped = str(value).replace("'", "''")
+        return f"N'{escaped}'"
+
+
 class _CSVRowStream(TextIOBase):
     """Lazy text stream that feeds COPY FROM without large buffers."""
 
