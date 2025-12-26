@@ -9,12 +9,13 @@ An Apache Airflow 3.0 pipeline for automated migrations from Microsoft SQL Serve
 | Component | Status |
 |-----------|--------|
 | Full Migration | Stable - tested with 100M+ rows |
-| Incremental Sync | Stable - full-diff with hash-based change detection |
+| Incremental Sync | Stable - staging table pattern with IS DISTINCT FROM |
 | Parallel Partitioning | Stable - NTILE-based for all PK types |
 | Connection Pooling | Stable - thread-safe pools for MSSQL and PostgreSQL |
 | Validation | Stable - standalone DAG with row count comparison |
 
 **Recent Updates**:
+- Staging table pattern for incremental sync (~7x faster than hash-based)
 - Added incremental loading with full-diff comparison
 - Implemented connection pooling for SQL Server and PostgreSQL
 - Parallel readers for overlapped read/write I/O
@@ -25,7 +26,7 @@ An Apache Airflow 3.0 pipeline for automated migrations from Microsoft SQL Serve
 ## Features
 
 - **Full Migration**: Complete schema and data migration with automatic type mapping
-- **Incremental Sync**: Detect and sync only new/changed rows using PK comparison and optional hash-based change detection
+- **Incremental Sync**: Efficient change detection using staging tables and PostgreSQL's IS DISTINCT FROM (legacy hash-based mode available)
 - **Schema Discovery**: Automatically extract table structures, columns, and indexes from SQL Server
 - **Type Mapping**: Convert 30+ SQL Server data types to their PostgreSQL equivalents
 - **Streaming Data Transfer**: Move data efficiently using server-side cursors, keyset pagination, and PostgreSQL's COPY protocol
@@ -107,13 +108,33 @@ Extract Schema -> Create Target Schema -> Create Tables -> Transfer Data (parall
 
 ### Incremental Sync Mode
 
-For ongoing synchronization, the pipeline supports incremental loading with full-diff comparison:
+For ongoing synchronization, the pipeline supports efficient incremental loading using a staging table pattern:
 
-1. **Diff Detection**: Compares source and target primary keys to identify new/changed rows
-2. **Hash-Based Change Detection**: Uses MD5 hashing to detect modified rows (optional)
-3. **Upsert Operations**: Inserts new rows and updates changed rows in a single pass
-4. **State Tracking**: The `_migration_state` table tracks sync progress, row counts, and errors
-5. **Resumability**: Interrupted syncs can resume from the last checkpoint
+**Default Mode (Staging Table)**:
+1. **COPY to Staging**: Bulk load all source rows to an UNLOGGED staging table (no WAL overhead)
+2. **Smart Upsert**: `INSERT...ON CONFLICT DO UPDATE WHERE col IS DISTINCT FROM EXCLUDED.col`
+3. **PostgreSQL Handles Diff**: Only rows that actually changed are updated - no pre-hashing needed
+4. **Cleanup**: Drop staging table after sync
+
+**Performance** (tested on StackOverflow 2013 - 10.5M rows):
+
+| Table | Rows | Time | Throughput |
+|-------|------|------|------------|
+| Users | 2.4M | 45s | ~55K rows/sec |
+| Badges | 8M | 110s | ~73K rows/sec |
+
+The staging table approach is ~7x faster than the legacy hash-based method because:
+- No MD5 hash computation on millions of rows
+- PostgreSQL's `IS DISTINCT FROM` handles NULL-safe comparison natively
+- Single bulk operation instead of per-row hash comparison
+
+**Legacy Mode** (`use_staging=False`):
+- Hash-based change detection using MD5
+- Useful for debugging or when staging tables aren't desired
+
+**State Tracking**:
+- The `_migration_state` table tracks sync progress, row counts, and errors
+- Interrupted syncs can resume from the last checkpoint
 
 Incremental sync is ideal for:
 - Regular data synchronization (daily/hourly)
