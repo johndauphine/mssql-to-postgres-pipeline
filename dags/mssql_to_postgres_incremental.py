@@ -85,7 +85,7 @@ logger = logging.getLogger(__name__)
             description="List of table patterns to exclude"
         ),
         "detect_changes": Param(
-            default=False,
+            default=True,
             type="boolean",
             description="Compare row hashes to detect changes (slower but finds updates)"
         ),
@@ -392,7 +392,7 @@ def mssql_to_postgres_incremental():
             "total_inserted": total_inserted,
             "total_updated": total_updated,
             "total_unchanged": total_unchanged,
-            "details": sync_results,
+            # Note: details removed to avoid XCom serialization issues with large results
         }
 
         logger.info(
