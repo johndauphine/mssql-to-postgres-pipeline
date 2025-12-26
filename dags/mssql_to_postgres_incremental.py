@@ -85,7 +85,7 @@ logger = logging.getLogger(__name__)
             description="List of table patterns to exclude"
         ),
         "detect_changes": Param(
-            default=True,
+            default=False,
             type="boolean",
             description="Compare row hashes to detect changes (slower but finds updates)"
         ),
