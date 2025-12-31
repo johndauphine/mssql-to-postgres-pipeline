@@ -1044,7 +1044,7 @@ class DataTransfer:
             with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
                 # Disable statement timeout for the entire transfer operation
                 with postgres_conn.cursor() as cursor:
-                    cursor.execute("SET statement_timeout = 0")
+                    cursor.execute("SET statement_timeout = '2h'")
 
                 # For partition transfers (not first partition), clean up any existing data
                 # This makes partition retries idempotent - prevents duplicate rows
@@ -1408,7 +1408,7 @@ class DataTransfer:
             conn = self.postgres_hook.get_conn()
             with conn.cursor() as cursor:
                 # Disable statement timeout for COUNT on large tables
-                cursor.execute("SET statement_timeout = 0")
+                cursor.execute("SET statement_timeout = '2h'")
                 cursor.execute(query)
                 count = cursor.fetchone()[0] or 0
         finally:
@@ -1621,7 +1621,7 @@ class DataTransfer:
             conn = self.postgres_hook.get_conn()
             with conn.cursor() as cursor:
                 # Disable statement timeout for large deletes
-                cursor.execute("SET statement_timeout = 0")
+                cursor.execute("SET statement_timeout = '2h'")
                 cursor.execute(query, params)
                 deleted = cursor.rowcount
             conn.commit()
@@ -2667,7 +2667,7 @@ def transfer_incremental_staging(
         with transfer._postgres_connection() as postgres_conn:
             # Disable statement timeout
             with postgres_conn.cursor() as cursor:
-                cursor.execute("SET statement_timeout = 0")
+                cursor.execute("SET statement_timeout = '2h'")
 
             # Step 1: Create staging table (UNLOGGED for speed)
             logger.info(f"Creating staging table: {target_schema}.{staging_table}")
@@ -2859,6 +2859,16 @@ def transfer_incremental_staging_partitioned(
 
     pk_column = pk_columns[0]
 
+    # Validate pk_start and pk_end are integers to prevent SQL injection
+    if not isinstance(pk_start, int) or not isinstance(pk_end, int):
+        logger.error(f"Partition bounds must be integers, got {type(pk_start)} and {type(pk_end)}")
+        return {
+            'table_name': source_table,
+            'partition_id': partition_id,
+            'success': False,
+            'errors': ['Partition bounds must be integers'],
+        }
+
     logger.info(
         f"Partition {partition_id}: Syncing {source_schema}.{source_table} "
         f"(PK range: {pk_start} - {pk_end})"
@@ -2880,9 +2890,9 @@ def transfer_incremental_staging_partitioned(
 
     try:
         with transfer._postgres_connection() as postgres_conn:
-            # Disable statement timeout
+            # Set high statement timeout (2 hours) instead of infinite
             with postgres_conn.cursor() as cursor:
-                cursor.execute("SET statement_timeout = 0")
+                cursor.execute("SET statement_timeout = '2h'")
 
             # Step 1: Create staging table (UNLOGGED for speed)
             _create_staging_table(
@@ -2891,8 +2901,9 @@ def transfer_incremental_staging_partitioned(
             postgres_conn.commit()
 
             # Step 2: Copy partition data to staging
-            # Build WHERE clause for partition
-            where_clause = f"{pk_column} >= {pk_start} AND {pk_column} <= {pk_end}"
+            # Build WHERE clause for partition - pk_column is escaped, values are validated integers
+            safe_pk = pk_column.replace(']', ']]')
+            where_clause = f"[{safe_pk}] >= {int(pk_start)} AND [{safe_pk}] <= {int(pk_end)}"
 
             # Check if binary COPY is enabled
             use_binary = transfer._use_binary_copy
@@ -3071,7 +3082,7 @@ def transfer_incremental(
         with transfer._postgres_connection() as postgres_conn:
             # Disable statement timeout
             with postgres_conn.cursor() as cursor:
-                cursor.execute("SET statement_timeout = 0")
+                cursor.execute("SET statement_timeout = '2h'")
 
             # Process in batches
             for i in range(0, len(pk_values), batch_size):

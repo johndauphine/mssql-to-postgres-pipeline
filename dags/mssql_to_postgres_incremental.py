@@ -274,7 +274,14 @@ def mssql_to_postgres_incremental():
 
                     with helper.get_conn() as conn:
                         cursor = conn.cursor()
-                        query = f"SELECT MIN([{pk_column}]), MAX([{pk_column}]) FROM [{table['source_schema']}].[{table_name}]"
+                        # Use parameterized identifiers via bracket escaping
+                        # Note: pyodbc doesn't support parameterized identifiers, but we
+                        # validate that pk_column comes from schema discovery (trusted source)
+                        # and double any brackets to prevent SQL injection
+                        safe_pk = pk_column.replace(']', ']]')
+                        safe_schema = table['source_schema'].replace(']', ']]')
+                        safe_table = table_name.replace(']', ']]')
+                        query = f"SELECT MIN([{safe_pk}]), MAX([{safe_pk}]) FROM [{safe_schema}].[{safe_table}]"
                         cursor.execute(query)
                         row = cursor.fetchone()
                         pk_min, pk_max = row[0], row[1]
