@@ -44,6 +44,10 @@
 
 ## Optimizations Applied
 
+These optimizations are applied to **both DAGs**:
+- `mssql_to_postgres_migration` - Full migration DAG (drop_recreate/truncate modes)
+- `mssql_to_postgres_incremental` - Incremental sync DAG (upsert mode)
+
 The optimized Airflow pipeline achieves **58% improvement** over baseline (199s → 84s) through:
 
 ### 1. Binary COPY Format (`USE_BINARY_COPY=true`)
@@ -103,18 +107,24 @@ AUTO_TUNE_CHUNK_SIZE=true
 
 ## Running Benchmarks
 
-### Full Migration
+Both DAGs use the same optimizations when enabled via environment variables.
+
+### Full Migration (Optimized)
 
 ```bash
-# Reset PostgreSQL and run full migration
+# Run with all optimizations enabled
+USE_BINARY_COPY=true \
+PARALLEL_READERS=4 \
+MAX_MSSQL_CONNECTIONS=24 \
 docker compose up -d
+
 # Trigger mssql_to_postgres_migration DAG via Airflow UI
 ```
 
 ### Incremental Migration (Optimized)
 
 ```bash
-# Run with all optimizations enabled
+# Run with all optimizations enabled (includes partitioning for large tables)
 USE_BINARY_COPY=true \
 PARTITION_THRESHOLD=1000000 \
 MAX_PARTITIONS_PER_TABLE=6 \
