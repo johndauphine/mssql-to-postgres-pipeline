@@ -36,12 +36,19 @@ MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
 # Batch size increased from 10K to 100K for staging table approach which uses bulk COPY.
 # Environments with very wide rows may need to lower via DEFAULT_INCREMENTAL_BATCH_SIZE env var.
 DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '100000'))
+# Partitioning settings for large tables
+PARTITION_THRESHOLD = int(os.environ.get('PARTITION_THRESHOLD', '1000000'))  # Tables > 1M rows get partitioned
+MAX_PARTITIONS_PER_TABLE = int(os.environ.get('MAX_PARTITIONS_PER_TABLE', '6'))
 
 # Import migration modules
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.incremental_state import IncrementalStateManager
 from mssql_pg_migration.diff_detector import DiffDetector
-from mssql_pg_migration.data_transfer import transfer_incremental, transfer_incremental_staging
+from mssql_pg_migration.data_transfer import (
+    transfer_incremental,
+    transfer_incremental_staging,
+    transfer_incremental_staging_partitioned,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,25 +239,119 @@ def mssql_to_postgres_incremental():
 
         return syncable_tables
 
-    @task(max_active_tis_per_dagrun=MAX_PARALLEL_TRANSFERS)
-    def sync_table(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
+    @task
+    def create_sync_tasks(tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
         """
-        Sync a single table incrementally.
+        Create sync tasks, partitioning large tables for parallel processing.
 
-        Default (use_staging=True):
+        Tables larger than PARTITION_THRESHOLD get split into multiple partitions.
+        Each partition is processed as a separate task for better parallelism.
+
+        Args:
+            tables: List of table info dicts
+
+        Returns:
+            List of sync task configs (may be more than input tables due to partitioning)
+        """
+        params = context["params"]
+        source_conn_id = params["source_conn_id"]
+
+        sync_tasks = []
+
+        for table in tables:
+            row_count = table.get("row_count", 0)
+            table_name = table["table_name"]
+            pk_columns = table.get("pk_columns", [])
+
+            # Check if table should be partitioned
+            if row_count >= PARTITION_THRESHOLD and pk_columns:
+                pk_column = pk_columns[0]
+
+                # Get PK min/max for partitioning
+                try:
+                    from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+                    helper = OdbcConnectionHelper(odbc_conn_id=source_conn_id)
+
+                    with helper.get_conn() as conn:
+                        cursor = conn.cursor()
+                        # Use parameterized identifiers via bracket escaping
+                        # Note: pyodbc doesn't support parameterized identifiers, but we
+                        # validate that pk_column comes from schema discovery (trusted source)
+                        # and double any brackets to prevent SQL injection
+                        safe_pk = pk_column.replace(']', ']]')
+                        safe_schema = table['source_schema'].replace(']', ']]')
+                        safe_table = table_name.replace(']', ']]')
+                        query = f"SELECT MIN([{safe_pk}]), MAX([{safe_pk}]) FROM [{safe_schema}].[{safe_table}]"
+                        cursor.execute(query)
+                        row = cursor.fetchone()
+                        pk_min, pk_max = row[0], row[1]
+                        cursor.close()
+
+                    if pk_min is not None and pk_max is not None and isinstance(pk_min, int):
+                        # Calculate partitions
+                        num_partitions = min(
+                            MAX_PARTITIONS_PER_TABLE,
+                            max(2, row_count // 500000)  # ~500K rows per partition
+                        )
+
+                        pk_range = pk_max - pk_min + 1
+                        partition_size = pk_range // num_partitions
+
+                        logger.info(
+                            f"Partitioning {table_name}: {row_count:,} rows into "
+                            f"{num_partitions} partitions"
+                        )
+
+                        for i in range(num_partitions):
+                            start_pk = pk_min + (i * partition_size)
+                            end_pk = pk_max if i == num_partitions - 1 else start_pk + partition_size - 1
+
+                            sync_tasks.append({
+                                **table,
+                                "is_partition": True,
+                                "partition_id": i,
+                                "pk_start": start_pk,
+                                "pk_end": end_pk,
+                                "partition_row_estimate": partition_size,
+                            })
+
+                        continue  # Skip adding as single task
+
+                except Exception as e:
+                    logger.warning(f"Could not partition {table_name}: {e}")
+
+            # Add as single task (small table or partitioning failed)
+            sync_tasks.append({
+                **table,
+                "is_partition": False,
+            })
+
+        logger.info(
+            f"Created {len(sync_tasks)} sync tasks from {len(tables)} tables "
+            f"(partitioned: {len(sync_tasks) - len(tables)} extra tasks)"
+        )
+
+        return sync_tasks
+
+    @task(max_active_tis_per_dagrun=MAX_PARALLEL_TRANSFERS)
+    def sync_table(task_info: Dict[str, Any], **context) -> Dict[str, Any]:
+        """
+        Sync a single table or partition incrementally.
+
+        For partitioned tables:
+        1. Create partition-specific staging table
+        2. COPY partition rows to staging
+        3. Upsert from staging to target
+        4. Drop staging table
+
+        For non-partitioned tables (default staging mode):
         1. Start sync in state table
         2. COPY all source rows to staging table
         3. Upsert from staging with IS DISTINCT FROM (only changed rows update)
         4. Update state with results
 
-        Legacy (use_staging=False):
-        1. Start sync in state table
-        2. Detect new/changed rows via diff (optionally with hash comparison)
-        3. Transfer only those rows via upsert
-        4. Update state with results
-
         Args:
-            table_info: Table configuration dict
+            task_info: Table or partition configuration dict
 
         Returns:
             Sync result dict
@@ -261,14 +362,66 @@ def mssql_to_postgres_incremental():
         use_staging = params.get("use_staging", True)
         batch_size = params.get("batch_size", DEFAULT_BATCH_SIZE)
 
-        table_name = table_info["table_name"]
-        source_schema = table_info["source_schema"]
-        target_schema = table_info["target_schema"]
+        is_partition = task_info.get("is_partition", False)
+        table_name = task_info["table_name"]
+        source_schema = task_info["source_schema"]
+        target_schema = task_info["target_schema"]
 
+        # Handle partitioned transfer
+        if is_partition:
+            partition_id = task_info["partition_id"]
+            pk_start = task_info["pk_start"]
+            pk_end = task_info["pk_end"]
+
+            logger.info(
+                f"Syncing partition {partition_id} of {source_schema}.{table_name} "
+                f"(PK range: {pk_start} - {pk_end})"
+            )
+
+            try:
+                result = transfer_incremental_staging_partitioned(
+                    mssql_conn_id=source_conn_id,
+                    postgres_conn_id=target_conn_id,
+                    table_info=task_info,
+                    pk_start=pk_start,
+                    pk_end=pk_end,
+                    partition_id=partition_id,
+                    chunk_size=batch_size,
+                )
+
+                return {
+                    "table_name": table_name,
+                    "partition_id": partition_id,
+                    "is_partition": True,
+                    "status": "synced" if result["success"] else "failed",
+                    "rows_inserted": result.get("rows_inserted", 0),
+                    "rows_updated": result.get("rows_updated", 0),
+                    "rows_copied_to_staging": result.get("rows_copied_to_staging", 0),
+                    "elapsed_seconds": result.get("elapsed_time_seconds", 0),
+                    "success": result["success"],
+                    "errors": result.get("errors", []),
+                }
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error syncing partition {partition_id} of {table_name}: {error_msg}")
+                return {
+                    "table_name": table_name,
+                    "partition_id": partition_id,
+                    "is_partition": True,
+                    "status": "failed",
+                    "success": False,
+                    "errors": [error_msg],
+                }
+
+        # Non-partitioned table sync (original logic)
         logger.info(
             f"Starting incremental sync for {source_schema}.{table_name} "
             f"(mode: {'staging' if use_staging else 'legacy'})"
         )
+
+        # For non-partitioned tables, we need the full table_info
+        table_info = task_info
 
         # Initialize state tracking
         state_manager = IncrementalStateManager(target_conn_id)
@@ -481,8 +634,11 @@ def mssql_to_postgres_incremental():
     # Ensure state is ready before discovering tables
     state_ready >> tables
 
-    # Sync tables in parallel
-    sync_results = sync_table.expand(table_info=tables)
+    # Create sync tasks (with partitioning for large tables)
+    sync_tasks = create_sync_tasks(tables)
+
+    # Sync tables/partitions in parallel
+    sync_results = sync_table.expand(task_info=sync_tasks)
 
     # Collect results
     collect_results(sync_results)
