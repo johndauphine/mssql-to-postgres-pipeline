@@ -41,6 +41,169 @@ def _get_binary_copy_module():
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# AUTO-TUNING UTILITIES
+# =============================================================================
+
+def calculate_optimal_chunk_size(
+    num_columns: int,
+    avg_row_width_bytes: Optional[int] = None,
+    base_chunk_size: int = 200000,
+) -> int:
+    """
+    Calculate optimal chunk size based on table characteristics.
+
+    Narrow tables (few columns) can use larger chunks for better throughput.
+    Wide tables (many columns) need smaller chunks to avoid memory pressure.
+
+    Args:
+        num_columns: Number of columns in the table
+        avg_row_width_bytes: Average row size in bytes (if known)
+        base_chunk_size: Base chunk size to adjust from
+
+    Returns:
+        Optimal chunk size for this table
+    """
+    if not os.environ.get('AUTO_TUNE_CHUNK_SIZE', 'false').lower() == 'true':
+        return base_chunk_size
+
+    # Heuristic based on column count
+    if num_columns <= 5:
+        # Very narrow table - can use large chunks
+        multiplier = 2.0
+    elif num_columns <= 10:
+        # Narrow table
+        multiplier = 1.5
+    elif num_columns <= 20:
+        # Medium table - use base
+        multiplier = 1.0
+    elif num_columns <= 40:
+        # Wide table - reduce chunk size
+        multiplier = 0.5
+    else:
+        # Very wide table - use small chunks
+        multiplier = 0.25
+
+    # If we know the row width, refine further
+    if avg_row_width_bytes:
+        # Target ~50MB per chunk in memory
+        target_chunk_bytes = 50 * 1024 * 1024
+        width_based_chunk = target_chunk_bytes // avg_row_width_bytes
+        # Blend column-based and width-based estimates
+        optimal = int((base_chunk_size * multiplier + width_based_chunk) / 2)
+    else:
+        optimal = int(base_chunk_size * multiplier)
+
+    # Clamp to reasonable bounds
+    min_chunk = 10000
+    max_chunk = 500000
+    result = max(min_chunk, min(max_chunk, optimal))
+
+    logger.debug(
+        f"Auto-tuned chunk size: {result} (columns={num_columns}, "
+        f"base={base_chunk_size}, multiplier={multiplier:.2f})"
+    )
+
+    return result
+
+
+def get_table_row_width(columns: List[Dict[str, Any]]) -> int:
+    """
+    Estimate average row width in bytes based on column types.
+
+    Args:
+        columns: List of column definitions with 'data_type' key
+
+    Returns:
+        Estimated row width in bytes
+    """
+    type_sizes = {
+        # Integer types
+        'bit': 1,
+        'tinyint': 1,
+        'smallint': 2,
+        'int': 4,
+        'bigint': 8,
+        # Float types
+        'real': 4,
+        'float': 8,
+        # Date/time types
+        'date': 4,
+        'time': 8,
+        'datetime': 8,
+        'datetime2': 8,
+        'smalldatetime': 4,
+        'datetimeoffset': 10,
+        # Other fixed types
+        'uniqueidentifier': 16,
+        'money': 8,
+        'smallmoney': 4,
+        # Variable types - estimate
+        'varchar': 50,
+        'nvarchar': 100,
+        'char': 20,
+        'nchar': 40,
+        'text': 200,
+        'ntext': 400,
+        'binary': 50,
+        'varbinary': 100,
+        'image': 500,
+        'xml': 500,
+        # Decimal - estimate
+        'decimal': 17,
+        'numeric': 17,
+    }
+
+    total = 0
+    for col in columns:
+        data_type = col.get('data_type', 'varchar').lower().split('(')[0]
+        total += type_sizes.get(data_type, 50)  # Default 50 bytes for unknown
+
+    return total
+
+
+# =============================================================================
+# PARALLEL PROCESSING UTILITIES
+# =============================================================================
+
+def calculate_partition_ranges(
+    total_rows: int,
+    num_partitions: int,
+    pk_min: Any,
+    pk_max: Any,
+) -> List[Tuple[Any, Any]]:
+    """
+    Calculate partition ranges for parallel processing.
+
+    Args:
+        total_rows: Total number of rows in the table
+        num_partitions: Desired number of partitions
+        pk_min: Minimum primary key value
+        pk_max: Maximum primary key value
+
+    Returns:
+        List of (start_pk, end_pk) tuples for each partition
+    """
+    if isinstance(pk_min, int) and isinstance(pk_max, int):
+        # Integer PK - calculate even ranges
+        pk_range = pk_max - pk_min + 1
+        partition_size = pk_range // num_partitions
+
+        ranges = []
+        for i in range(num_partitions):
+            start = pk_min + (i * partition_size)
+            if i == num_partitions - 1:
+                end = pk_max  # Last partition gets remainder
+            else:
+                end = start + partition_size - 1
+            ranges.append((start, end))
+
+        return ranges
+    else:
+        # Non-integer PK - fall back to single partition
+        return [(pk_min, pk_max)]
+
+
 class MssqlConnectionPool:
     """
     Thread-safe connection pool for SQL Server pyodbc connections.
@@ -2639,6 +2802,206 @@ def transfer_incremental_staging(
         )
     else:
         logger.error(f"Staging sync failed: {errors}")
+
+    return result
+
+
+def transfer_incremental_staging_partitioned(
+    mssql_conn_id: str,
+    postgres_conn_id: str,
+    table_info: Dict[str, Any],
+    pk_start: Any,
+    pk_end: Any,
+    partition_id: int,
+    chunk_size: int = 100000,
+) -> Dict[str, Any]:
+    """
+    Transfer a partition of table data using staging table pattern.
+
+    This is used for parallel processing of large tables. Each partition
+    handles a range of primary keys independently.
+
+    Args:
+        mssql_conn_id: SQL Server connection ID
+        postgres_conn_id: PostgreSQL connection ID
+        table_info: Table information including schema, columns, and pk_columns
+        pk_start: Start of primary key range (inclusive)
+        pk_end: End of primary key range (inclusive)
+        partition_id: Partition identifier for logging
+        chunk_size: Rows per chunk for COPY to staging
+
+    Returns:
+        Transfer result dictionary with rows_inserted, rows_updated, etc.
+    """
+    import uuid
+
+    start_time = time.time()
+
+    source_schema = table_info.get('source_schema', 'dbo')
+    source_table = table_info['table_name']
+    target_schema = table_info.get('target_schema', 'public')
+    target_table = table_info.get('target_table', source_table)
+    columns = table_info.get('columns', [])
+    pk_columns = table_info.get('pk_columns', [])
+
+    # Handle pk_columns as dict from schema extractor
+    if isinstance(pk_columns, dict):
+        pk_columns = [col['name'] for col in pk_columns.get('columns', [])]
+
+    if not pk_columns:
+        logger.error(f"No primary key columns for {source_table}")
+        return {
+            'table_name': source_table,
+            'partition_id': partition_id,
+            'success': False,
+            'errors': ['No primary key columns defined'],
+        }
+
+    pk_column = pk_columns[0]
+
+    logger.info(
+        f"Partition {partition_id}: Syncing {source_schema}.{source_table} "
+        f"(PK range: {pk_start} - {pk_end})"
+    )
+
+    transfer = DataTransfer(mssql_conn_id, postgres_conn_id)
+
+    # Get columns if not provided
+    if not columns:
+        columns = transfer._get_table_columns(source_schema, source_table)
+
+    total_inserted = 0
+    total_updated = 0
+    rows_copied = 0
+    errors = []
+
+    # Generate unique staging table name for this partition
+    staging_table = f"_staging_{source_table}_p{partition_id}_{uuid.uuid4().hex[:6]}"
+
+    try:
+        with transfer._postgres_connection() as postgres_conn:
+            # Disable statement timeout
+            with postgres_conn.cursor() as cursor:
+                cursor.execute("SET statement_timeout = 0")
+
+            # Step 1: Create staging table (UNLOGGED for speed)
+            _create_staging_table(
+                postgres_conn, target_schema, target_table, staging_table
+            )
+            postgres_conn.commit()
+
+            # Step 2: Copy partition data to staging
+            # Build WHERE clause for partition
+            where_clause = f"{pk_column} >= {pk_start} AND {pk_column} <= {pk_end}"
+
+            # Check if binary COPY is enabled
+            use_binary = transfer._use_binary_copy
+            column_types = None
+            if use_binary:
+                column_types = transfer._get_pg_column_types(
+                    target_schema, target_table, columns, postgres_conn
+                )
+
+            pk_index = columns.index(pk_column) if pk_column in columns else 0
+
+            with transfer._mssql_connection() as mssql_conn:
+                last_key_value = pk_start - 1 if isinstance(pk_start, int) else None
+                chunks_processed = 0
+
+                while True:
+                    rows, last_key_value = transfer._read_chunk_keyset(
+                        mssql_conn,
+                        source_schema,
+                        source_table,
+                        columns,
+                        pk_column,
+                        last_key_value,
+                        chunk_size,
+                        pk_index,
+                        where_clause=where_clause,
+                    )
+
+                    if not rows:
+                        break
+
+                    # Check if we've passed the end of our partition
+                    if isinstance(pk_end, int) and last_key_value and last_key_value > pk_end:
+                        # Filter out rows beyond our partition
+                        rows = [r for r in rows if r[pk_index] <= pk_end]
+
+                    if not rows:
+                        break
+
+                    # Write chunk to staging table
+                    rows_written = _write_to_staging(
+                        postgres_conn,
+                        target_schema,
+                        staging_table,
+                        columns,
+                        rows,
+                        transfer._normalize_value,
+                        column_types=column_types,
+                        use_binary=use_binary,
+                    )
+
+                    rows_copied += rows_written
+                    chunks_processed += 1
+                    postgres_conn.commit()
+
+                    # Check if we've reached the end of our partition
+                    if isinstance(pk_end, int) and last_key_value and last_key_value >= pk_end:
+                        break
+
+            # Step 3: Upsert from staging to target
+            total_inserted, total_updated = upsert_from_staging(
+                postgres_conn,
+                target_schema,
+                staging_table,
+                target_schema,
+                target_table,
+                columns,
+                pk_columns,
+            )
+            postgres_conn.commit()
+
+            # Step 4: Drop staging table
+            _drop_staging_table(postgres_conn, target_schema, staging_table)
+            postgres_conn.commit()
+
+    except Exception as e:
+        error_msg = f"Error in partition {partition_id}: {str(e)}"
+        logger.error(error_msg)
+        errors.append(error_msg)
+
+        # Cleanup staging table on error
+        try:
+            with transfer._postgres_connection() as cleanup_conn:
+                _drop_staging_table(cleanup_conn, target_schema, staging_table)
+                cleanup_conn.commit()
+        except Exception:
+            pass
+
+    elapsed_time = time.time() - start_time
+    rows_unchanged = rows_copied - (total_inserted + total_updated)
+
+    result = {
+        'table_name': source_table,
+        'partition_id': partition_id,
+        'pk_range': (pk_start, pk_end),
+        'rows_copied_to_staging': rows_copied,
+        'rows_inserted': total_inserted,
+        'rows_updated': total_updated,
+        'rows_unchanged': rows_unchanged,
+        'elapsed_time_seconds': elapsed_time,
+        'success': len(errors) == 0,
+        'errors': errors,
+    }
+
+    if result['success']:
+        logger.info(
+            f"Partition {partition_id} complete: {total_inserted:,} inserted, "
+            f"{total_updated:,} updated in {elapsed_time:.2f}s"
+        )
 
     return result
 

@@ -35,15 +35,20 @@ x-airflow-common:
     MAX_PARTITIONS: ${MAX_PARTITIONS:-8}
     MAX_PARALLEL_TRANSFERS: ${MAX_PARALLEL_TRANSFERS:-8}
     MAX_ACTIVE_TASKS: ${MAX_ACTIVE_TASKS:-16}
-    PG_POOL_MINCONN: ${PG_POOL_MINCONN:-1}
-    PG_POOL_MAXCONN: ${PG_POOL_MAXCONN:-8}
+    # Connection pool settings (increased for better parallelism)
+    PG_POOL_MINCONN: ${PG_POOL_MINCONN:-2}
+    PG_POOL_MAXCONN: ${PG_POOL_MAXCONN:-16}
+    MAX_MSSQL_CONNECTIONS: ${MAX_MSSQL_CONNECTIONS:-24}
+    MAX_PG_CONNECTIONS: ${MAX_PG_CONNECTIONS:-16}
+    # Parallel reader settings (increased from 1 to 4 for better throughput)
+    PARALLEL_READERS: ${PARALLEL_READERS:-4}
+    READER_QUEUE_SIZE: ${READER_QUEUE_SIZE:-8}
+    # Chunk size settings
     DEFAULT_CHUNK_SIZE: ${DEFAULT_CHUNK_SIZE:-200000}
-    PARALLEL_READERS: ${PARALLEL_READERS:-1}
-    READER_QUEUE_SIZE: ${READER_QUEUE_SIZE:-5}
-    MAX_MSSQL_CONNECTIONS: ${MAX_MSSQL_CONNECTIONS:-12}
-    MAX_PG_CONNECTIONS: ${MAX_PG_CONNECTIONS:-8}
+    # Auto-tune chunk size based on table width (set to true to enable)
+    AUTO_TUNE_CHUNK_SIZE: ${AUTO_TUNE_CHUNK_SIZE:-true}
     # Performance: Binary COPY format for PostgreSQL writes (~20-30% faster)
-    USE_BINARY_COPY: ${USE_BINARY_COPY:-false}
+    USE_BINARY_COPY: ${USE_BINARY_COPY:-true}
     # For validation DAG (must match database in AIRFLOW_CONN_MSSQL_SOURCE)
     MSSQL_DATABASE: ${MSSQL_DATABASE:-StackOverflow2010}
     # For testing: set to comma-separated table names to simulate failures
