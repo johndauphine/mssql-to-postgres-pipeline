@@ -12,9 +12,15 @@ Modules:
 - validation: Validate migration results
 - incremental_state: Track sync state for incremental loading
 - diff_detector: Detect new/changed rows for incremental sync
+- binary_copy: PostgreSQL binary COPY format for faster transfers
+
+Performance Options:
+- USE_BINARY_COPY=true: Enable binary COPY format (~20-30% faster)
+- PARALLEL_READERS=N: Number of parallel reader threads per table
+- MAX_PARALLEL_TRANSFERS=N: Max concurrent table transfers
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Core modules
 from mssql_pg_migration import schema_extractor
@@ -27,6 +33,9 @@ from mssql_pg_migration import validation
 from mssql_pg_migration import incremental_state
 from mssql_pg_migration import diff_detector
 
+# Optional: Binary COPY (loaded lazily in data_transfer)
+# from mssql_pg_migration import binary_copy
+
 __all__ = [
     "schema_extractor",
     "type_mapping",
@@ -35,4 +44,5 @@ __all__ = [
     "validation",
     "incremental_state",
     "diff_detector",
+    "binary_copy",
 ]

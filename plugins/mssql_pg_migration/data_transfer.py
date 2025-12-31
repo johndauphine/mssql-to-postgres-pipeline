@@ -27,6 +27,17 @@ import pyodbc
 from psycopg2 import pool as pg_pool
 from psycopg2 import sql
 
+# Binary COPY support - import lazily to avoid import errors if not used
+_binary_copy_module = None
+
+def _get_binary_copy_module():
+    """Lazily import binary_copy module."""
+    global _binary_copy_module
+    if _binary_copy_module is None:
+        from mssql_pg_migration import binary_copy
+        _binary_copy_module = binary_copy
+    return _binary_copy_module
+
 logger = logging.getLogger(__name__)
 
 
@@ -657,6 +668,16 @@ class DataTransfer:
         self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
         self._mssql_conn_id = mssql_conn_id
         self._postgres_conn_id = postgres_conn_id
+
+        # Binary COPY configuration
+        # Set USE_BINARY_COPY=true to enable PostgreSQL binary COPY format
+        # Binary COPY is ~20-30% faster than CSV COPY
+        self._use_binary_copy = os.environ.get('USE_BINARY_COPY', 'false').lower() == 'true'
+        if self._use_binary_copy:
+            logger.info("Binary COPY format enabled for PostgreSQL writes")
+
+        # Column type cache for binary COPY (populated per table)
+        self._column_types_cache: Dict[str, List[str]] = {}
 
         # Get direct MSSQL connection parameters for keyset pagination
         # This avoids issues with Airflow hook's get_pandas_df on large datasets
@@ -1810,6 +1831,10 @@ class DataTransfer:
         """
         Stream rows to PostgreSQL using COPY.
 
+        Supports two formats:
+        - CSV COPY (default): Text-based, universal compatibility
+        - Binary COPY (USE_BINARY_COPY=true): ~20-30% faster, more compact
+
         Args:
             rows: Sequence of rows to write
             schema_name: Target schema name
@@ -1823,6 +1848,11 @@ class DataTransfer:
         if not rows:
             return 0
 
+        # Use binary COPY if enabled
+        if self._use_binary_copy:
+            return self._write_chunk_binary(rows, schema_name, table_name, columns, postgres_conn)
+
+        # Default: CSV COPY
         # Use safe identifier quoting for schema, table, and columns
         # P0.1 FIX: Use \N as NULL marker to distinguish NULL from empty strings
         # The \N marker is PostgreSQL's default and unlikely to appear in real data
@@ -1838,6 +1868,86 @@ class DataTransfer:
             cursor.copy_expert(copy_sql, stream)
 
         return len(rows)
+
+    def _write_chunk_binary(
+        self,
+        rows: List[Tuple[Any, ...]],
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        postgres_conn
+    ) -> int:
+        """
+        Stream rows to PostgreSQL using Binary COPY format.
+
+        Binary COPY is ~20-30% faster than CSV COPY because:
+        - No text encoding/decoding overhead
+        - More compact wire format
+        - PostgreSQL's binary parser is highly optimized
+
+        Args:
+            rows: Sequence of rows to write
+            schema_name: Target schema name
+            table_name: Target table name
+            columns: List of column names
+            postgres_conn: Active PostgreSQL connection
+
+        Returns:
+            Number of rows written
+        """
+        binary_copy = _get_binary_copy_module()
+
+        # Get column types (cached per table for performance)
+        cache_key = f"{schema_name}.{table_name}"
+        if cache_key not in self._column_types_cache:
+            # Query column types from PostgreSQL
+            column_types = self._get_pg_column_types(schema_name, table_name, columns, postgres_conn)
+            self._column_types_cache[cache_key] = column_types
+        else:
+            column_types = self._column_types_cache[cache_key]
+
+        # Use binary COPY
+        return binary_copy.stream_binary_copy(
+            rows=rows,
+            schema_name=schema_name,
+            table_name=table_name,
+            columns=columns,
+            column_types=column_types,
+            postgres_conn=postgres_conn,
+        )
+
+    def _get_pg_column_types(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        postgres_conn
+    ) -> List[str]:
+        """
+        Get PostgreSQL column types for binary encoding.
+
+        Args:
+            schema_name: Schema name
+            table_name: Table name
+            columns: List of column names
+            postgres_conn: PostgreSQL connection
+
+        Returns:
+            List of PostgreSQL type names in same order as columns
+        """
+        # Query column types from information_schema
+        query = """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+        """
+
+        with postgres_conn.cursor() as cursor:
+            cursor.execute(query, (schema_name, table_name))
+            type_map = {row[0]: row[1] for row in cursor.fetchall()}
+
+        # Return types in column order
+        return [type_map.get(col, 'text') for col in columns]
 
     def _normalize_value(self, value: Any) -> Any:
         """
@@ -2259,9 +2369,13 @@ def _write_to_staging(
     columns: List[str],
     rows: List[Tuple[Any, ...]],
     normalize_value,
+    column_types: Optional[List[str]] = None,
+    use_binary: bool = False,
 ) -> int:
     """
     Write rows to staging table using COPY for speed.
+
+    Supports both CSV COPY (default) and binary COPY (faster).
 
     Args:
         postgres_conn: PostgreSQL connection
@@ -2270,6 +2384,8 @@ def _write_to_staging(
         columns: Column names
         rows: Rows to write
         normalize_value: Value normalization function
+        column_types: PostgreSQL column types (required for binary COPY)
+        use_binary: Use binary COPY format (default: False)
 
     Returns:
         Number of rows written
@@ -2277,6 +2393,19 @@ def _write_to_staging(
     if not rows:
         return 0
 
+    # Use binary COPY if enabled and column types are available
+    if use_binary and column_types:
+        binary_copy = _get_binary_copy_module()
+        return binary_copy.stream_binary_copy(
+            rows=rows,
+            schema_name=schema_name,
+            table_name=table_name,
+            columns=columns,
+            column_types=column_types,
+            postgres_conn=postgres_conn,
+        )
+
+    # Default: CSV COPY
     quoted_columns = sql.SQL(', ').join([sql.Identifier(col) for col in columns])
     copy_sql = sql.SQL(
         "COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '\\N')"
@@ -2390,6 +2519,16 @@ def transfer_incremental_staging(
             pk_column = pk_columns[0] if pk_columns else columns[0]
             pk_index = columns.index(pk_column) if pk_column in columns else 0
 
+            # Check if binary COPY is enabled
+            use_binary = transfer._use_binary_copy
+            column_types = None
+            if use_binary:
+                # Get column types for binary encoding
+                column_types = transfer._get_pg_column_types(
+                    target_schema, target_table, columns, postgres_conn
+                )
+                logger.info(f"Using binary COPY for staging (column types: {len(column_types)})")
+
             with transfer._mssql_connection() as mssql_conn:
                 last_key_value = None
                 chunks_processed = 0
@@ -2419,6 +2558,8 @@ def transfer_incremental_staging(
                         columns,
                         rows,
                         transfer._normalize_value,
+                        column_types=column_types,
+                        use_binary=use_binary,
                     )
 
                     rows_copied += rows_written
