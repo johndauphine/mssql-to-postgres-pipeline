@@ -41,8 +41,8 @@ def _get_binary_copy_module():
 logger = logging.getLogger(__name__)
 
 # Environment variable to control UNLOGGED staging tables
-# Default to False for data safety (logged tables are crash-safe)
-USE_UNLOGGED_STAGING = os.environ.get('USE_UNLOGGED_STAGING', 'false').lower() == 'true'
+# Default to True for speed (staging tables are temporary and don't need crash safety)
+USE_UNLOGGED_STAGING = os.environ.get('USE_UNLOGGED_STAGING', 'true').lower() == 'true'
 
 
 # =============================================================================

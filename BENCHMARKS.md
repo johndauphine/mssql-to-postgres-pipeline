@@ -140,7 +140,7 @@ docker compose up -d
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `USE_BINARY_COPY` | `true` | Use PostgreSQL binary COPY format |
-| `USE_UNLOGGED_STAGING` | `false` | Use UNLOGGED staging tables (faster but not crash-safe) |
+| `USE_UNLOGGED_STAGING` | `true` | Use UNLOGGED staging tables (faster, staging is temporary) |
 | `PARTITION_THRESHOLD` | `1000000` | Row count threshold for partitioning |
 | `MAX_PARTITIONS_PER_TABLE` | `6` | Maximum partitions per large table |
 | `PARALLEL_READERS` | `4` | Concurrent MSSQL readers per table |
