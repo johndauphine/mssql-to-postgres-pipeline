@@ -40,6 +40,10 @@ def _get_binary_copy_module():
 
 logger = logging.getLogger(__name__)
 
+# Environment variable to control UNLOGGED staging tables
+# Default to False for data safety (logged tables are crash-safe)
+USE_UNLOGGED_STAGING = os.environ.get('USE_UNLOGGED_STAGING', 'false').lower() == 'true'
+
 
 # =============================================================================
 # AUTO-TUNING UTILITIES
@@ -2490,17 +2494,24 @@ def _create_staging_table(
     schema_name: str,
     source_table: str,
     staging_table: str,
+    use_unlogged: bool = False,
 ) -> None:
     """
-    Create an UNLOGGED staging table with same structure as source.
+    Create a staging table with same structure as source.
 
-    UNLOGGED tables don't write to WAL, making them much faster for
-    temporary data that doesn't need to survive a crash.
+    Args:
+        postgres_conn: PostgreSQL connection
+        schema_name: Target schema name
+        source_table: Source table to copy structure from
+        staging_table: Name for the staging table
+        use_unlogged: If True, create as UNLOGGED table (faster but not crash-safe).
+                      Defaults to False for data safety.
     """
-    query = sql.SQL("""
-        CREATE UNLOGGED TABLE {schema}.{staging}
-        (LIKE {schema}.{source} INCLUDING DEFAULTS)
-    """).format(
+    table_type = "UNLOGGED TABLE" if use_unlogged else "TABLE"
+    query = sql.SQL(
+        "CREATE " + table_type + " {schema}.{staging} "
+        "(LIKE {schema}.{source} INCLUDING DEFAULTS)"
+    ).format(
         schema=sql.Identifier(schema_name),
         staging=sql.Identifier(staging_table),
         source=sql.Identifier(source_table),
@@ -2595,7 +2606,7 @@ def transfer_incremental_staging(
     Transfer table data using staging table pattern for efficient incremental sync.
 
     This approach is significantly faster than hash-based change detection:
-    1. Create UNLOGGED temp staging table (fast, no WAL)
+    1. Create staging table (UNLOGGED if USE_UNLOGGED_STAGING=true)
     2. COPY all source rows to staging (bulk load)
     3. Upsert from staging using INSERT...ON CONFLICT with IS DISTINCT FROM
     4. Drop staging table
@@ -2669,10 +2680,11 @@ def transfer_incremental_staging(
             with postgres_conn.cursor() as cursor:
                 cursor.execute("SET statement_timeout = '2h'")
 
-            # Step 1: Create staging table (UNLOGGED for speed)
-            logger.info(f"Creating staging table: {target_schema}.{staging_table}")
+            # Step 1: Create staging table
+            logger.info(f"Creating staging table: {target_schema}.{staging_table} (unlogged={USE_UNLOGGED_STAGING})")
             _create_staging_table(
-                postgres_conn, target_schema, target_table, staging_table
+                postgres_conn, target_schema, target_table, staging_table,
+                use_unlogged=USE_UNLOGGED_STAGING
             )
             postgres_conn.commit()
 
@@ -2894,9 +2906,10 @@ def transfer_incremental_staging_partitioned(
             with postgres_conn.cursor() as cursor:
                 cursor.execute("SET statement_timeout = '2h'")
 
-            # Step 1: Create staging table (UNLOGGED for speed)
+            # Step 1: Create staging table
             _create_staging_table(
-                postgres_conn, target_schema, target_table, staging_table
+                postgres_conn, target_schema, target_table, staging_table,
+                use_unlogged=USE_UNLOGGED_STAGING
             )
             postgres_conn.commit()
 

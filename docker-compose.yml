@@ -49,6 +49,8 @@ x-airflow-common:
     AUTO_TUNE_CHUNK_SIZE: ${AUTO_TUNE_CHUNK_SIZE:-true}
     # Performance: Binary COPY format for PostgreSQL writes (~20-30% faster)
     USE_BINARY_COPY: ${USE_BINARY_COPY:-true}
+    # Use UNLOGGED staging tables (faster but not crash-safe, default: false for safety)
+    USE_UNLOGGED_STAGING: ${USE_UNLOGGED_STAGING:-false}
     # For validation DAG (must match database in AIRFLOW_CONN_MSSQL_SOURCE)
     MSSQL_DATABASE: ${MSSQL_DATABASE:-StackOverflow2010}
     # For testing: set to comma-separated table names to simulate failures
