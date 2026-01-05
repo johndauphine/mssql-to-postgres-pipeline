@@ -44,6 +44,8 @@ x-airflow-common:
     MAX_PG_CONNECTIONS: ${MAX_PG_CONNECTIONS:-8}
     # For validation DAG (must match database in AIRFLOW_CONN_MSSQL_SOURCE)
     MSSQL_DATABASE: ${MSSQL_DATABASE:-StackOverflow2010}
+    # Default tables to migrate in schema.table format (comma-separated)
+    INCLUDE_TABLES: ${INCLUDE_TABLES:-}
     # For testing: set to comma-separated table names to simulate failures
     SIMULATE_FAILURE_TABLES: ${SIMULATE_FAILURE_TABLES:-}
 

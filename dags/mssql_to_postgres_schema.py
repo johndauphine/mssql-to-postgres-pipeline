@@ -3,8 +3,11 @@ SQL Server to PostgreSQL Schema DAG
 
 This DAG handles schema operations only:
 1. Extract schema from SQL Server (tables, columns, primary keys)
-2. Create target schema in PostgreSQL
+2. Create target schema(s) in PostgreSQL (derived from source db/schema)
 3. Create tables with primary keys
+
+Tables must be explicitly specified in 'schema.table' format in include_tables.
+Target PostgreSQL schema is derived as: {sourcedb}__{sourceschema} (lowercase)
 
 This DAG is triggered by the migration DAG before data transfer.
 It can also be run standalone to set up or refresh the target schema.
@@ -18,23 +21,22 @@ from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any
 import logging
-import re
 import os
 
-from mssql_pg_migration import schema_extractor, ddl_generator
+from mssql_pg_migration import schema_extractor
+from mssql_pg_migration.ddl_generator import DDLGenerator
+from mssql_pg_migration.table_config import (
+    expand_include_tables_param,
+    validate_include_tables,
+    parse_include_tables,
+    get_source_database,
+    derive_target_schema,
+)
 
 logger = logging.getLogger(__name__)
 
-
-def validate_sql_identifier(identifier: str, identifier_type: str = "identifier") -> str:
-    """Validate and sanitize SQL identifiers to prevent SQL injection."""
-    if not identifier:
-        raise ValueError(f"Invalid {identifier_type}: cannot be empty")
-    if len(identifier) > 128:
-        raise ValueError(f"Invalid {identifier_type}: exceeds maximum length")
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
-        raise ValueError(f"Invalid {identifier_type} '{identifier}'")
-    return identifier
+# Default tables from environment variable (fallback)
+DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
 
 
 @dag(
@@ -61,23 +63,9 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
             type="string",
             description="PostgreSQL connection ID"
         ),
-        "source_schema": Param(
-            default="dbo",
-            type="string",
-            description="Source schema in SQL Server"
-        ),
-        "target_schema": Param(
-            default="public",
-            type="string",
-            description="Target schema in PostgreSQL"
-        ),
         "include_tables": Param(
             default=[],
-            description="Tables to include (empty = all)"
-        ),
-        "exclude_tables": Param(
-            default=[],
-            description="Tables to exclude"
+            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
         ),
         "drop_existing": Param(
             default=True,
@@ -92,37 +80,48 @@ def mssql_to_postgres_schema():
 
     @task
     def extract_source_schema(**context) -> List[Dict[str, Any]]:
-        """Extract schema information from SQL Server."""
+        """
+        Extract schema information from SQL Server.
+
+        Parses include_tables in schema.table format, derives target schemas,
+        and extracts full schema info for each table.
+        """
         params = context["params"]
+        source_conn_id = params["source_conn_id"]
 
-        # Parse include_tables parameter
+        # Parse and expand include_tables parameter
         include_tables_raw = params.get("include_tables", [])
-        if isinstance(include_tables_raw, str):
-            import json
-            try:
-                include_tables = json.loads(include_tables_raw)
-            except json.JSONDecodeError:
-                include_tables = [t.strip() for t in include_tables_raw.split(',') if t.strip()]
-        else:
-            include_tables = include_tables_raw
+        include_tables = expand_include_tables_param(include_tables_raw)
 
-        # Expand comma-separated items
-        if include_tables and isinstance(include_tables, list):
-            expanded = []
-            for item in include_tables:
-                if isinstance(item, str) and ',' in item:
-                    expanded.extend([t.strip() for t in item.split(',') if t.strip()])
-                elif isinstance(item, str) and item.strip():
-                    expanded.append(item.strip())
-            include_tables = expanded
+        # Fall back to environment variable if empty
+        if not include_tables and DEFAULT_INCLUDE_TABLES:
+            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
 
-        logger.info(f"Extracting schema from {params['source_schema']}")
+        # Validate include_tables (will raise ValueError if empty or invalid)
+        validate_include_tables(include_tables)
 
-        tables = schema_extractor.extract_schema_info(
-            mssql_conn_id=params["source_conn_id"],
-            schema_name=params["source_schema"],
-            exclude_tables=params.get("exclude_tables", []),
-            include_tables=include_tables or None
+        logger.info(f"Processing {len(include_tables)} tables: {include_tables}")
+
+        # Parse into {schema: [tables]} dict
+        schema_tables = parse_include_tables(include_tables)
+        logger.info(f"Grouped into schemas: {list(schema_tables.keys())}")
+
+        # Get source database name for deriving target schemas
+        source_db = get_source_database(source_conn_id)
+        logger.info(f"Source database: {source_db}")
+
+        # Build target schema map: {source_schema: target_schema}
+        target_schema_map = {
+            src_schema: derive_target_schema(source_db, src_schema)
+            for src_schema in schema_tables.keys()
+        }
+        logger.info(f"Target schemas: {target_schema_map}")
+
+        # Extract schema info using new function that accepts schema_tables dict
+        tables = schema_extractor.extract_schema_for_tables(
+            mssql_conn_id=source_conn_id,
+            schema_tables=schema_tables,
+            target_schema_map=target_schema_map
         )
 
         logger.info(f"Extracted schema for {len(tables)} tables")
@@ -131,48 +130,78 @@ def mssql_to_postgres_schema():
         for t in tables:
             pk_info = t.get('primary_key', {})
             pk_cols = pk_info.get('columns', []) if isinstance(pk_info, dict) else []
-            logger.info(f"  {t['table_name']}: {len(t.get('columns', []))} columns, PK: {pk_cols}")
+            logger.info(
+                f"  {t.get('source_schema', 'unknown')}.{t['table_name']} -> "
+                f"{t.get('target_schema', 'unknown')}: {len(t.get('columns', []))} cols, PK: {pk_cols}"
+            )
 
+        # Push metadata to XCom
         context["ti"].xcom_push(key="table_count", value=len(tables))
         context["ti"].xcom_push(key="table_names", value=[t["table_name"] for t in tables])
+        context["ti"].xcom_push(
+            key="target_schemas",
+            value=list(set(t.get("target_schema") for t in tables if t.get("target_schema")))
+        )
 
         return tables
 
     @task
-    def create_target_schema(**context) -> str:
-        """Create target schema in PostgreSQL if it doesn't exist."""
+    def create_target_schemas(tables_schema: List[Dict[str, Any]], **context) -> List[str]:
+        """
+        Create all unique target schemas in PostgreSQL.
+
+        Target schemas are derived from source db/schema and embedded in tables_schema.
+        """
         params = context["params"]
-        schema_name = params["target_schema"]
 
         from airflow.providers.postgres.hooks.postgres import PostgresHook
         postgres_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
 
-        create_sql = f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'
-        postgres_hook.run(create_sql)
+        # Get unique target schemas from table info
+        target_schemas = list(set(
+            t.get("target_schema")
+            for t in tables_schema
+            if t.get("target_schema")
+        ))
 
-        logger.info(f"Ensured schema '{schema_name}' exists")
-        return f"Schema {schema_name} ready"
+        if not target_schemas:
+            raise ValueError("No target schemas found in table info")
+
+        created_schemas = []
+        for schema_name in sorted(target_schemas):
+            # Use quoted identifier for safety
+            create_sql = f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'
+            postgres_hook.run(create_sql)
+            logger.info(f"Ensured schema '{schema_name}' exists")
+            created_schemas.append(schema_name)
+
+        return created_schemas
 
     @task
     def create_tables_with_pks(
         tables_schema: List[Dict[str, Any]],
-        schema_status: str,
+        created_schemas: List[str],
         **context
-    ) -> List[str]:
+    ) -> List[Dict[str, str]]:
         """
         Create all tables in PostgreSQL WITH primary keys.
 
+        Uses target_schema from each table's info dict.
         No foreign keys or secondary indexes are created.
         """
         params = context["params"]
-        target_schema = params["target_schema"]
         drop_existing = params.get("drop_existing", True)
 
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
+        generator = DDLGenerator(params["target_conn_id"])
         created_tables = []
 
         for table_schema in tables_schema:
             table_name = table_schema["table_name"]
+            target_schema = table_schema.get("target_schema")
+
+            if not target_schema:
+                logger.error(f"No target_schema for table {table_name}, skipping")
+                continue
 
             try:
                 ddl_statements = []
@@ -194,29 +223,45 @@ def mssql_to_postgres_schema():
 
                 # Execute DDL
                 generator.execute_ddl(ddl_statements, transaction=False)
-                created_tables.append(table_name)
+
+                created_tables.append({
+                    "table_name": table_name,
+                    "source_schema": table_schema.get("source_schema", "unknown"),
+                    "target_schema": target_schema,
+                })
 
                 logger.info(f"Created table {target_schema}.{table_name} with PK")
 
             except Exception as e:
-                logger.error(f"Failed to create table {table_name}: {e}")
+                logger.error(f"Failed to create table {target_schema}.{table_name}: {e}")
                 raise
 
         logger.info(f"Successfully created {len(created_tables)} tables with primary keys")
         return created_tables
 
     @task
-    def log_schema_summary(created_tables: List[str], **context) -> str:
+    def log_schema_summary(created_tables: List[Dict[str, str]], **context) -> str:
         """Log summary of schema creation."""
         summary = f"Schema DAG complete: {len(created_tables)} tables created with PKs"
         logger.info(summary)
-        logger.info(f"Tables: {', '.join(created_tables)}")
+
+        # Group by target schema for nice summary
+        by_schema: Dict[str, List[str]] = {}
+        for t in created_tables:
+            schema = t.get("target_schema", "unknown")
+            if schema not in by_schema:
+                by_schema[schema] = []
+            by_schema[schema].append(t["table_name"])
+
+        for schema, tables in by_schema.items():
+            logger.info(f"  {schema}: {', '.join(tables)}")
+
         return summary
 
     # Task flow
     schema_data = extract_source_schema()
-    schema_status = create_target_schema()
-    created_tables = create_tables_with_pks(schema_data, schema_status)
+    created_schemas = create_target_schemas(schema_data)
+    created_tables = create_tables_with_pks(schema_data, created_schemas)
     summary = log_schema_summary(created_tables)
 
 
