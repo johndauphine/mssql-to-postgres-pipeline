@@ -353,11 +353,12 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
 
 Tables must be explicitly specified in `schema.table` format. The target PostgreSQL schema is automatically derived as `{database}__{schema}` (lowercase). For example, `dbo.Users` from `StackOverflow2010` becomes `stackoverflow2010__dbo.Users`.
 
-**Configuration priority (highest to lowest):**
+**Default value resolution (when param not provided):**
 
-1. **Config file**: `config/{database}_include_tables.txt`
-2. **Environment variable**: `INCLUDE_TABLES`
-3. **DAG parameter**: `include_tables` (when triggering)
+1. **Config file**: `config/{database}_include_tables.txt` (loaded at runtime)
+2. **Environment variable**: `INCLUDE_TABLES` (loaded at DAG parse time)
+
+Note: When triggering a DAG with `--conf`, the `include_tables` parameter overrides these defaults.
 
 **Config file format** (`config/StackOverflow2010_include_tables.txt`):
 ```

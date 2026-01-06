@@ -289,7 +289,7 @@ def load_include_tables_from_config(mssql_conn_id: str) -> List[str]:
         config_file = CONFIG_DIR / f"{safe_database}_include_tables.txt"
         if config_file.exists():
             logger.info(f"Loading include_tables from {config_file}")
-            with open(config_file, 'r') as f:
+            with open(config_file, 'r', encoding='utf-8') as f:
                 tables = [
                     line.strip()
                     for line in f
