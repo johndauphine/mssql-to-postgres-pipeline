@@ -107,7 +107,21 @@ def get_partition_count(row_count: int) -> int:
 def mssql_to_postgres_migration():
     """Migration DAG: Trigger schema DAG, then transfer data."""
 
-    # Step 1: Trigger schema DAG to ensure tables exist
+    from airflow.operators.empty import EmptyOperator
+
+    @task.branch
+    def check_skip_schema(**context) -> str:
+        """Branch based on skip_schema_dag parameter."""
+        params = context["params"]
+        if params.get("skip_schema_dag", False):
+            logger.info("Skipping schema DAG trigger (skip_schema_dag=True)")
+            return "skip_schema_dag_task"
+        return "trigger_schema_dag"
+
+    # Branch decision
+    branch = check_skip_schema()
+
+    # Step 1a: Trigger schema DAG to ensure tables exist
     trigger_schema = TriggerDagRunOperator(
         task_id="trigger_schema_dag",
         trigger_dag_id="mssql_to_postgres_schema",
@@ -121,7 +135,12 @@ def mssql_to_postgres_migration():
         },
     )
 
-    @task
+    # Step 1b: Skip trigger (dummy task for branching)
+    skip_schema = EmptyOperator(task_id="skip_schema_dag_task")
+
+    branch >> [trigger_schema, skip_schema]
+
+    @task(trigger_rule="none_failed_min_one_success")
     def discover_target_tables(**context) -> List[Dict[str, Any]]:
         """
         Discover tables from target PostgreSQL based on include_tables.
@@ -541,19 +560,19 @@ def mssql_to_postgres_migration():
         ti = context["ti"]
         all_results = []
 
-        # Manually pull XCom from each transfer task
+        # Manually pull XCom from each transfer task (use explicit task IDs)
         regular_results = ti.xcom_pull(
             task_ids="transfer_table_data",
             key="return_value",
             default=[]
         )
         first_results = ti.xcom_pull(
-            task_ids="transfer_partition",
+            task_ids="transfer_first_partitions",
             key="return_value",
             default=[]
         )
         remaining_results = ti.xcom_pull(
-            task_ids="transfer_partition__1",
+            task_ids="transfer_remaining_partitions",
             key="return_value",
             default=[]
         )
@@ -623,13 +642,15 @@ def mssql_to_postgres_migration():
 
         reset_count = 0
 
+        from psycopg2 import sql
+
         for target_schema in target_schemas:
             # Find columns with sequences (SERIAL/BIGSERIAL) in this schema
             seq_query = """
                 SELECT table_name, column_name
                 FROM information_schema.columns
                 WHERE table_schema = %s
-                  AND column_default LIKE 'nextval%%'
+                  AND column_default LIKE 'nextval%'
             """
             seq_columns = pg_hook.get_records(seq_query, parameters=[target_schema])
 
@@ -639,14 +660,20 @@ def mssql_to_postgres_migration():
                         if (target_schema, table_name) not in successful:
                             continue
                         try:
-                            quoted_table = f'"{target_schema}"."{table_name}"'
-                            reset_sql = f"""
+                            # Use sql.Identifier for proper escaping to prevent SQL injection
+                            reset_sql = sql.SQL("""
                             SELECT setval(
-                                pg_get_serial_sequence('{quoted_table}', '{col_name}'),
-                                COALESCE((SELECT MAX("{col_name}") FROM "{target_schema}"."{table_name}"), 1),
+                                pg_get_serial_sequence({table}, {column}),
+                                COALESCE((SELECT MAX({col_id}) FROM {schema}.{table_id}), 1),
                                 true
                             )
-                            """
+                            """).format(
+                                table=sql.Literal(f"{target_schema}.{table_name}"),
+                                column=sql.Literal(col_name),
+                                col_id=sql.Identifier(col_name),
+                                schema=sql.Identifier(target_schema),
+                                table_id=sql.Identifier(table_name),
+                            )
                             cursor.execute(reset_sql)
                             reset_count += 1
                             logger.info(f"Reset sequence for {target_schema}.{table_name}.{col_name}")
@@ -702,10 +729,11 @@ def mssql_to_postgres_migration():
     # Task Flow
     # =========================================================================
 
-    # 1. Trigger schema DAG first
+    # 1. Branch based on skip_schema_dag, then trigger schema DAG or skip
     # 2. Discover tables from target PostgreSQL (using derived schemas)
     tables = discover_target_tables()
-    trigger_schema >> tables
+    # Both branches lead to tables discovery (trigger_rule handles skipped upstream)
+    [trigger_schema, skip_schema] >> tables
 
     # 3. Get row counts from source
     tables_with_counts = get_source_row_counts(tables)
@@ -720,15 +748,16 @@ def mssql_to_postgres_migration():
 
     # 6. Transfer data
     regular_results = transfer_table_data.expand(table_info=regular)
-    first_results = transfer_partition.expand(partition_info=first_parts)
-    remaining_results = transfer_partition.expand(partition_info=remaining_parts)
+    # Use explicit task IDs for partition transfers to avoid relying on auto-generated names
+    first_results = transfer_partition.override(task_id="transfer_first_partitions").expand(partition_info=first_parts)
+    remaining_results = transfer_partition.override(task_id="transfer_remaining_partitions").expand(partition_info=remaining_parts)
 
     # First partitions must complete before remaining (prevent truncate race)
     first_results >> remaining_results
 
-    # 7. Collect results
+    # 7. Collect results (wait for all transfer tasks)
     results = collect_results()
-    [regular_results, remaining_results] >> results
+    [regular_results, first_results, remaining_results] >> results
 
     # 8. Reset sequences
     seq_status = reset_sequences(tables_with_counts, results)

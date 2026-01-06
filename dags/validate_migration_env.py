@@ -50,6 +50,9 @@ DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
         "retries": 2,
     },
     params={
+        # Note: source_conn_id/target_conn_id are accepted for API compatibility when
+        # triggered by other DAGs, but this DAG uses environment variables for actual
+        # connections due to Airflow 3.0 SDK connection resolution issues.
         "source_conn_id": Param(default="mssql_source", type="string"),
         "target_conn_id": Param(default="postgres_target", type="string"),
         "include_tables": Param(

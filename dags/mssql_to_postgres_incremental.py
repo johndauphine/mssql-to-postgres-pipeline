@@ -130,6 +130,9 @@ def mssql_to_postgres_incremental():
         Ensure migration state table exists in target database.
 
         State is stored in public._migration_state (fixed schema).
+        Note: This requires the 'public' schema to exist and be accessible.
+        The schema is intentionally fixed to preserve state across migrations
+        regardless of target schema naming.
 
         Returns:
             Status message

@@ -125,6 +125,11 @@ def derive_target_schema(source_db: str, source_schema: str) -> str:
     - Replace special chars with underscores
     - Truncate to 63 chars (PostgreSQL identifier limit)
 
+    Note: The double underscore separator could cause ambiguity if source
+    schemas contain double underscores (e.g., "db__schema" vs "db" + "__schema").
+    Also, different source names may collide after sanitization
+    (e.g., "My-DB" and "My_DB" both become "my_db__*").
+
     Args:
         source_db: Source database name
         source_schema: Source schema name
@@ -217,6 +222,11 @@ def expand_include_tables_param(include_tables_raw) -> List[str]:
                     expanded.append(item.strip())
         return expanded
 
+    # Unsupported type - log warning to help debug configuration issues
+    logger.warning(
+        "expand_include_tables_param received unsupported type %s; returning empty list.",
+        type(include_tables_raw).__name__,
+    )
     return []
 
 

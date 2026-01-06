@@ -262,7 +262,7 @@ def mssql_to_postgres_schema():
     schema_data = extract_source_schema()
     created_schemas = create_target_schemas(schema_data)
     created_tables = create_tables_with_pks(schema_data, created_schemas)
-    summary = log_schema_summary(created_tables)
+    log_schema_summary(created_tables)
 
 
 # Instantiate
