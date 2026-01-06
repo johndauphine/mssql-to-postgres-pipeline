@@ -515,3 +515,65 @@ def extract_schema_info(
     """
     extractor = SchemaExtractor(mssql_conn_id)
     return extractor.get_all_tables_schema(schema_name, exclude_tables, include_tables)
+
+
+def extract_schema_for_tables(
+    mssql_conn_id: str,
+    schema_tables: Dict[str, List[str]],
+    target_schema_map: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Extract schema information for specified tables grouped by source schema.
+
+    This function is used when tables are explicitly specified in schema.table format
+    and target schemas are derived (e.g., sourcedb__sourceschema).
+
+    Args:
+        mssql_conn_id: Airflow connection ID for SQL Server
+        schema_tables: Dict mapping source schema to list of table names
+                       e.g., {"dbo": ["Users", "Posts"], "sales": ["Orders"]}
+        target_schema_map: Optional dict mapping source schema to target schema
+                          e.g., {"dbo": "stackoverflow2010__dbo"}
+                          If not provided, target_schema is not added to results.
+
+    Returns:
+        List of complete table schema information, each with:
+        - source_schema: Original schema from SQL Server
+        - target_schema: Derived PostgreSQL schema (if target_schema_map provided)
+        - All other schema info (columns, primary_key, etc.)
+
+    Example:
+        schema_tables = {"dbo": ["Users", "Posts"]}
+        target_schema_map = {"dbo": "stackoverflow2010__dbo"}
+
+        results = extract_schema_for_tables(
+            "mssql_source",
+            schema_tables,
+            target_schema_map
+        )
+        # Results include source_schema and target_schema for each table
+    """
+    extractor = SchemaExtractor(mssql_conn_id)
+    all_tables = []
+
+    for source_schema, tables in schema_tables.items():
+        logger.info(f"Extracting schema for {len(tables)} tables from {source_schema}")
+
+        # Extract schema info for tables in this schema
+        schema_results = extractor.get_all_tables_schema(
+            schema_name=source_schema,
+            exclude_patterns=None,
+            include_tables=tables
+        )
+
+        # Add source_schema and target_schema to each table result
+        for table_info in schema_results:
+            table_info['source_schema'] = source_schema
+
+            if target_schema_map and source_schema in target_schema_map:
+                table_info['target_schema'] = target_schema_map[source_schema]
+
+            all_tables.append(table_info)
+
+    logger.info(f"Total: extracted schema for {len(all_tables)} tables")
+    return all_tables

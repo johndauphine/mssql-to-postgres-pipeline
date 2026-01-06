@@ -3,6 +3,9 @@ SQL Server to PostgreSQL Incremental Migration DAG
 
 This DAG performs incremental data synchronization from SQL Server to PostgreSQL.
 
+Tables must be explicitly specified in 'schema.table' format in include_tables.
+Target PostgreSQL schema is derived as: {sourcedb}__{sourceschema} (lowercase)
+
 Default mode (use_staging=True):
 Uses a staging table pattern for efficient sync:
 1. COPY all source rows to an UNLOGGED staging table
@@ -19,7 +22,7 @@ Requires:
 - Target tables already exist (run full migration first)
 - Tables must have primary keys for upsert operations
 
-State is tracked in _migration_state table in target database.
+State is tracked in public._migration_state table in target database.
 """
 
 from airflow.decorators import dag, task
@@ -40,6 +43,9 @@ DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '10000
 PARTITION_THRESHOLD = int(os.environ.get('PARTITION_THRESHOLD', '1000000'))  # Tables > 1M rows get partitioned
 MAX_PARTITIONS_PER_TABLE = int(os.environ.get('MAX_PARTITIONS_PER_TABLE', '6'))
 
+# Default tables from environment variable (fallback)
+DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
+
 # Import migration modules
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.incremental_state import IncrementalStateManager
@@ -48,6 +54,13 @@ from mssql_pg_migration.data_transfer import (
     transfer_incremental,
     transfer_incremental_staging,
     transfer_incremental_staging_partitioned,
+)
+from mssql_pg_migration.table_config import (
+    expand_include_tables_param,
+    validate_include_tables,
+    parse_include_tables,
+    get_source_database,
+    derive_target_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,25 +93,9 @@ logger = logging.getLogger(__name__)
             type="string",
             description="PostgreSQL connection ID"
         ),
-        "source_schema": Param(
-            default="dbo",
-            type="string",
-            description="Source schema in SQL Server"
-        ),
-        "target_schema": Param(
-            default="public",
-            type="string",
-            description="Target schema in PostgreSQL"
-        ),
         "include_tables": Param(
             default=[],
-            type="array",
-            description="List of specific tables to sync (if empty, all tables)"
-        ),
-        "exclude_tables": Param(
-            default=[],
-            type="array",
-            description="List of table patterns to exclude"
+            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
         ),
         "use_staging": Param(
             default=True,
@@ -139,6 +136,11 @@ def mssql_to_postgres_incremental():
         """
         Ensure migration state table exists in target database.
 
+        State is stored in public._migration_state (fixed schema).
+        Note: This requires the 'public' schema to exist and be accessible.
+        The schema is intentionally fixed to preserve state across migrations
+        regardless of target schema naming.
+
         Returns:
             Status message
         """
@@ -152,6 +154,7 @@ def mssql_to_postgres_incremental():
         """
         Discover tables to sync from source database.
 
+        Parses include_tables in schema.table format and derives target schemas.
         Filters to tables that:
         - Have a primary key (required for diff detection)
         - Exist in target database
@@ -160,74 +163,80 @@ def mssql_to_postgres_incremental():
             List of table info dicts with PK information
         """
         params = context["params"]
-        source_schema = params["source_schema"]
-        target_schema = params["target_schema"]
+        source_conn_id = params["source_conn_id"]
 
-        # Parse include_tables - handle various formats
+        # Parse and expand include_tables parameter
         include_tables_raw = params.get("include_tables", [])
-        if isinstance(include_tables_raw, str):
-            import json
-            try:
-                include_tables = json.loads(include_tables_raw)
-            except json.JSONDecodeError:
-                include_tables = [t.strip() for t in include_tables_raw.split(',') if t.strip()]
-        else:
-            include_tables = include_tables_raw
+        include_tables = expand_include_tables_param(include_tables_raw)
 
-        # Handle nested comma-separated items
-        if include_tables and isinstance(include_tables, list):
-            expanded = []
-            for item in include_tables:
-                if isinstance(item, str) and ',' in item:
-                    expanded.extend([t.strip() for t in item.split(',') if t.strip()])
-                elif isinstance(item, str) and item.strip():
-                    expanded.append(item.strip())
-            include_tables = expanded
+        # Fall back to environment variable if empty
+        if not include_tables and DEFAULT_INCLUDE_TABLES:
+            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
 
-        # Get source tables with schema info
-        tables = schema_extractor.extract_schema_info(
-            mssql_conn_id=params["source_conn_id"],
-            schema_name=source_schema,
-            exclude_tables=params.get("exclude_tables", []),
-            include_tables=include_tables or None
-        )
+        # Validate include_tables
+        validate_include_tables(include_tables)
 
-        logger.info(f"Found {len(tables)} tables in source")
+        # Parse into {schema: [tables]} dict
+        schema_tables = parse_include_tables(include_tables)
 
-        # Check which tables exist in target and have PKs
+        # Get source database name for deriving target schemas
+        source_db = get_source_database(source_conn_id)
+
+        logger.info(f"Discovering tables from schemas: {list(schema_tables.keys())}")
+
+        # Build target schema map
+        target_schema_map = {
+            src_schema: derive_target_schema(source_db, src_schema)
+            for src_schema in schema_tables.keys()
+        }
+
+        # Initialize state manager for checking target tables
         state_manager = IncrementalStateManager(params["target_conn_id"])
         syncable_tables = []
 
-        for table in tables:
-            table_name = table["table_name"]
-            pk_columns = table.get("pk_columns", {})
+        for source_schema, tables in schema_tables.items():
+            target_schema = target_schema_map[source_schema]
 
-            # Skip tables without primary keys
-            if not pk_columns or not pk_columns.get("columns"):
-                logger.warning(
-                    f"Skipping {table_name}: no primary key (required for incremental sync)"
-                )
-                continue
+            # Get source tables with schema info for this schema
+            source_tables = schema_extractor.extract_schema_info(
+                mssql_conn_id=source_conn_id,
+                schema_name=source_schema,
+                exclude_tables=[],
+                include_tables=tables
+            )
 
-            # Check if target table exists and has data
-            if not state_manager.target_table_has_data(table_name, target_schema):
-                logger.warning(
-                    f"Skipping {table_name}: target table is empty or doesn't exist. "
-                    "Run full migration first."
-                )
-                continue
+            logger.info(f"Found {len(source_tables)} tables in {source_schema}")
 
-            # Build table info for sync
-            table_info = {
-                "table_name": table_name,
-                "source_schema": source_schema,
-                "target_schema": target_schema,
-                "target_table": table_name,
-                "row_count": table.get("row_count", 0),
-                "columns": [col["column_name"] for col in table["columns"]],
-                "pk_columns": [col["name"] for col in pk_columns.get("columns", [])],
-            }
-            syncable_tables.append(table_info)
+            for table in source_tables:
+                table_name = table["table_name"]
+                pk_columns = table.get("pk_columns", {})
+
+                # Skip tables without primary keys
+                if not pk_columns or not pk_columns.get("columns"):
+                    logger.warning(
+                        f"Skipping {source_schema}.{table_name}: no primary key (required for incremental sync)"
+                    )
+                    continue
+
+                # Check if target table exists and has data
+                if not state_manager.target_table_has_data(table_name, target_schema):
+                    logger.warning(
+                        f"Skipping {source_schema}.{table_name}: target table {target_schema}.{table_name} "
+                        "is empty or doesn't exist. Run full migration first."
+                    )
+                    continue
+
+                # Build table info for sync
+                table_info = {
+                    "table_name": table_name,
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "target_table": table_name,
+                    "row_count": table.get("row_count", 0),
+                    "columns": [col["column_name"] for col in table["columns"]],
+                    "pk_columns": [col["name"] for col in pk_columns.get("columns", [])],
+                }
+                syncable_tables.append(table_info)
 
         logger.info(f"Prepared {len(syncable_tables)} tables for incremental sync")
 
@@ -416,7 +425,7 @@ def mssql_to_postgres_incremental():
 
         # Non-partitioned table sync (original logic)
         logger.info(
-            f"Starting incremental sync for {source_schema}.{table_name} "
+            f"Starting incremental sync for {source_schema}.{table_name} -> {target_schema}.{table_name} "
             f"(mode: {'staging' if use_staging else 'legacy'})"
         )
 
@@ -462,6 +471,8 @@ def mssql_to_postgres_incremental():
 
                 return {
                     "table_name": table_name,
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
                     "status": "synced" if transfer_result["success"] else "failed",
                     "rows_inserted": rows_inserted,
                     "rows_updated": rows_updated,
@@ -502,7 +513,7 @@ def mssql_to_postgres_incremental():
                 unchanged_count = diff_result["unchanged_count"]
 
                 logger.info(
-                    f"{table_name}: {new_count:,} new, {changed_count:,} changed, "
+                    f"{source_schema}.{table_name}: {new_count:,} new, {changed_count:,} changed, "
                     f"{unchanged_count:,} unchanged"
                 )
 
@@ -517,6 +528,8 @@ def mssql_to_postgres_incremental():
                     )
                     return {
                         "table_name": table_name,
+                        "source_schema": source_schema,
+                        "target_schema": target_schema,
                         "status": "no_changes",
                         "new_count": 0,
                         "changed_count": 0,
@@ -554,6 +567,8 @@ def mssql_to_postgres_incremental():
 
                 return {
                     "table_name": table_name,
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
                     "status": "synced" if transfer_result["success"] else "failed",
                     "new_count": new_count,
                     "changed_count": changed_count,
@@ -567,10 +582,12 @@ def mssql_to_postgres_incremental():
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"Error syncing {table_name}: {error_msg}")
+            logger.error(f"Error syncing {source_schema}.{table_name}: {error_msg}")
             state_manager.fail_sync(sync_id=sync_id, error=error_msg)
             return {
                 "table_name": table_name,
+                "source_schema": source_schema,
+                "target_schema": target_schema,
                 "status": "failed",
                 "success": False,
                 "errors": [error_msg],
@@ -622,7 +639,10 @@ def mssql_to_postgres_incremental():
         )
 
         if tables_failed > 0:
-            failed_tables = [r["table_name"] for r in sync_results if not r.get("success")]
+            failed_tables = [
+                f"{r.get('source_schema', '')}.{r['table_name']}"
+                for r in sync_results if not r.get("success")
+            ]
             logger.error(f"Failed tables: {', '.join(failed_tables)}")
 
         return summary

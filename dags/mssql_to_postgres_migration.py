@@ -1,15 +1,25 @@
 """
-SQL Server to PostgreSQL Migration DAG
+SQL Server to PostgreSQL Migration DAG (Data Transfer Only)
 
-This DAG performs a complete schema and data migration from SQL Server to PostgreSQL.
-It handles:
-1. Schema extraction from SQL Server
-2. Data type mapping from SQL Server to PostgreSQL
-3. Table creation in PostgreSQL
-4. Data transfer with chunking and parallelization
-5. Row count validation and reporting
+This DAG performs data transfer from SQL Server to PostgreSQL.
+It assumes tables already exist in the target (created by schema DAG).
 
-The DAG is designed to be generic and reusable for any SQL Server database migration.
+Tables must be explicitly specified in 'schema.table' format in include_tables.
+Target PostgreSQL schema is derived as: {sourcedb}__{sourceschema} (lowercase)
+
+Workflow:
+1. Trigger schema DAG (ensures tables exist with PKs)
+2. Discover tables from target PostgreSQL (using derived schemas)
+3. Get row counts from source SQL Server
+4. Partition large tables for parallel transfer
+5. Transfer data via TRUNCATE + COPY
+6. Reset sequences for SERIAL columns
+7. Trigger validation DAG
+
+This DAG does NOT:
+- Create or drop tables (schema DAG does this)
+- Create primary keys (schema DAG does this)
+- Create foreign keys or indexes (not supported)
 """
 
 from airflow.decorators import dag, task
@@ -23,68 +33,54 @@ import logging
 import re
 import os
 
-# Read configuration from environment (set in docker-compose.yml or .env)
-# MAX_PARALLEL_TRANSFERS: how many table/partition transfers run concurrently
-# MAX_ACTIVE_TASKS: total concurrent tasks across the entire DAG run
-# DEFAULT_CHUNK_SIZE: rows per batch during data transfer
-MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
-MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
-DEFAULT_CHUNK_SIZE = int(os.environ.get('DEFAULT_CHUNK_SIZE', '200000'))
-
-# Import our custom migration modules
-from mssql_pg_migration import (
-    schema_extractor,
-    ddl_generator,
-    data_transfer,
-    validation,
-)
-from mssql_pg_migration.notifications import (
-    on_dag_failure,
-    on_task_failure,
-    send_success_notification,
+from mssql_pg_migration import data_transfer
+from mssql_pg_migration.notifications import send_success_notification
+from mssql_pg_migration.table_config import (
+    expand_include_tables_param,
+    validate_include_tables,
+    parse_include_tables,
+    get_source_database,
+    derive_target_schema,
 )
 
 logger = logging.getLogger(__name__)
 
+# Configuration from environment
+MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
+MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
+DEFAULT_CHUNK_SIZE = int(os.environ.get('DEFAULT_CHUNK_SIZE', '200000'))
+LARGE_TABLE_THRESHOLD = 1_000_000
+
+# Default tables from environment variable (fallback)
+DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
+
 
 def validate_sql_identifier(identifier: str, identifier_type: str = "identifier") -> str:
-    """
-    Validate and sanitize SQL identifiers to prevent SQL injection.
-    
-    SQL identifiers (table names, column names, schema names) must:
-    - Start with a letter or underscore
-    - Contain only alphanumeric characters and underscores
-    - Be 128 characters or less (SQL Server limit)
-    
-    Args:
-        identifier: The SQL identifier to validate
-        identifier_type: Type of identifier (for error messages)
-    
-    Returns:
-        The validated identifier
-        
-    Raises:
-        ValueError: If the identifier is invalid or potentially unsafe
-    """
+    """Validate SQL identifiers to prevent injection."""
     if not identifier:
         raise ValueError(f"Invalid {identifier_type}: cannot be empty")
-    
     if len(identifier) > 128:
-        raise ValueError(f"Invalid {identifier_type}: exceeds maximum length of 128 characters")
-    
-    # SQL identifiers must start with letter or underscore, contain only alphanumeric and underscore
+        raise ValueError(f"Invalid {identifier_type}: exceeds maximum length")
     if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
-        raise ValueError(
-            f"Invalid {identifier_type} '{identifier}': must start with letter or underscore "
-            "and contain only alphanumeric characters and underscores"
-        )
-    
+        raise ValueError(f"Invalid {identifier_type} '{identifier}'")
     return identifier
 
 
+def get_partition_count(row_count: int) -> int:
+    """Calculate optimal partition count based on table size."""
+    max_partitions = int(os.environ.get('MAX_PARTITIONS', '8'))
+    if row_count < 2_000_000:
+        return min(2, max_partitions)
+    elif row_count < 5_000_000:
+        return min(4, max_partitions)
+    else:
+        return max_partitions
+
+
 @dag(
+    dag_id="mssql_to_postgres_migration",
     start_date=datetime(2025, 1, 1),
-    schedule=None,  # Run manually or trigger via API
+    schedule=None,
     catchup=False,
     max_active_runs=1,
     max_active_tasks=MAX_ACTIVE_TASKS,
@@ -94,405 +90,320 @@ def validate_sql_identifier(identifier: str, identifier_type: str = "identifier"
         "owner": "data-team",
         "retries": 3,
         "retry_delay": timedelta(seconds=30),
-        "retry_exponential_backoff": False,
-        "max_retry_delay": timedelta(minutes=30),
-        "pool": "default_pool",  # Use default pool for all tasks
-        # TEMP: Disabled for Airflow 3.0 - callbacks not yet implemented
-        # # "on_failure_callback": on_task_failure,
+        "pool": "default_pool",
     },
-    # on_failure_callback=on_dag_failure,
     params={
-        "source_conn_id": Param(
-            default="mssql_source",
-            type="string",
-            description="SQL Server connection ID"
-        ),
-        "target_conn_id": Param(
-            default="postgres_target",
-            type="string",
-            description="PostgreSQL connection ID"
-        ),
-        "source_schema": Param(
-            default="dbo",
-            type="string",
-            description="Source schema in SQL Server"
-        ),
-        "target_schema": Param(
-            default="public",
-            type="string",
-            description="Target schema in PostgreSQL"
-        ),
-        "chunk_size": Param(
-            default=DEFAULT_CHUNK_SIZE,
-            type="integer",
-            minimum=100,
-            maximum=500000,
-            description="Number of rows to transfer per batch"
-        ),
+        "source_conn_id": Param(default="mssql_source", type="string"),
+        "target_conn_id": Param(default="postgres_target", type="string"),
+        "chunk_size": Param(default=DEFAULT_CHUNK_SIZE, type="integer", minimum=100, maximum=500000),
         "include_tables": Param(
             default=[],
-            type="array",
-            description="List of specific tables to include (if empty, all tables are included)"
+            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
         ),
-        "exclude_tables": Param(
-            default=[],
-            type="array",
-            description="List of table patterns to exclude (supports wildcards)"
-        ),
-        "validate_samples": Param(
-            default=False,
-            type="boolean",
-            description="Whether to validate sample data (slower)"
-        ),
+        "skip_schema_dag": Param(default=False, type="boolean", description="Skip schema DAG trigger"),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
 def mssql_to_postgres_migration():
-    """
-    Main DAG for SQL Server to PostgreSQL migration.
-    """
+    """Migration DAG: Trigger schema DAG, then transfer data."""
 
-    @task
-    def extract_source_schema(**context) -> List[Dict[str, Any]]:
+    from airflow.operators.empty import EmptyOperator
+
+    @task.branch
+    def check_skip_schema(**context) -> str:
+        """Branch based on skip_schema_dag parameter."""
+        params = context["params"]
+        if params.get("skip_schema_dag", False):
+            logger.info("Skipping schema DAG trigger (skip_schema_dag=True)")
+            return "skip_schema_dag_task"
+        return "trigger_schema_dag"
+
+    # Branch decision
+    branch = check_skip_schema()
+
+    # Step 1a: Trigger schema DAG to ensure tables exist
+    trigger_schema = TriggerDagRunOperator(
+        task_id="trigger_schema_dag",
+        trigger_dag_id="mssql_to_postgres_schema",
+        wait_for_completion=True,
+        poke_interval=10,
+        conf={
+            "source_conn_id": "{{ params.source_conn_id }}",
+            "target_conn_id": "{{ params.target_conn_id }}",
+            "include_tables": "{{ params.include_tables | tojson }}",
+            "drop_existing": True,
+        },
+    )
+
+    # Step 1b: Skip trigger (dummy task for branching)
+    skip_schema = EmptyOperator(task_id="skip_schema_dag_task")
+
+    branch >> [trigger_schema, skip_schema]
+
+    @task(trigger_rule="none_failed_min_one_success")
+    def discover_target_tables(**context) -> List[Dict[str, Any]]:
         """
-        Extract complete schema information from SQL Server.
+        Discover tables from target PostgreSQL based on include_tables.
 
-        Returns:
-            List of table schema dictionaries
+        Parses include_tables, derives target schemas, and queries
+        information_schema to find tables, columns, and PK info.
         """
         params = context["params"]
-        logger.info(f"Extracting schema from {params['source_schema']} in SQL Server")
+        source_conn_id = params["source_conn_id"]
 
-        # Parse include_tables - handle string (JSON or CSV) and list formats
+        # Parse and expand include_tables parameter
         include_tables_raw = params.get("include_tables", [])
-        if isinstance(include_tables_raw, str):
-            # If it's a string, try to parse as JSON first
-            import json
-            try:
-                include_tables = json.loads(include_tables_raw)
-                logger.info(f"Parsed include_tables from JSON string: {len(include_tables)} tables")
-            except json.JSONDecodeError:
-                # If not valid JSON, treat as comma-separated list
-                include_tables = [t.strip() for t in include_tables_raw.split(',') if t.strip()]
-                logger.info(f"Parsed include_tables from comma-separated string: {len(include_tables)} tables")
-        else:
-            include_tables = include_tables_raw
+        include_tables = expand_include_tables_param(include_tables_raw)
 
-        # Handle case where list contains comma-separated strings (e.g., ["ACCT,EMPL"])
-        if include_tables and isinstance(include_tables, list):
-            expanded = []
-            for item in include_tables:
-                if isinstance(item, str) and ',' in item:
-                    # Split comma-separated items within the list
-                    expanded.extend([t.strip() for t in item.split(',') if t.strip()])
-                elif isinstance(item, str) and item.strip():
-                    expanded.append(item.strip())
-            include_tables = expanded
-            logger.info(f"Final include_tables: {len(include_tables)} tables")
+        # Fall back to environment variable if empty
+        if not include_tables and DEFAULT_INCLUDE_TABLES:
+            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
 
-        # Extract tables and their schemas (filtered at SQL level if include_tables specified)
-        tables = schema_extractor.extract_schema_info(
-            mssql_conn_id=params["source_conn_id"],
-            schema_name=params["source_schema"],
-            exclude_tables=params.get("exclude_tables", []),
-            include_tables=include_tables or None
-        )
+        # Validate include_tables
+        validate_include_tables(include_tables)
 
-        logger.info(f"Extracted schema for {len(tables)} tables")
+        # Parse into {schema: [tables]} dict
+        schema_tables = parse_include_tables(include_tables)
 
-        # Push summary to XCom for visibility
-        context["ti"].xcom_push(
-            key="extracted_tables",
-            value=[t["table_name"] for t in tables]
-        )
-        context["ti"].xcom_push(
-            key="total_row_count",
-            value=sum(t.get("row_count", 0) for t in tables)
-        )
+        # Get source database name for deriving target schemas
+        source_db = get_source_database(source_conn_id)
 
-        return tables
+        # Build mapping: source_schema -> target_schema
+        target_schema_map = {
+            src_schema: derive_target_schema(source_db, src_schema)
+            for src_schema in schema_tables.keys()
+        }
 
-    @task
-    def create_target_schema(schema_name: str, **context) -> str:
-        """
-        Create target schema in PostgreSQL if it doesn't exist.
+        logger.info(f"Target schemas to query: {list(target_schema_map.values())}")
 
-        Args:
-            schema_name: Schema name to create
-
-        Returns:
-            Schema creation status
-        """
-        params = context["params"]
         from airflow.providers.postgres.hooks.postgres import PostgresHook
+        pg_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
 
-        postgres_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
+        discovered_tables = []
 
-        # Quote schema name to preserve case in PostgreSQL
-        create_schema_sql = f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'
-        postgres_hook.run(create_schema_sql)
+        # Query each target schema
+        for source_schema, tables in schema_tables.items():
+            target_schema = target_schema_map[source_schema]
 
-        logger.info(f'Ensured schema "{schema_name}" exists in PostgreSQL')
-        return f"Schema {schema_name} ready"
+            # Get columns for tables in this schema
+            columns_query = """
+                SELECT table_name, column_name, ordinal_position
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                ORDER BY table_name, ordinal_position
+            """
+            columns_result = pg_hook.get_records(columns_query, parameters=[target_schema])
 
-    @task
-    def create_target_tables(
-        tables_schema: List[Dict[str, Any]],
-        schema_status: str,
-        **context
-    ) -> List[Dict[str, Any]]:
-        """
-        Create all tables in PostgreSQL with proper data types.
+            # Group columns by table
+            table_columns = {}
+            for row in columns_result:
+                tbl, col, _ = row
+                if tbl not in table_columns:
+                    table_columns[tbl] = []
+                table_columns[tbl].append(col)
 
-        Args:
-            tables_schema: List of table schemas from SQL Server
-            schema_status: Status from schema creation task
+            # Get primary key columns
+            pk_query = """
+                SELECT tc.table_name, kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                    ON tc.constraint_name = kcu.constraint_name
+                    AND tc.table_schema = kcu.table_schema
+                WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = %s
+                ORDER BY tc.table_name, kcu.ordinal_position
+            """
+            pk_result = pg_hook.get_records(pk_query, parameters=[target_schema])
 
-        Returns:
-            List of created tables with mapping information
-        """
-        params = context["params"]
-        target_schema = params["target_schema"]
+            # Group PKs by table
+            table_pks = {}
+            for row in pk_result:
+                tbl, col = row
+                if tbl not in table_pks:
+                    table_pks[tbl] = []
+                table_pks[tbl].append(col)
 
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
-        created_tables = []
+            # Build table info for tables in this schema
+            for table_name in tables:
+                # Check if table exists in target (case-insensitive match)
+                table_lower = table_name.lower()
+                found_table = None
+                for t in table_columns.keys():
+                    if t.lower() == table_lower:
+                        found_table = t
+                        break
 
-        for table_schema in tables_schema:
-            table_name = table_schema["table_name"]
-            logger.info(f"Creating table {target_schema}.{table_name}")
+                if not found_table:
+                    logger.warning(f"Table {target_schema}.{table_name} not found in target, skipping")
+                    continue
 
-            try:
-                # Remove PK constraint from CREATE TABLE - will be added after data load
-                # This is done by setting include_constraints=False in generate_create_table
-                ddl_statements = [generator.generate_drop_table(table_name, target_schema, cascade=True)]
-                ddl_statements.append(generator.generate_create_table(
-                    table_schema,
-                    target_schema,
-                    include_constraints=False  # Skip PK - added after data load
-                ))
-
-                # Execute DDL
-                generator.execute_ddl(ddl_statements, transaction=False)
-
-                # Prepare table info for data transfer
-                table_info = {
-                    "table_name": table_name,
-                    "source_schema": params["source_schema"],
+                discovered_tables.append({
+                    "table_name": found_table,
+                    "source_schema": source_schema,
                     "target_schema": target_schema,
-                    "target_table": table_name,
-                    "row_count": table_schema.get("row_count", 0),
-                    "columns": [col["column_name"] for col in table_schema["columns"]],
-                }
-                created_tables.append(table_info)
+                    "columns": table_columns.get(found_table, []),
+                    "pk_columns": table_pks.get(found_table, []),
+                })
 
-                logger.info(f"✓ Created table {table_name}")
-
-            except Exception as e:
-                logger.error(f"✗ Failed to create table {table_name}: {str(e)}")
-                raise
-
-        logger.info(f"Successfully created {len(created_tables)} tables")
-        return created_tables
-
-    # Threshold for partitioning large tables (rows)
-    # Lowered from 5M to 1M to catch more tables for better parallelization
-    LARGE_TABLE_THRESHOLD = 1_000_000
-
-    def get_partition_count(row_count: int) -> int:
-        """
-        Calculate optimal partition count based on table size.
-
-        Reads MAX_PARTITIONS from environment (default: 8 for 32GB systems).
-        Set MAX_PARTITIONS=4 for 16GB systems.
-        """
-        import os
-        max_partitions = int(os.environ.get('MAX_PARTITIONS', '8'))
-
-        if row_count < 2_000_000:
-            return min(2, max_partitions)
-        elif row_count < 5_000_000:
-            return min(4, max_partitions)
-        else:
-            return max_partitions
+        logger.info(f"Discovered {len(discovered_tables)} tables for migration")
+        return discovered_tables
 
     @task
-    def prepare_regular_tables(created_tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
+    def get_source_row_counts(tables: List[Dict[str, Any]], **context) -> List[Dict[str, Any]]:
         """
-        Filter out tables that are small enough to transfer without partitioning.
-        Large tables (>1M rows) will be handled by partition transfer.
-        """
-        regular_tables = []
+        Get row counts from source SQL Server for partitioning decisions.
 
-        logger.info(f"Categorizing {len(created_tables)} tables for transfer strategy...")
-
-        for table_info in created_tables:
-            row_count = table_info.get('row_count', 0)
-            table_name = table_info['table_name']
-
-            if row_count < LARGE_TABLE_THRESHOLD:
-                regular_tables.append(table_info)
-                logger.info(f"  {table_name} ({row_count:,} rows) → regular transfer")
-            else:
-                logger.info(f"  {table_name} ({row_count:,} rows) → will be partitioned")
-
-        logger.info(f"Summary: {len(regular_tables)} regular tables, {len(created_tables) - len(regular_tables)} to be partitioned")
-        return regular_tables
-
-    @task
-    def prepare_large_table_partitions(created_tables: List[Dict[str, Any]], **context) -> Dict[str, Any]:
-        """
-        Create partitions for any large table (>1M rows) using NTILE-based boundaries.
-
-        Uses NTILE to divide rows evenly by count (not by PK range), which:
-        - Works for ANY primary key type (integer, GUID, string)
-        - Handles sparse/gappy ID sequences correctly
-        - Guarantees balanced partitions
-
-        For composite PKs, uses ROW_NUMBER with row ranges instead.
-
-        P0.3 FIX: Returns both partitions and any tables that failed partitioning.
-        Failed tables are sent back to regular transfer as a fallback.
-
-        Returns:
-            Dict with 'partitions' list and 'fallback_tables' list
+        Uses source_schema from each table's info dict.
         """
         params = context["params"]
-        partitions = []
-        fallback_tables = []  # P0.3: Tables that failed partitioning - will use regular transfer
 
-        # Get MSSQL connection for querying partition boundaries
         from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
         mssql_hook = OdbcConnectionHelper(odbc_conn_id=params["source_conn_id"])
 
-        for table_info in created_tables:
-            row_count = table_info.get('row_count', 0)
-            table_name = table_info['table_name']
+        tables_with_counts = []
 
-            # Defensive logging to track partitioning decisions
-            logger.info(f"Evaluating {table_name}: {row_count:,} rows (threshold: {LARGE_TABLE_THRESHOLD:,})")
+        for table_info in tables:
+            table_name = table_info["table_name"]
+            source_schema = table_info["source_schema"]
 
-            if row_count < LARGE_TABLE_THRESHOLD:
-                logger.info(f"  → {table_name} will use regular transfer (below threshold)")
-                continue
-
-            logger.info(f"  → {table_name} will be partitioned (above threshold)")
-
-            source_schema = table_info.get('source_schema', params.get('source_schema', 'dbo'))
-
-            # Validate SQL identifiers to prevent SQL injection
             try:
-                safe_table_name = validate_sql_identifier(table_name, "table name")
-                safe_source_schema = validate_sql_identifier(source_schema, "schema name")
-            except ValueError as e:
-                # P0.3: Fall back to regular transfer instead of skipping
-                logger.warning(f"Invalid SQL identifier during table validation: {e} - falling back to regular transfer")
-                fallback_tables.append(table_info)
-                continue
+                # Get row count from SQL Server
+                count_query = f"""
+                    SELECT SUM(p.rows) as row_count
+                    FROM sys.partitions p
+                    INNER JOIN sys.tables t ON p.object_id = t.object_id
+                    INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    WHERE s.name = ? AND t.name = ? AND p.index_id IN (0, 1)
+                """
+                result = mssql_hook.get_first(count_query, parameters=[source_schema, table_name])
+                row_count = result[0] if result and result[0] else 0
 
-            # Get primary key columns info from schema extraction
-            pk_columns_info = table_info.get('pk_columns')
-
-            if not pk_columns_info or not pk_columns_info.get('columns'):
-                # Fallback: Query for primary key columns directly
+                # Get PK column info for partitioning
                 pk_query = """
                     SELECT c.name, t.name as data_type
                     FROM sys.indexes i
-                    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-                    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                    INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
-                    INNER JOIN sys.tables tbl ON i.object_id = tbl.object_id
-                    INNER JOIN sys.schemas s ON tbl.schema_id = s.schema_id
-                    WHERE i.is_primary_key = 1
-                      AND s.name = ? AND tbl.name = ?
+                    JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                    JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    JOIN sys.tables tbl ON i.object_id = tbl.object_id
+                    JOIN sys.schemas s ON tbl.schema_id = s.schema_id
+                    WHERE i.is_primary_key = 1 AND s.name = ? AND tbl.name = ?
                     ORDER BY ic.key_ordinal
                 """
-                pk_result = mssql_hook.get_records(pk_query, parameters=[safe_source_schema, safe_table_name])
-                if pk_result:
-                    pk_columns_info = {
-                        'columns': [{'name': row[0], 'data_type': row[1]} for row in pk_result],
-                        'is_composite': len(pk_result) > 1
-                    }
-                else:
-                    # No PK found - use first column as fallback
-                    logger.warning(f"No primary key found for {safe_table_name}, using ROW_NUMBER with first column")
-                    first_col_query = """
-                        SELECT TOP 1 c.name
-                        FROM sys.columns c
-                        INNER JOIN sys.tables t ON c.object_id = t.object_id
-                        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                        WHERE s.name = ? AND t.name = ?
-                        ORDER BY c.column_id
-                    """
-                    first_col = mssql_hook.get_first(first_col_query, parameters=[safe_source_schema, safe_table_name])
-                    pk_columns_info = {
-                        'columns': [{'name': first_col[0], 'data_type': 'unknown'}] if first_col else [],
-                        'is_composite': False
-                    }
+                pk_result = mssql_hook.get_records(pk_query, parameters=[source_schema, table_name])
+                pk_columns_info = {
+                    'columns': [{'name': r[0], 'data_type': r[1]} for r in pk_result] if pk_result else [],
+                    'is_composite': len(pk_result) > 1 if pk_result else False,
+                }
 
-            if not pk_columns_info.get('columns'):
-                # P0.3: Fall back to regular transfer instead of skipping
-                logger.warning(f"Could not determine ordering column for {safe_table_name} - falling back to regular transfer")
-                fallback_tables.append(table_info)
+                tables_with_counts.append({
+                    **table_info,
+                    "row_count": row_count,
+                    "pk_columns_info": pk_columns_info,
+                })
+
+                logger.info(f"  {source_schema}.{table_name}: {row_count:,} rows")
+
+            except Exception as e:
+                logger.warning(f"Could not get row count for {source_schema}.{table_name}: {e}")
+                tables_with_counts.append({
+                    **table_info,
+                    "row_count": 0,
+                    "pk_columns_info": {'columns': [], 'is_composite': False},
+                })
+
+        total_rows = sum(t["row_count"] for t in tables_with_counts)
+        logger.info(f"Total rows to transfer: {total_rows:,}")
+
+        return tables_with_counts
+
+    @task
+    def prepare_transfer_plan(tables: List[Dict[str, Any]], **context) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Prepare transfer plan: split into regular tables and partitioned tables.
+
+        Uses source_schema from each table's info dict.
+        Large tables (>1M rows) are partitioned for parallel transfer.
+        """
+        params = context["params"]
+
+        regular_tables = []
+        partitions = []
+
+        from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+        mssql_hook = OdbcConnectionHelper(odbc_conn_id=params["source_conn_id"])
+
+        for table_info in tables:
+            table_name = table_info["table_name"]
+            source_schema = table_info["source_schema"]
+            row_count = table_info.get("row_count", 0)
+            pk_info = table_info.get("pk_columns_info", {})
+            pk_columns = pk_info.get("columns", [])
+
+            if row_count < LARGE_TABLE_THRESHOLD:
+                # Small table: regular transfer
+                regular_tables.append({
+                    **table_info,
+                    "truncate_first": True,
+                })
+                logger.info(f"  {source_schema}.{table_name} ({row_count:,} rows) -> regular transfer")
                 continue
 
-            pk_columns = pk_columns_info['columns']
-            is_composite = pk_columns_info.get('is_composite', len(pk_columns) > 1)
-
-            # Validate PK column names
-            safe_pk_columns = []
-            for col in pk_columns:
-                try:
-                    safe_col = validate_sql_identifier(col['name'], "primary key column")
-                    safe_pk_columns.append(safe_col)
-                except ValueError as e:
-                    logger.error(f"Invalid primary key column for table {safe_table_name}: {e}")
-                    continue
-
-            if not safe_pk_columns:
-                # P0.3: Fall back to regular transfer instead of skipping
-                logger.warning(f"No valid PK columns for {safe_table_name} - falling back to regular transfer")
-                fallback_tables.append(table_info)
+            # Large table: partition it
+            if not pk_columns:
+                # No PK: fall back to regular transfer
+                logger.warning(f"  {source_schema}.{table_name} has no PK, using regular transfer")
+                regular_tables.append({
+                    **table_info,
+                    "truncate_first": True,
+                })
                 continue
 
+            is_composite = pk_info.get("is_composite", False)
             partition_count = get_partition_count(row_count)
 
-            if is_composite:
-                # Composite PK: Use ROW_NUMBER with row ranges
-                logger.info(f"Partitioning {safe_table_name} using ROW_NUMBER (composite PK: {', '.join(safe_pk_columns)})")
-                logger.info(f"  Using {partition_count} partitions (~{row_count // partition_count:,} rows each)")
+            try:
+                safe_table = validate_sql_identifier(table_name, "table")
+                safe_schema = validate_sql_identifier(source_schema, "schema")
+            except ValueError as e:
+                logger.warning(f"  {source_schema}.{table_name}: {e}, using regular transfer")
+                regular_tables.append({**table_info, "truncate_first": True})
+                continue
 
-                rows_per_partition = (row_count + partition_count - 1) // partition_count  # Ceiling division
+            if is_composite:
+                # Composite PK: use ROW_NUMBER ranges
+                rows_per_partition = (row_count + partition_count - 1) // partition_count
+                pk_col_names = [c['name'] for c in pk_columns]
 
                 for i in range(partition_count):
                     start_row = i * rows_per_partition + 1
                     end_row = min((i + 1) * rows_per_partition, row_count)
 
-                    partition_info = {
+                    partitions.append({
                         **table_info,
-                        'partition_name': f'partition_{i + 1}',
-                        'partition_index': i,
-                        'use_row_number': True,
-                        'order_by_columns': safe_pk_columns,
-                        'start_row': start_row,
-                        'end_row': end_row,
-                        'pk_column': safe_pk_columns[0],
-                        'estimated_rows': end_row - start_row + 1,
-                        'truncate_first': i == 0
-                    }
-                    partitions.append(partition_info)
-            else:
-                # Single-column PK: Use NTILE to get balanced partition boundaries
-                pk_column = safe_pk_columns[0]
-                logger.info(f"Partitioning {safe_table_name} using NTILE on [{pk_column}] ({row_count:,} rows)")
+                        "partition_name": f"partition_{i + 1}",
+                        "partition_index": i,
+                        "use_row_number": True,
+                        "order_by_columns": pk_col_names,
+                        "start_row": start_row,
+                        "end_row": end_row,
+                        "pk_column": pk_col_names[0],
+                        "estimated_rows": end_row - start_row + 1,
+                        "truncate_first": i == 0,
+                    })
 
-                # Query NTILE boundaries - this gives us actual boundary values for any PK type
+                logger.info(f"  {source_schema}.{table_name} ({row_count:,} rows) -> {partition_count} partitions (ROW_NUMBER)")
+            else:
+                # Single PK: use NTILE boundaries
+                pk_column = pk_columns[0]['name']
+                safe_pk = validate_sql_identifier(pk_column, "pk column")
+
                 boundaries_query = f"""
                 WITH numbered AS (
-                    SELECT [{pk_column}],
-                           NTILE({partition_count}) OVER (ORDER BY [{pk_column}]) as partition_id
-                    FROM [{safe_source_schema}].[{safe_table_name}]
+                    SELECT [{safe_pk}],
+                           NTILE({partition_count}) OVER (ORDER BY [{safe_pk}]) as partition_id
+                    FROM [{safe_schema}].[{safe_table}]
                 )
-                SELECT partition_id, MIN([{pk_column}]) as min_pk, MAX([{pk_column}]) as max_pk, COUNT(*) as row_count
+                SELECT partition_id, MIN([{safe_pk}]) as min_pk, MAX([{safe_pk}]) as max_pk, COUNT(*) as cnt
                 FROM numbered
                 GROUP BY partition_id
                 ORDER BY partition_id
@@ -501,714 +412,376 @@ def mssql_to_postgres_migration():
                 try:
                     boundaries = mssql_hook.get_records(boundaries_query)
                 except Exception as e:
-                    # P0.3: Fall back to regular transfer instead of skipping
-                    logger.warning(f"Error querying NTILE boundaries for {safe_table_name}: {e} - falling back to regular transfer")
-                    fallback_tables.append(table_info)
+                    logger.warning(f"  {source_schema}.{table_name}: NTILE failed ({e}), using regular transfer")
+                    regular_tables.append({**table_info, "truncate_first": True})
                     continue
 
                 if not boundaries:
-                    # P0.3: Fall back to regular transfer instead of skipping
-                    logger.warning(f"No partition boundaries returned for {safe_table_name} - falling back to regular transfer")
-                    fallback_tables.append(table_info)
+                    regular_tables.append({**table_info, "truncate_first": True})
                     continue
 
-                logger.info(f"  NTILE returned {len(boundaries)} partitions")
-
                 for i, boundary in enumerate(boundaries):
-                    partition_id, min_pk, max_pk, part_row_count = boundary
+                    _, min_pk, max_pk, part_count = boundary
 
-                    # Format boundary values for WHERE clause based on type
+                    # Format boundary values
                     if isinstance(min_pk, str):
-                        # String/GUID: use quoted values with proper escaping
-                        min_pk_sql = f"'{min_pk.replace(chr(39), chr(39)+chr(39))}'"
-                        max_pk_sql = f"'{max_pk.replace(chr(39), chr(39)+chr(39))}'"
+                        min_sql = f"'{min_pk.replace(chr(39), chr(39)+chr(39))}'"
+                        max_sql = f"'{max_pk.replace(chr(39), chr(39)+chr(39))}'"
                     elif isinstance(min_pk, (int, float)):
-                        # Numeric: use as-is
-                        min_pk_sql = str(min_pk)
-                        max_pk_sql = str(max_pk)
+                        min_sql = str(min_pk)
+                        max_sql = str(max_pk)
                     else:
-                        # Other types (datetime, etc): convert to string representation
-                        min_pk_sql = f"'{min_pk}'"
-                        max_pk_sql = f"'{max_pk}'"
+                        min_sql = f"'{min_pk}'"
+                        max_sql = f"'{max_pk}'"
 
                     # Build WHERE clause
                     if i == len(boundaries) - 1:
-                        # Last partition: >= min (no upper bound to catch any edge cases)
-                        where_clause = f"[{pk_column}] >= {min_pk_sql}"
+                        where = f"[{safe_pk}] >= {min_sql}"
                     elif i == 0:
-                        # First partition: <= max
-                        where_clause = f"[{pk_column}] <= {max_pk_sql}"
+                        where = f"[{safe_pk}] <= {max_sql}"
                     else:
-                        # Middle partitions: use both bounds
-                        where_clause = f"[{pk_column}] >= {min_pk_sql} AND [{pk_column}] <= {max_pk_sql}"
+                        where = f"[{safe_pk}] >= {min_sql} AND [{safe_pk}] <= {max_sql}"
 
-                    partition_info = {
+                    partitions.append({
                         **table_info,
-                        'partition_name': f'partition_{i + 1}',
-                        'partition_index': i,
-                        'where_clause': where_clause,
-                        'pk_column': pk_column,
-                        'estimated_rows': part_row_count,
-                        'truncate_first': i == 0
-                    }
-                    partitions.append(partition_info)
+                        "partition_name": f"partition_{i + 1}",
+                        "partition_index": i,
+                        "where_clause": where,
+                        "pk_column": pk_column,
+                        "estimated_rows": part_count,
+                        "truncate_first": i == 0,
+                    })
 
-                logger.info(f"  Created {len(boundaries)} partitions for {safe_table_name}")
+                logger.info(f"  {source_schema}.{table_name} ({row_count:,} rows) -> {len(boundaries)} partitions (NTILE)")
 
-        # Calculate total number of partitioned tables
-        partitioned_tables = len(set(p['table_name'] for p in partitions)) if partitions else 0
-        logger.info(f"Total: {len(partitions)} partitions across {partitioned_tables} large tables")
+        # Split partitions into first (truncate) and remaining (no truncate)
+        first_partitions = [p for p in partitions if p.get("truncate_first", False)]
+        remaining_partitions = [p for p in partitions if not p.get("truncate_first", False)]
 
-        # P0.3: Log and return fallback tables for regular transfer
-        if fallback_tables:
-            fallback_names = [t['table_name'] for t in fallback_tables]
-            logger.warning(f"P0.3 FALLBACK: {len(fallback_tables)} large tables will use regular transfer: {', '.join(fallback_names)}")
+        logger.info(f"Transfer plan: {len(regular_tables)} regular tables, "
+                   f"{len(first_partitions)} first partitions, {len(remaining_partitions)} remaining partitions")
 
         return {
-            'partitions': partitions,
-            'fallback_tables': fallback_tables
+            "regular": regular_tables,
+            "first_partitions": first_partitions,
+            "remaining_partitions": remaining_partitions,
         }
+
+    @task
+    def get_regular_tables(plan: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract regular tables from plan."""
+        return plan.get("regular", [])
+
+    @task
+    def get_first_partitions(plan: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract first partitions from plan."""
+        return plan.get("first_partitions", [])
+
+    @task
+    def get_remaining_partitions(plan: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Extract remaining partitions from plan."""
+        return plan.get("remaining_partitions", [])
 
     @task(max_active_tis_per_dagrun=MAX_PARALLEL_TRANSFERS)
     def transfer_table_data(table_info: Dict[str, Any], **context) -> Dict[str, Any]:
-        """
-        Transfer data for a single table from SQL Server to PostgreSQL.
-
-        Args:
-            table_info: Table information including source and target details
-
-        Returns:
-            Transfer result dictionary with statistics
-        """
+        """Transfer data for a single table (TRUNCATE + COPY)."""
         params = context["params"]
+        table_name = table_info["table_name"]
+        source_schema = table_info.get("source_schema", "unknown")
 
-        logger.info(
-            f"Starting data transfer for {table_info['table_name']} "
-            f"({table_info.get('row_count', 0):,} rows)"
-        )
+        logger.info(f"Transferring {source_schema}.{table_name} ({table_info.get('row_count', 0):,} rows)")
 
         result = data_transfer.transfer_table_data(
             mssql_conn_id=params["source_conn_id"],
             postgres_conn_id=params["target_conn_id"],
             table_info=table_info,
             chunk_size=params["chunk_size"],
-            truncate=True  # Ensure tables are truncated before transfer
+            truncate=table_info.get("truncate_first", True),
         )
 
-        # Add table name to result for tracking
-        result["table_name"] = table_info["table_name"]
+        result["table_name"] = table_name
+        result["source_schema"] = source_schema
+        result["target_schema"] = table_info.get("target_schema", "unknown")
 
         if result["success"]:
-            logger.info(
-                f"✓ {table_info['table_name']}: Transferred {result['rows_transferred']:,} rows "
-                f"in {result['elapsed_time_seconds']:.2f}s "
-                f"({result['avg_rows_per_second']:,.0f} rows/sec)"
-            )
+            logger.info(f"  {source_schema}.{table_name}: {result['rows_transferred']:,} rows "
+                       f"in {result['elapsed_time_seconds']:.1f}s "
+                       f"({result['avg_rows_per_second']:,.0f} rows/sec)")
         else:
-            logger.error(
-                f"✗ {table_info['table_name']}: Transfer failed or incomplete. "
-                f"Errors: {result.get('errors', [])}"
-            )
+            logger.error(f"  {source_schema}.{table_name}: FAILED - {result.get('errors', [])}")
 
         return result
 
     @task(max_active_tis_per_dagrun=MAX_PARALLEL_TRANSFERS)
     def transfer_partition(partition_info: Dict[str, Any], **context) -> Dict[str, Any]:
-        """
-        Transfer a partition of a large table in parallel.
-
-        Supports two partitioning modes:
-        - Single-column PK: Uses WHERE clause with NTILE-derived boundaries
-        - Composite PK: Uses ROW_NUMBER with row range boundaries
-
-        Args:
-            partition_info: Partition information including:
-                - where_clause: For single-column PK partitions
-                - use_row_number, start_row, end_row: For composite PK partitions
-
-        Returns:
-            Transfer result dictionary with statistics
-        """
+        """Transfer a partition of a large table."""
         params = context["params"]
-        table_name = partition_info['table_name']
-        partition_name = partition_info['partition_name']
+        table_name = partition_info["table_name"]
+        source_schema = partition_info.get("source_schema", "unknown")
+        partition_name = partition_info["partition_name"]
 
-        logger.info(
-            f"Starting {table_name} {partition_name} transfer "
-            f"(estimated {partition_info.get('estimated_rows', 0):,} rows)"
-        )
+        logger.info(f"Transferring {source_schema}.{table_name} {partition_name} "
+                   f"(~{partition_info.get('estimated_rows', 0):,} rows)")
 
-        # Transfer with WHERE clause for partitioning
         result = data_transfer.transfer_table_data(
             mssql_conn_id=params["source_conn_id"],
             postgres_conn_id=params["target_conn_id"],
             table_info=partition_info,
             chunk_size=params["chunk_size"],
-            truncate=partition_info.get('truncate_first', False),  # Only first partition truncates
-            where_clause=partition_info.get('where_clause')
+            truncate=partition_info.get("truncate_first", False),
+            where_clause=partition_info.get("where_clause"),
         )
 
-        # Add metadata to result for downstream processing
         result["table_name"] = table_name
+        result["source_schema"] = source_schema
+        result["target_schema"] = partition_info.get("target_schema", "unknown")
         result["partition_name"] = partition_name
         result["is_partition"] = True
-
-        # For partitions, success = rows transferred without errors
-        # The full table validation (comparing total source vs target counts) is done by validation DAG
-        # This fixes the issue where intermediate partitions would be marked failed because
-        # target_row_count (cumulative) != source_row_count (total or partition depending on PK type)
         result["success"] = len(result.get("errors", [])) == 0 and result.get("rows_transferred", 0) > 0
 
         if result["success"]:
-            logger.info(
-                f"✓ {table_name} {partition_name}: Transferred {result['rows_transferred']:,} rows "
-                f"in {result['elapsed_time_seconds']:.2f}s "
-                f"({result['avg_rows_per_second']:,.0f} rows/sec)"
-            )
+            logger.info(f"  {source_schema}.{table_name} {partition_name}: {result['rows_transferred']:,} rows "
+                       f"in {result['elapsed_time_seconds']:.1f}s")
         else:
-            logger.error(
-                f"✗ {table_name} {partition_name}: Transfer failed. "
-                f"Errors: {result.get('errors', [])}"
-            )
+            logger.error(f"  {source_schema}.{table_name} {partition_name}: FAILED")
 
         return result
 
     @task(trigger_rule="all_done")
-    def create_indexes(
-        tables_schema: List[Dict[str, Any]],
-        transfer_results: List[Dict[str, Any]],
-        **context
-    ) -> str:
+    def collect_results(**context) -> List[Dict[str, Any]]:
         """
-        Create indexes after data transfer for better performance.
+        Aggregate all transfer results by pulling XCom manually.
 
-        Building indexes after bulk data load is much faster than maintaining
-        indexes during inserts.
-
-        Args:
-            tables_schema: Original table schemas with index definitions
-            transfer_results: Results from data transfers
-
-        Returns:
-            Status message
-        """
-        params = context["params"]
-        target_schema = params["target_schema"]
-
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
-
-        # Only create indexes for successfully transferred tables
-        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
-        index_count = 0
-
-        for table_schema in tables_schema:
-            table_name = table_schema["table_name"]
-            if table_name not in successful_tables:
-                continue
-
-            index_statements = generator.generate_indexes(table_schema, target_schema)
-
-            for index_ddl in index_statements:
-                try:
-                    generator.execute_ddl([index_ddl], transaction=False)
-                    index_count += 1
-                    logger.info(f"✓ Created index for {table_name}")
-                except Exception as e:
-                    logger.warning(f"Could not create index: {str(e)}")
-
-        logger.info(f"Created {index_count} indexes")
-        return f"Created {index_count} indexes"
-
-    @task(trigger_rule="all_done")
-    def create_primary_keys(
-        tables_schema: List[Dict[str, Any]],
-        transfer_results: List[Dict[str, Any]],
-        **context
-    ) -> str:
-        """
-        Create primary key constraints after data transfer for better performance.
-
-        Building PK indexes after bulk data load is much faster than maintaining
-        them during inserts.
-
-        Args:
-            tables_schema: Original table schemas with PK definitions
-            transfer_results: Results from data transfers
-
-        Returns:
-            Status message
-        """
-        params = context["params"]
-        target_schema = params["target_schema"]
-
-        generator = ddl_generator.DDLGenerator(params["target_conn_id"])
-
-        # Only create PKs for successfully transferred tables
-        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
-        pk_count = 0
-
-        for table_schema in tables_schema:
-            table_name = table_schema["table_name"]
-            if table_name not in successful_tables:
-                continue
-
-            pk_ddl = generator.generate_primary_key(table_schema, target_schema)
-            if pk_ddl:
-                try:
-                    generator.execute_ddl([pk_ddl], transaction=False)
-                    pk_count += 1
-                    logger.info(f"✓ Created primary key for {table_name}")
-                except Exception as e:
-                    logger.warning(f"Could not create primary key for {table_name}: {str(e)}")
-
-        logger.info(f"Created {pk_count} primary key constraints")
-        return f"Created {pk_count} primary keys"
-
-    """
-    # Commented out - replaced with TriggerDagRunOperator to avoid XCom bug
-    @task(
-        outlets=[Asset("migration_validated")]
-    )
-    def validate_migration(
-        tables_info: List[Dict[str, Any]],
-        transfer_results: List[Dict[str, Any]],
-        **context
-    ) -> Dict[str, Any]:
-        '''
-        Validate the migration by comparing row counts and optionally sample data.
-
-        Args:
-            tables_info: List of table information
-            transfer_results: Results from data transfers
-
-        Returns:
-            Validation results with report
-        '''
-        params = context["params"]
-
-        logger.info("Starting migration validation")
-
-        # Validate all tables
-        validation_results = validation.validate_migration(
-            mssql_conn_id=params["source_conn_id"],
-            postgres_conn_id=params["target_conn_id"],
-            tables=tables_info,
-            validate_samples=params["validate_samples"],
-            transfer_results=transfer_results
-        )
-
-        # Push summary to XCom
-        context["ti"].xcom_push(key="validation_summary", value={
-            "total_tables": validation_results["total_tables"],
-            "passed_tables": validation_results["passed_count"],
-            "failed_tables": validation_results["failed_count"],
-            "success_rate": validation_results["success_rate"],
-            "overall_success": validation_results["overall_success"],
-        })
-
-        # Log the report
-        if validation_results.get("report"):
-            logger.info(f"\\n{validation_results['report']}")
-
-        # Raise alert if validation failed
-        if not validation_results["overall_success"]:
-            logger.warning(
-                f"Migration validation failed for {validation_results['failed_count']} tables. "
-                f"Check the report for details."
-            )
-
-        return validation_results
-    """
-
-    """
-    # Commented out - replaced with simplified version
-    @task
-    def generate_final_report(validation_results: Dict[str, Any], **context) -> str:
-        '''
-        Generate and output the final migration report.
-
-        Args:
-            validation_results: Validation results from previous task
-
-        Returns:
-            Final status message
-        '''
-        report = validation_results.get("report", "No report generated")
-
-        # Save report to a file if needed
-        # This could be extended to send the report via email, Slack, etc.
-
-        if validation_results["overall_success"]:
-            status = f"✓ Migration completed successfully for all {validation_results['total_tables']} tables"
-            logger.info(status)
-        else:
-            status = (
-                f"⚠ Migration completed with issues: "
-                f"{validation_results['failed_count']}/{validation_results['total_tables']} tables failed"
-            )
-            logger.warning(status)
-
-        # Push final status to XCom
-        context["ti"].xcom_push(key="final_status", value=status)
-
-        return status
-    """
-
-    # Define the task flow
-    schema_data = extract_source_schema()
-    schema_status = create_target_schema(schema_name="{{ params.target_schema }}")
-    created_tables = create_target_tables(schema_data, schema_status)
-
-    # Prepare transfer tasks - partition any large tables (>5M rows)
-    regular_tables_initial = prepare_regular_tables(created_tables)
-    large_table_result = prepare_large_table_partitions(created_tables)
-
-    # P0.3: Extract partitions and fallback tables from partition planning result
-    @task
-    def get_partitions(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract partitions from partition planning result."""
-        return result.get('partitions', [])
-
-    @task
-    def merge_with_fallback(
-        regular_tables: List[Dict[str, Any]],
-        partition_result: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """
-        P0.3: Merge fallback tables (large tables that failed partitioning)
-        with regular tables for transfer.
-        """
-        fallback_tables = partition_result.get('fallback_tables', [])
-        if fallback_tables:
-            fallback_names = [t['table_name'] for t in fallback_tables]
-            logger.info(f"P0.3: Adding {len(fallback_tables)} fallback tables to regular transfer: {', '.join(fallback_names)}")
-        return regular_tables + fallback_tables
-
-    # Merge regular tables with any fallback tables from partition failures
-    regular_tables = merge_with_fallback(regular_tables_initial, large_table_result)
-    large_table_partitions = get_partitions(large_table_result)
-
-    # Split partitions into first (truncates) and remaining (no truncate)
-    @task
-    def split_partitions(partitions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Split partitions into first partitions (that truncate) and remaining partitions.
-        This prevents race conditions where non-truncating partitions might insert
-        data before truncating partitions complete.
-        """
-        first_partitions = []
-        remaining_partitions = []
-        
-        for partition in partitions:
-            if partition.get('truncate_first', False):
-                first_partitions.append(partition)
-            else:
-                remaining_partitions.append(partition)
-        
-        logger.info(f"Split {len(partitions)} partitions: {len(first_partitions)} first, {len(remaining_partitions)} remaining")
-        return {
-            'first': first_partitions,
-            'remaining': remaining_partitions
-        }
-    
-    partition_groups = split_partitions(large_table_partitions)
-
-    # Transfer regular tables in parallel
-    regular_transfer_results = transfer_table_data.expand(
-        table_info=regular_tables
-    )
-    
-    # Transfer first partitions (with truncate) - must complete before remaining partitions
-    @task
-    def get_first_partitions(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """Extract first partitions from partition groups."""
-        return groups.get('first', [])
-    
-    @task
-    def get_remaining_partitions(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """Extract remaining partitions from partition groups."""
-        return groups.get('remaining', [])
-    
-    first_partitions_list = get_first_partitions(partition_groups)
-    remaining_partitions_list = get_remaining_partitions(partition_groups)
-    
-    # Transfer first partitions (these do the truncate operation)
-    # All first partitions from different tables run in parallel with each other
-    first_partition_results = transfer_partition.expand(
-        partition_info=first_partitions_list
-    )
-
-    # Transfer remaining partitions AFTER first partitions complete
-    # All remaining partitions run in parallel with each other, but wait for ALL
-    # first partitions to complete to prevent race conditions with truncate operations
-    remaining_partition_results = transfer_partition.expand(
-        partition_info=remaining_partitions_list
-    )
-
-    # IMPORTANT: First partitions MUST complete before remaining partitions start
-    # This prevents a race condition where the truncate operation in first partitions
-    # would delete data already written by other partitions
-    first_partition_results >> remaining_partition_results
-
-    # Collect all transfer results (both regular tables and partitioned large tables)
-    # In Airflow 3 TaskFlow API, pass expanded results directly as parameters
-    @task(trigger_rule="all_done")
-    def collect_all_results(
-        expected_tables: List[Dict[str, Any]],
-        regular_results: List[Dict[str, Any]],
-        first_partition_results: List[Dict[str, Any]],
-        remaining_partition_results: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Collect and aggregate results from all transfer tasks.
-
-        Compares expected tables (from create_target_tables) with actual results
-        to identify and track failed transfers.
+        This works around Airflow 3.0's buggy automatic XCom resolution
+        for dynamically mapped tasks.
         """
         from collections import defaultdict
 
+        ti = context["ti"]
         all_results = []
-        successful_table_names = set()
 
-        # Process regular table results (non-partitioned tables)
-        logger.info(f"Processing regular_results: {type(regular_results)}, count={len(regular_results) if regular_results else 0}")
-        if regular_results:
-            for r in regular_results:
-                if r is not None and isinstance(r, dict):
-                    all_results.append(r)
-                    if r.get('success', False):
-                        successful_table_names.add(r.get('table_name', ''))
-                    logger.info(f"Regular table: {r.get('table_name', 'unknown')} - {r.get('rows_transferred', 0):,} rows, success={r.get('success')}")
+        # Manually pull XCom from each transfer task (use explicit task IDs)
+        regular_results = ti.xcom_pull(
+            task_ids="transfer_table_data",
+            key="return_value",
+            default=[]
+        )
+        first_results = ti.xcom_pull(
+            task_ids="transfer_first_partitions",
+            key="return_value",
+            default=[]
+        )
+        remaining_results = ti.xcom_pull(
+            task_ids="transfer_remaining_partitions",
+            key="return_value",
+            default=[]
+        )
 
-        # Process partition results and aggregate by table name
+        # Normalize to lists
+        if regular_results and not isinstance(regular_results, list):
+            regular_results = [regular_results]
+        if first_results and not isinstance(first_results, list):
+            first_results = [first_results]
+        if remaining_results and not isinstance(remaining_results, list):
+            remaining_results = [remaining_results]
+
+        # Process regular tables
+        for r in (regular_results or []):
+            if r and isinstance(r, dict):
+                all_results.append(r)
+
+        # Aggregate partitions by table
         table_partitions = defaultdict(list)
+        for r in (first_results or []) + (remaining_results or []):
+            if r and isinstance(r, dict):
+                key = (r.get("source_schema", ""), r.get("table_name", "Unknown"))
+                table_partitions[key].append(r)
 
-        logger.info(f"Processing first_partition_results: {type(first_partition_results)}, count={len(first_partition_results) if first_partition_results else 0}")
-        if first_partition_results:
-            for p in first_partition_results:
-                if p is not None and isinstance(p, dict):
-                    table_partitions[p.get('table_name', 'Unknown')].append(p)
-
-        logger.info(f"Processing remaining_partition_results: {type(remaining_partition_results)}, count={len(remaining_partition_results) if remaining_partition_results else 0}")
-        if remaining_partition_results:
-            for p in remaining_partition_results:
-                if p is not None and isinstance(p, dict):
-                    table_partitions[p.get('table_name', 'Unknown')].append(p)
-
-        # Aggregate each table's partitions into a single result
-        for table_name, parts in table_partitions.items():
-            total_rows = sum(p.get('rows_transferred', 0) for p in parts)
-            # A table is successful only if ALL its partitions succeeded
-            success = all(p.get('success', False) for p in parts)
-
+        for (source_schema, table_name), parts in table_partitions.items():
+            total_rows = sum(p.get("rows_transferred", 0) for p in parts)
+            success = all(p.get("success", False) for p in parts)
             all_results.append({
-                'table_name': table_name,
-                'rows_transferred': total_rows,
-                'success': success,
-                'partitions_processed': len(parts)
+                "table_name": table_name,
+                "source_schema": source_schema,
+                "target_schema": parts[0].get("target_schema", "unknown") if parts else "unknown",
+                "rows_transferred": total_rows,
+                "success": success,
+                "partitions": len(parts),
             })
-            if success:
-                successful_table_names.add(table_name)
-            logger.info(f"Partitioned table: {table_name} - {total_rows:,} rows from {len(parts)} partitions, success={success}")
 
-        # Identify tables that were expected but have no results (completely failed transfers)
-        expected_table_names = {t.get('table_name', '') for t in expected_tables} if expected_tables else set()
-        tables_with_results = {r.get('table_name', '') for r in all_results}
-        missing_tables = expected_table_names - tables_with_results
-
-        # Add failed entries for tables that have no results at all
-        for table_name in missing_tables:
-            if table_name:  # Skip empty names
-                all_results.append({
-                    'table_name': table_name,
-                    'rows_transferred': 0,
-                    'success': False,
-                    'error': 'Transfer failed - no results received'
-                })
-                logger.warning(f"FAILED table: {table_name} - no transfer results received (task failed)")
-
-        # Log summary
-        successful = sum(1 for r in all_results if r.get('success', False))
+        successful = sum(1 for r in all_results if r.get("success"))
         failed = len(all_results) - successful
-        failed_table_names = [r.get('table_name', 'unknown') for r in all_results if not r.get('success', False)]
+        total_rows = sum(r.get("rows_transferred", 0) for r in all_results)
 
-        if failed > 0:
-            logger.warning(f"Collected results: {len(all_results)} tables total, {successful} succeeded, {failed} FAILED")
-            logger.warning(f"FAILED TABLES: {', '.join(failed_table_names)}")
-        else:
-            logger.info(f"Collected results for {len(all_results)} tables: {successful} succeeded, {failed} failed")
+        logger.info(f"Transfer complete: {successful} tables succeeded, {failed} failed, "
+                   f"{total_rows:,} total rows")
 
         return all_results
 
-    # Collect all results by passing expanded task results directly
-    # This uses Airflow 3's TaskFlow API automatic XCom passing
-    # Pass expected_tables (created_tables) to track which tables should have been migrated
-    transfer_results = collect_all_results(
-        expected_tables=created_tables,
-        regular_results=regular_transfer_results,
-        first_partition_results=first_partition_results,
-        remaining_partition_results=remaining_partition_results
-    )
-
-    # P2.2: Reset sequences for SERIAL/BIGSERIAL columns after data load
     @task(trigger_rule="all_done")
     def reset_sequences(
-        tables_schema: List[Dict[str, Any]],
-        transfer_results: List[Dict[str, Any]],
+        tables: List[Dict[str, Any]],
+        results: List[Dict[str, Any]],
         **context
     ) -> str:
-        """
-        P2.2: Reset sequences for SERIAL/BIGSERIAL columns to MAX(column) value (parallelized).
-
-        After COPY loading explicit values into SERIAL columns, the sequences need
-        to be advanced to prevent duplicate key errors on future inserts.
-
-        Args:
-            tables_schema: Original table schemas with column definitions
-            transfer_results: Results from data transfers
-
-        Returns:
-            Status message
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
+        """Reset SERIAL sequences to MAX(column) value for all target schemas."""
         params = context["params"]
-        target_schema = params["target_schema"]
         target_conn_id = params["target_conn_id"]
 
-        # Only reset sequences for successfully transferred tables
-        successful_tables = {r["table_name"] for r in transfer_results if r.get("success", False)}
-
-        # Filter tables that need sequence reset
-        tables_to_process = [
-            ts for ts in tables_schema
-            if ts["table_name"] in successful_tables
-        ]
-
-        def reset_table_sequences(table_schema: Dict[str, Any]) -> int:
-            """Reset sequences for a single table."""
-            table_name = table_schema["table_name"]
-            try:
-                # Each thread needs its own generator/connection
-                gen = ddl_generator.DDLGenerator(target_conn_id)
-                return gen.reset_sequences(table_schema, target_schema)
-            except Exception as e:
-                logger.warning(f"Could not reset sequences for {table_name}: {str(e)}")
-                return 0
-
-        # Parallelize sequence reset operations (4 workers)
-        sequences_reset = 0
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(reset_table_sequences, ts) for ts in tables_to_process]
-            for future in as_completed(futures):
-                sequences_reset += future.result()
-
-        logger.info(f"P2.2: Reset {sequences_reset} sequences for SERIAL/BIGSERIAL columns")
-        return f"Reset {sequences_reset} sequences"
-
-    seq_status = reset_sequences(schema_data, transfer_results)
-
-    # Create primary keys after data load (much faster than during inserts)
-    pk_status = create_primary_keys(schema_data, transfer_results)
-
-    # Create secondary indexes after PKs
-    index_status = create_indexes(schema_data, transfer_results)
-
-    # Task order: reset_sequences -> create_primary_keys -> create_indexes
-    seq_status >> pk_status >> index_status
-
-    # Trigger validation DAG instead of internal validation (avoids XCom bug)
-    trigger_validation = TriggerDagRunOperator(
-        task_id="trigger_validation_dag",
-        trigger_dag_id="validate_migration_env",
-        wait_for_completion=True,
-        poke_interval=30,
-        trigger_rule="all_done",  # Run even if some transfers failed
-        conf={
-            "source_schema": "{{ params.source_schema }}",
-            "target_schema": "{{ params.target_schema }}",
-        },
-    )
-
-    # Set task dependencies: trigger validation after indexes are created
-    index_status >> trigger_validation
-
-    # Generate final report (simplified version without validation results)
-    @task(trigger_rule="all_done")
-    def generate_migration_summary(**context):
-        """Generate a summary of the migration and send notifications."""
-        dag_run = context.get("dag_run")
-        ti = context["ti"]
-
-        transfer_results = ti.xcom_pull(task_ids="collect_all_results", key="return_value") or []
-
-        # Separate successful and failed tables
-        successful_tables = [r for r in transfer_results if r.get("success", False)]
-        failed_tables = [r for r in transfer_results if not r.get("success", False)]
-
-        tables_migrated = len(successful_tables)
-        tables_failed = len(failed_tables)
-        total_rows = sum(r.get("rows_transferred", 0) for r in successful_tables)
-
-        duration_seconds = 0
-        if dag_run and dag_run.start_date:
-            # Use pendulum now for timezone-aware safe diff
-            duration_seconds = (pendulum.now("UTC") - dag_run.start_date).total_seconds()
-
-        rows_per_second = int(total_rows / duration_seconds) if duration_seconds > 0 and total_rows else 0
-        successful_tables_list = [r.get("table_name", "unknown") for r in successful_tables]
-        failed_tables_list = [r.get("table_name", "unknown") for r in failed_tables]
-
-        stats = {
-            "tables_migrated": tables_migrated,
-            "tables_failed": tables_failed,
-            "total_rows": total_rows,
-            "rows_per_second": rows_per_second,
-            "tables_list": successful_tables_list,
-            "failed_tables_list": failed_tables_list,
+        # Get successful tables with their target schemas
+        successful = {
+            (r.get("target_schema"), r["table_name"])
+            for r in results if r.get("success")
         }
 
-        # Log summary with clear success/failure breakdown
-        if tables_failed > 0:
-            logger.warning(
-                "Migration completed with FAILURES: %s tables succeeded, %s tables FAILED",
-                tables_migrated,
-                tables_failed,
-            )
-            logger.warning("FAILED TABLES: %s", ", ".join(failed_tables_list))
-        else:
-            logger.info(
-                "Migration completed SUCCESSFULLY: %s tables migrated",
-                tables_migrated,
-            )
+        # Get unique target schemas from tables
+        target_schemas = set(t.get("target_schema") for t in tables if t.get("target_schema"))
 
-        logger.info(
-            "Migration stats: rows=%s, duration=%.2fs, rps=%s",
-            total_rows,
-            duration_seconds,
-            rows_per_second,
-        )
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+        pg_hook = PostgresHook(postgres_conn_id=target_conn_id)
+
+        reset_count = 0
+
+        from psycopg2 import sql
+
+        for target_schema in target_schemas:
+            # Find columns with sequences (SERIAL/BIGSERIAL) in this schema
+            seq_query = """
+                SELECT table_name, column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND column_default LIKE 'nextval%'
+            """
+            seq_columns = pg_hook.get_records(seq_query, parameters=[target_schema])
+
+            with pg_hook.get_conn() as conn:
+                with conn.cursor() as cursor:
+                    for table_name, col_name in seq_columns:
+                        if (target_schema, table_name) not in successful:
+                            continue
+                        try:
+                            # Use sql.Identifier for proper escaping to prevent SQL injection
+                            reset_sql = sql.SQL("""
+                            SELECT setval(
+                                pg_get_serial_sequence({table}, {column}),
+                                COALESCE((SELECT MAX({col_id}) FROM {schema}.{table_id}), 1),
+                                true
+                            )
+                            """).format(
+                                table=sql.Literal(f"{target_schema}.{table_name}"),
+                                column=sql.Literal(col_name),
+                                col_id=sql.Identifier(col_name),
+                                schema=sql.Identifier(target_schema),
+                                table_id=sql.Identifier(table_name),
+                            )
+                            cursor.execute(reset_sql)
+                            reset_count += 1
+                            logger.info(f"Reset sequence for {target_schema}.{table_name}.{col_name}")
+                        except Exception as e:
+                            logger.warning(f"Could not reset sequence for {target_schema}.{table_name}.{col_name}: {e}")
+                conn.commit()
+
+        logger.info(f"Reset {reset_count} sequences")
+        return f"Reset {reset_count} sequences"
+
+    @task(trigger_rule="all_done")
+    def generate_summary(results: List[Dict[str, Any]], **context) -> str:
+        """Generate migration summary and send notifications."""
+        dag_run = context.get("dag_run")
+
+        successful = [r for r in results if r.get("success")]
+        failed = [r for r in results if not r.get("success")]
+        total_rows = sum(r.get("rows_transferred", 0) for r in successful)
+
+        duration = 0
+        if dag_run and dag_run.start_date:
+            duration = (pendulum.now("UTC") - dag_run.start_date).total_seconds()
+
+        rps = int(total_rows / duration) if duration > 0 else 0
+
+        stats = {
+            "tables_migrated": len(successful),
+            "tables_failed": len(failed),
+            "total_rows": total_rows,
+            "rows_per_second": rps,
+            "tables_list": [f"{r.get('source_schema', '')}.{r['table_name']}" for r in successful],
+            "failed_tables_list": [f"{r.get('source_schema', '')}.{r['table_name']}" for r in failed],
+        }
+
+        if failed:
+            logger.warning(f"Migration completed with {len(failed)} failures: "
+                          f"{', '.join(stats['failed_tables_list'])}")
+        else:
+            logger.info(f"Migration completed: {len(successful)} tables, "
+                       f"{total_rows:,} rows in {duration:.1f}s ({rps:,} rows/sec)")
 
         send_success_notification(
             dag_id=dag_run.dag_id if dag_run else "unknown",
             run_id=dag_run.run_id if dag_run else "unknown",
             start_date=dag_run.start_date if dag_run else None,
-            duration_seconds=duration_seconds,
+            duration_seconds=duration,
             stats=stats,
         )
 
-        logger.info("Validation DAG has been triggered to verify data integrity.")
+        return f"Migrated {len(successful)} tables, {total_rows:,} rows"
 
-        if tables_failed > 0:
-            return f"Migration completed with {tables_failed} failures. Check logs for details."
-        return "Migration complete. Check validation DAG for results."
+    # =========================================================================
+    # Task Flow
+    # =========================================================================
 
-    final_status = generate_migration_summary()
-    trigger_validation >> final_status
+    # 1. Branch based on skip_schema_dag, then trigger schema DAG or skip
+    # 2. Discover tables from target PostgreSQL (using derived schemas)
+    tables = discover_target_tables()
+    # Both branches lead to tables discovery (trigger_rule handles skipped upstream)
+    [trigger_schema, skip_schema] >> tables
 
-    # Define task dependencies
-    # The task flow is already defined through function calls above
-    # Additional explicit dependencies can be added if needed
+    # 3. Get row counts from source
+    tables_with_counts = get_source_row_counts(tables)
+
+    # 4. Prepare transfer plan
+    plan = prepare_transfer_plan(tables_with_counts)
+
+    # 5. Extract from plan
+    regular = get_regular_tables(plan)
+    first_parts = get_first_partitions(plan)
+    remaining_parts = get_remaining_partitions(plan)
+
+    # 6. Transfer data
+    regular_results = transfer_table_data.expand(table_info=regular)
+    # Use explicit task IDs for partition transfers to avoid relying on auto-generated names
+    first_results = transfer_partition.override(task_id="transfer_first_partitions").expand(partition_info=first_parts)
+    remaining_results = transfer_partition.override(task_id="transfer_remaining_partitions").expand(partition_info=remaining_parts)
+
+    # First partitions must complete before remaining (prevent truncate race)
+    first_results >> remaining_results
+
+    # 7. Collect results (wait for all transfer tasks)
+    results = collect_results()
+    [regular_results, first_results, remaining_results] >> results
+
+    # 8. Reset sequences
+    seq_status = reset_sequences(tables_with_counts, results)
+
+    # 9. Trigger validation
+    trigger_validation = TriggerDagRunOperator(
+        task_id="trigger_validation_dag",
+        trigger_dag_id="validate_migration_env",
+        wait_for_completion=True,
+        poke_interval=30,
+        trigger_rule="all_done",
+        conf={
+            "source_conn_id": "{{ params.source_conn_id }}",
+            "target_conn_id": "{{ params.target_conn_id }}",
+            "include_tables": "{{ params.include_tables | tojson }}",
+        },
+    )
+
+    seq_status >> trigger_validation
+
+    # 10. Generate summary
+    summary = generate_summary(results)
+    trigger_validation >> summary
 
 
-# Instantiate the DAG
+# Instantiate
 mssql_to_postgres_migration()
