@@ -345,11 +345,29 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
 |-----------|---------|-------------|
 | `source_conn_id` | `mssql_source` | Airflow connection ID for SQL Server |
 | `target_conn_id` | `postgres_target` | Airflow connection ID for PostgreSQL |
-| `source_schema` | `dbo` | Schema to migrate from SQL Server |
-| `target_schema` | `public` | Target schema in PostgreSQL |
+| `include_tables` | from config file | Tables to migrate in `schema.table` format (e.g., `["dbo.Users", "dbo.Posts"]`) |
 | `chunk_size` | `200000` | Rows per batch during transfer (100-500,000) |
-| `exclude_tables` | `[]` | Table patterns to skip (supports wildcards) |
-| `validate_samples` | `false` | Enable sample data validation (slower) |
+| `skip_schema_dag` | `false` | Skip schema creation (use if tables already exist) |
+
+### Table Selection
+
+Tables must be explicitly specified in `schema.table` format. The target PostgreSQL schema is automatically derived as `{database}__{schema}` (lowercase). For example, `dbo.Users` from `StackOverflow2010` becomes `stackoverflow2010__dbo.Users`.
+
+**Configuration priority (highest to lowest):**
+
+1. **Config file**: `config/{database}_include_tables.txt`
+2. **Environment variable**: `INCLUDE_TABLES`
+3. **DAG parameter**: `include_tables` (when triggering)
+
+**Config file format** (`config/StackOverflow2010_include_tables.txt`):
+```
+# Tables to migrate (one per line)
+# Lines starting with # are comments
+dbo.Users
+dbo.Posts
+dbo.Comments
+sales.Orders
+```
 
 ### Example: Trigger via CLI
 
@@ -360,7 +378,7 @@ docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration
 Or with custom configuration:
 ```bash
 docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration \
-  --conf '{"source_schema": "sales", "target_schema": "sales", "chunk_size": 50000}'
+  --conf '{"include_tables": ["dbo.Users", "dbo.Posts"], "chunk_size": 50000}'
 ```
 
 ### Monitoring
@@ -382,6 +400,8 @@ docker exec airflow-scheduler airflow dags list-runs validate_migration_env
 mssql-to-postgres-pipeline/
 ├── dags/
 │   ├── mssql_to_postgres_migration.py   # Main migration DAG
+│   ├── mssql_to_postgres_schema.py      # Schema-only DAG (triggered by migration)
+│   ├── mssql_to_postgres_incremental.py # Incremental sync DAG
 │   └── validate_migration_env.py        # Standalone validation DAG
 ├── plugins/
 │   └── mssql_pg_migration/              # Shared migration modules (auto-loaded by Airflow)
@@ -389,9 +409,12 @@ mssql-to-postgres-pipeline/
 │       ├── type_mapping.py              # Data type conversion logic
 │       ├── ddl_generator.py             # PostgreSQL DDL generation
 │       ├── data_transfer.py             # Streaming data transfer with keyset pagination
+│       ├── table_config.py              # Table selection and schema derivation
 │       ├── validation.py                # Migration validation
 │       ├── odbc_helper.py               # SQL Server ODBC connection helper
 │       └── notifications.py             # Slack/email notifications
+├── config/                              # Table configuration files
+│   └── {database}_include_tables.txt    # Tables to migrate per database
 ├── tests/
 │   └── dags/
 │       ├── test_dag_example.py          # DAG validation tests
