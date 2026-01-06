@@ -35,6 +35,7 @@ import os
 
 from mssql_pg_migration import data_transfer
 from mssql_pg_migration.notifications import send_success_notification
+from mssql_pg_migration.incremental_state import IncrementalStateManager
 from mssql_pg_migration.table_config import (
     expand_include_tables_param,
     validate_include_tables,
@@ -101,6 +102,23 @@ def get_partition_count(row_count: int) -> int:
                         "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
         "skip_schema_dag": Param(default=False, type="boolean", description="Skip schema DAG trigger"),
+        # Restartability parameters
+        "resume_mode": Param(
+            default=False, type="boolean",
+            description="Skip tables that completed in previous runs. Retry failed/running tables."
+        ),
+        "reset_state": Param(
+            default=False, type="boolean",
+            description="Clear all migration state before starting (fresh start)."
+        ),
+        "retry_failed_only": Param(
+            default=False, type="boolean",
+            description="Only retry tables that failed (skip pending tables). Requires resume_mode=True."
+        ),
+        "force_refresh_tables": Param(
+            default=[],
+            description="Force re-run specific tables even if completed (e.g., ['Users', 'Posts'])."
+        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
@@ -139,6 +157,100 @@ def mssql_to_postgres_migration():
     skip_schema = EmptyOperator(task_id="skip_schema_dag_task")
 
     branch >> [trigger_schema, skip_schema]
+
+    @task(trigger_rule="none_failed_min_one_success")
+    def initialize_migration_state(**context) -> Dict[str, Any]:
+        """
+        Initialize migration state for restartability.
+
+        - Creates state table if not exists (with schema migration)
+        - Clears state if reset_state=True
+        - Resets zombie 'running' states from crashed DAG runs
+        - Returns migration summary for resume planning
+        """
+        params = context["params"]
+        dag_run = context["dag_run"]
+
+        target_conn_id = params["target_conn_id"]
+        resume_mode = params.get("resume_mode", False)
+        reset_state = params.get("reset_state", False)
+        retry_failed_only = params.get("retry_failed_only", False)
+        force_refresh_tables = params.get("force_refresh_tables", [])
+
+        dag_run_id = dag_run.run_id if dag_run else "unknown"
+
+        # Initialize state manager
+        state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
+        state_mgr.ensure_state_table_exists()
+
+        # Handle reset_state
+        if reset_state:
+            count = state_mgr.reset_all_state(migration_type='full')
+            logger.info(f"[STATE] Reset state for {count} tables (reset_state=True)")
+
+        # Handle zombie running states
+        if resume_mode:
+            zombies = state_mgr.reset_stale_running_states(
+                current_dag_run_id=dag_run_id,
+                migration_type='full'
+            )
+            if zombies > 0:
+                logger.warning(f"[STATE] Reset {zombies} zombie 'running' states from previous DAG runs")
+
+        # Handle force_refresh_tables (reset specific tables to pending)
+        if force_refresh_tables:
+            # Parse include_tables to get source_schema -> target_schema mapping
+            include_tables_raw = params.get("include_tables", [])
+            include_tables = expand_include_tables_param(include_tables_raw)
+            schema_tables = parse_include_tables(include_tables)
+            source_db = get_source_database(params["source_conn_id"])
+
+            for table_name in force_refresh_tables:
+                # Find source_schema for this table
+                for src_schema, tables in schema_tables.items():
+                    if table_name in tables:
+                        target_schema = derive_target_schema(source_db, src_schema)
+                        state_mgr.reset_table_state(table_name, src_schema, target_schema)
+                        logger.info(f"[STATE] Force reset state for {src_schema}.{table_name}")
+                        break
+
+        # Get migration summary
+        summary = state_mgr.get_migration_summary(migration_type='full')
+
+        # Log resume plan
+        logger.info("=" * 60)
+        logger.info("[PLAN] Migration State Summary")
+        logger.info("=" * 60)
+        logger.info(f"  resume_mode: {resume_mode}")
+        logger.info(f"  reset_state: {reset_state}")
+        logger.info(f"  retry_failed_only: {retry_failed_only}")
+        logger.info(f"  force_refresh_tables: {force_refresh_tables}")
+        logger.info("-" * 60)
+        logger.info(f"  Completed: {summary['completed']['count']} tables")
+        logger.info(f"  Failed:    {summary['failed']['count']} tables")
+        logger.info(f"  Running:   {summary['running']['count']} tables")
+        logger.info(f"  Pending:   {summary['pending']['count']} tables")
+        logger.info("=" * 60)
+
+        if resume_mode:
+            skip_count = summary['completed']['count'] - len(force_refresh_tables)
+            retry_count = summary['failed']['count'] + summary['running']['count']
+            logger.info(f"[PLAN] Skipping: {skip_count} completed tables")
+            logger.info(f"[PLAN] Retrying: {retry_count} failed/running tables")
+            if summary['completed']['tables']:
+                logger.info(f"[PLAN] Completed tables: {', '.join(summary['completed']['tables'][:10])}" +
+                           ("..." if len(summary['completed']['tables']) > 10 else ""))
+            if summary['failed']['tables']:
+                logger.info(f"[PLAN] Failed tables: {', '.join(summary['failed']['tables'])}")
+
+        return {
+            "dag_run_id": dag_run_id,
+            "resume_mode": resume_mode,
+            "reset_state": reset_state,
+            "retry_failed_only": retry_failed_only,
+            "force_refresh_tables": force_refresh_tables,
+            "summary": summary,
+        }
 
     @task(trigger_rule="none_failed_min_one_success")
     def discover_target_tables(**context) -> List[Dict[str, Any]]:
@@ -317,32 +429,179 @@ def mssql_to_postgres_migration():
         return tables_with_counts
 
     @task
-    def prepare_transfer_plan(tables: List[Dict[str, Any]], **context) -> Dict[str, List[Dict[str, Any]]]:
+    def prepare_transfer_plan(
+        tables: List[Dict[str, Any]],
+        migration_state: Dict[str, Any],
+        **context
+    ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Prepare transfer plan: split into regular tables and partitioned tables.
 
         Uses source_schema from each table's info dict.
         Large tables (>1M rows) are partitioned for parallel transfer.
+
+        In resume_mode, filters out completed tables unless in force_refresh_tables.
         """
         params = context["params"]
+        dag_run = context["dag_run"]
+        dag_run_id = dag_run.run_id if dag_run else "unknown"
+
+        resume_mode = migration_state.get("resume_mode", False)
+        retry_failed_only = migration_state.get("retry_failed_only", False)
+        force_refresh_tables = migration_state.get("force_refresh_tables", [])
+        summary = migration_state.get("summary", {})
+
+        # Get sets of tables by status for quick lookup
+        completed_tables = set(summary.get('completed', {}).get('tables', []))
+        failed_tables = set(summary.get('failed', {}).get('tables', []))
+        running_tables = set(summary.get('running', {}).get('tables', []))
+        force_refresh_set = set(force_refresh_tables)
 
         regular_tables = []
         partitions = []
+        skipped_tables = []
 
         from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
         mssql_hook = OdbcConnectionHelper(odbc_conn_id=params["source_conn_id"])
 
+        # Initialize state manager for recording state
+        target_conn_id = params["target_conn_id"]
+        state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
+
         for table_info in tables:
             table_name = table_info["table_name"]
             source_schema = table_info["source_schema"]
+            target_schema = table_info.get("target_schema", "unknown")
             row_count = table_info.get("row_count", 0)
             pk_info = table_info.get("pk_columns_info", {})
             pk_columns = pk_info.get("columns", [])
 
+            # Check if we should skip this table in resume mode
+            if resume_mode:
+                if table_name in completed_tables and table_name not in force_refresh_set:
+                    skipped_tables.append(table_name)
+                    logger.info(f"  {source_schema}.{table_name} -> SKIPPED (completed in previous run)")
+                    continue
+
+                if retry_failed_only:
+                    # Only process failed/running tables
+                    if table_name not in failed_tables and table_name not in running_tables:
+                        if table_name not in force_refresh_set:
+                            skipped_tables.append(table_name)
+                            logger.info(f"  {source_schema}.{table_name} -> SKIPPED (not failed, retry_failed_only=True)")
+                            continue
+
+            # Add state tracking info to table_info
+            table_info_with_state = {
+                **table_info,
+                "dag_run_id": dag_run_id,
+            }
+
+            # Check for partition-level resume in resume mode
+            # If table was previously partitioned and has incomplete partitions, resume from there
+            if resume_mode and (table_name in running_tables or table_name in failed_tables):
+                table_state = state_mgr.get_partitioned_table_state(
+                    table_name, source_schema, target_schema, migration_type='full'
+                )
+                if table_state and table_state.get('partition_info'):
+                    stored_partition_info = table_state['partition_info']
+                    stored_partitions = stored_partition_info.get('partitions', [])
+
+                    # Find incomplete partitions (pending, running, or failed)
+                    incomplete = [
+                        p for p in stored_partitions
+                        if p.get('status') in ('pending', 'running', 'failed')
+                    ]
+                    completed_partitions = [
+                        p for p in stored_partitions
+                        if p.get('status') == 'completed'
+                    ]
+
+                    if incomplete and completed_partitions:
+                        # Have both completed and incomplete - do partition resume
+                        logger.info(f"  {source_schema}.{table_name} -> PARTITION RESUME "
+                                   f"({len(completed_partitions)} completed, {len(incomplete)} to retry)")
+
+                        # Get pk_column from table_info for building WHERE clause
+                        pk_column = pk_columns[0]['name'] if pk_columns else None
+
+                        # Check if table uses composite PK (ROW_NUMBER mode) - no checkpoint resume for that
+                        is_composite = pk_info.get("is_composite", False)
+
+                        for stored_p in incomplete:
+                            partition_idx = stored_p.get('id', 0)
+                            min_pk = stored_p.get('min_pk')
+                            max_pk = stored_p.get('max_pk')
+                            was_failed = stored_p.get('status') == 'failed'
+                            last_pk_synced = stored_p.get('last_pk_synced')
+
+                            # Checkpoint resume only for keyset mode (single PK, sequential reader)
+                            # ROW_NUMBER mode and parallel readers don't support mid-partition resume
+                            resume_from_pk = None
+                            if last_pk_synced is not None and not is_composite:
+                                resume_from_pk = last_pk_synced
+                                logger.info(f"    partition_{partition_idx + 1}: checkpoint at PK={last_pk_synced}")
+
+                            # Build WHERE clause if we have PK bounds
+                            where_clause = None
+                            if pk_column and min_pk is not None and max_pk is not None:
+                                safe_pk = validate_sql_identifier(pk_column, "pk column")
+                                # Format values for SQL
+                                if isinstance(min_pk, str):
+                                    min_sql = f"'{min_pk.replace(chr(39), chr(39)+chr(39))}'"
+                                    max_sql = f"'{max_pk.replace(chr(39), chr(39)+chr(39))}'"
+                                else:
+                                    min_sql = str(min_pk)
+                                    max_sql = str(max_pk)
+
+                                # Last partition uses >= only (no upper bound)
+                                total_parts = stored_partition_info.get('total_partitions', len(stored_partitions))
+                                if partition_idx == total_parts - 1:
+                                    where_clause = f"[{safe_pk}] >= {min_sql}"
+                                elif partition_idx == 0:
+                                    where_clause = f"[{safe_pk}] <= {max_sql}"
+                                else:
+                                    where_clause = f"[{safe_pk}] >= {min_sql} AND [{safe_pk}] <= {max_sql}"
+
+                            # Cleanup logic (Gemini fix for stale checkpoints):
+                            # - If resuming from checkpoint: delete rows AFTER checkpoint (handles stale checkpoint)
+                            # - If no checkpoint (full retry): delete entire partition range
+                            # - If not failed: no cleanup needed
+                            cleanup_required = was_failed and resume_from_pk is None
+
+                            resume_partition = {
+                                **table_info_with_state,
+                                "partition_name": f"partition_{partition_idx + 1}",
+                                "partition_index": partition_idx,
+                                "where_clause": where_clause,
+                                "pk_column": pk_column,
+                                "min_pk": min_pk,
+                                "max_pk": max_pk,
+                                "estimated_rows": stored_p.get('rows', 0),
+                                "truncate_first": False,  # Never truncate on resume
+                                "total_partitions": stored_partition_info.get('total_partitions', len(stored_partitions)),
+                                "is_resume": True,
+                                "cleanup_required": cleanup_required,
+                                "resume_from_pk": resume_from_pk,  # Checkpoint resume
+                                "sync_id": table_state.get('sync_id'),  # Preserve existing sync_id
+                            }
+                            partitions.append(resume_partition)
+
+                            if resume_from_pk:
+                                status_msg = f"CHECKPOINT (pk > {resume_from_pk})"
+                            elif was_failed:
+                                status_msg = "RETRY (cleanup)"
+                            else:
+                                status_msg = "RESUME"
+                            logger.info(f"    partition_{partition_idx + 1}: {status_msg}")
+
+                        # Skip normal table processing - we've built resume partitions
+                        continue
+
             if row_count < LARGE_TABLE_THRESHOLD:
                 # Small table: regular transfer
                 regular_tables.append({
-                    **table_info,
+                    **table_info_with_state,
                     "truncate_first": True,
                 })
                 logger.info(f"  {source_schema}.{table_name} ({row_count:,} rows) -> regular transfer")
@@ -353,7 +612,7 @@ def mssql_to_postgres_migration():
                 # No PK: fall back to regular transfer
                 logger.warning(f"  {source_schema}.{table_name} has no PK, using regular transfer")
                 regular_tables.append({
-                    **table_info,
+                    **table_info_with_state,
                     "truncate_first": True,
                 })
                 continue
@@ -366,7 +625,7 @@ def mssql_to_postgres_migration():
                 safe_schema = validate_sql_identifier(source_schema, "schema")
             except ValueError as e:
                 logger.warning(f"  {source_schema}.{table_name}: {e}, using regular transfer")
-                regular_tables.append({**table_info, "truncate_first": True})
+                regular_tables.append({**table_info_with_state, "truncate_first": True})
                 continue
 
             if is_composite:
@@ -379,7 +638,7 @@ def mssql_to_postgres_migration():
                     end_row = min((i + 1) * rows_per_partition, row_count)
 
                     partitions.append({
-                        **table_info,
+                        **table_info_with_state,
                         "partition_name": f"partition_{i + 1}",
                         "partition_index": i,
                         "use_row_number": True,
@@ -389,6 +648,7 @@ def mssql_to_postgres_migration():
                         "pk_column": pk_col_names[0],
                         "estimated_rows": end_row - start_row + 1,
                         "truncate_first": i == 0,
+                        "total_partitions": partition_count,
                     })
 
                 logger.info(f"  {source_schema}.{table_name} ({row_count:,} rows) -> {partition_count} partitions (ROW_NUMBER)")
@@ -413,11 +673,11 @@ def mssql_to_postgres_migration():
                     boundaries = mssql_hook.get_records(boundaries_query)
                 except Exception as e:
                     logger.warning(f"  {source_schema}.{table_name}: NTILE failed ({e}), using regular transfer")
-                    regular_tables.append({**table_info, "truncate_first": True})
+                    regular_tables.append({**table_info_with_state, "truncate_first": True})
                     continue
 
                 if not boundaries:
-                    regular_tables.append({**table_info, "truncate_first": True})
+                    regular_tables.append({**table_info_with_state, "truncate_first": True})
                     continue
 
                 for i, boundary in enumerate(boundaries):
@@ -443,13 +703,16 @@ def mssql_to_postgres_migration():
                         where = f"[{safe_pk}] >= {min_sql} AND [{safe_pk}] <= {max_sql}"
 
                     partitions.append({
-                        **table_info,
+                        **table_info_with_state,
                         "partition_name": f"partition_{i + 1}",
                         "partition_index": i,
                         "where_clause": where,
                         "pk_column": pk_column,
+                        "min_pk": min_pk,
+                        "max_pk": max_pk,
                         "estimated_rows": part_count,
                         "truncate_first": i == 0,
+                        "total_partitions": len(boundaries),
                     })
 
                 logger.info(f"  {source_schema}.{table_name} ({row_count:,} rows) -> {len(boundaries)} partitions (NTILE)")
@@ -461,10 +724,15 @@ def mssql_to_postgres_migration():
         logger.info(f"Transfer plan: {len(regular_tables)} regular tables, "
                    f"{len(first_partitions)} first partitions, {len(remaining_partitions)} remaining partitions")
 
+        if skipped_tables:
+            logger.info(f"Skipped {len(skipped_tables)} tables (already completed): {', '.join(skipped_tables)}")
+
         return {
             "regular": regular_tables,
             "first_partitions": first_partitions,
             "remaining_partitions": remaining_partitions,
+            "skipped": skipped_tables,
+            "dag_run_id": dag_run_id,
         }
 
     @task
@@ -488,8 +756,22 @@ def mssql_to_postgres_migration():
         params = context["params"]
         table_name = table_info["table_name"]
         source_schema = table_info.get("source_schema", "unknown")
+        target_schema = table_info.get("target_schema", "unknown")
+        dag_run_id = table_info.get("dag_run_id", "unknown")
+        row_count = table_info.get("row_count", 0)
 
-        logger.info(f"Transferring {source_schema}.{table_name} ({table_info.get('row_count', 0):,} rows)")
+        logger.info(f"Transferring {source_schema}.{table_name} ({row_count:,} rows)")
+
+        # Initialize state manager and start sync
+        state_mgr = IncrementalStateManager(postgres_conn_id=params["target_conn_id"])
+        sync_id = state_mgr.start_sync(
+            table_name=table_name,
+            source_schema=source_schema,
+            target_schema=target_schema,
+            source_row_count=row_count,
+            migration_type='full',
+            dag_run_id=dag_run_id,
+        )
 
         result = data_transfer.transfer_table_data(
             mssql_conn_id=params["source_conn_id"],
@@ -501,14 +783,27 @@ def mssql_to_postgres_migration():
 
         result["table_name"] = table_name
         result["source_schema"] = source_schema
-        result["target_schema"] = table_info.get("target_schema", "unknown")
+        result["target_schema"] = target_schema
+        result["sync_id"] = sync_id
 
         if result["success"]:
             logger.info(f"  {source_schema}.{table_name}: {result['rows_transferred']:,} rows "
                        f"in {result['elapsed_time_seconds']:.1f}s "
                        f"({result['avg_rows_per_second']:,.0f} rows/sec)")
+            # Mark as completed
+            state_mgr.complete_sync(
+                sync_id=sync_id,
+                rows_inserted=result.get("rows_transferred", 0),
+                rows_updated=0,
+                rows_unchanged=0,
+                target_row_count=result.get("target_row_count"),
+            )
         else:
-            logger.error(f"  {source_schema}.{table_name}: FAILED - {result.get('errors', [])}")
+            errors = result.get('errors', [])
+            error_msg = '; '.join(str(e) for e in errors) if errors else 'Unknown error'
+            logger.error(f"  {source_schema}.{table_name}: FAILED - {error_msg}")
+            # Mark as failed
+            state_mgr.fail_sync(sync_id=sync_id, error=error_msg)
 
         return result
 
@@ -518,10 +813,143 @@ def mssql_to_postgres_migration():
         params = context["params"]
         table_name = partition_info["table_name"]
         source_schema = partition_info.get("source_schema", "unknown")
+        target_schema = partition_info.get("target_schema", "unknown")
+        dag_run_id = partition_info.get("dag_run_id", "unknown")
         partition_name = partition_info["partition_name"]
+        partition_index = partition_info.get("partition_index", 0)
+        total_partitions = partition_info.get("total_partitions", 1)
+        is_first_partition = partition_info.get("truncate_first", False)
+        row_count = partition_info.get("row_count", 0)
+        is_resume = partition_info.get("is_resume", False)
+        cleanup_required = partition_info.get("cleanup_required", False)
+        provided_sync_id = partition_info.get("sync_id")
 
         logger.info(f"Transferring {source_schema}.{table_name} {partition_name} "
-                   f"(~{partition_info.get('estimated_rows', 0):,} rows)")
+                   f"(~{partition_info.get('estimated_rows', 0):,} rows)"
+                   f"{' [RESUME]' if is_resume else ''}"
+                   f"{' [CLEANUP]' if cleanup_required else ''}")
+
+        # Initialize state manager
+        state_mgr = IncrementalStateManager(postgres_conn_id=params["target_conn_id"])
+
+        # Determine sync_id: use provided one for resume, or create/find
+        sync_id = None
+        if is_resume and provided_sync_id:
+            # Resume mode: use the existing sync_id
+            sync_id = provided_sync_id
+        elif is_first_partition:
+            # First partition of fresh transfer: create state record
+            initial_partition_info = {
+                "total_partitions": total_partitions,
+                "partitions": [
+                    {
+                        "id": i,
+                        "status": "pending",
+                        "min_pk": partition_info.get("min_pk") if i == partition_index else None,
+                        "max_pk": partition_info.get("max_pk") if i == partition_index else None,
+                    }
+                    for i in range(total_partitions)
+                ]
+            }
+            sync_id = state_mgr.start_sync(
+                table_name=table_name,
+                source_schema=source_schema,
+                target_schema=target_schema,
+                source_row_count=row_count,
+                migration_type='full',
+                dag_run_id=dag_run_id,
+                partition_info=initial_partition_info,
+            )
+        else:
+            # Non-first partition of fresh transfer: get sync_id from state
+            conn = state_mgr._hook.get_conn()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """SELECT id FROM _migration_state
+                           WHERE table_name = %s AND source_schema = %s AND target_schema = %s""",
+                        (table_name, source_schema, target_schema)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        sync_id = row[0]
+            finally:
+                conn.close()
+
+        # Get resume checkpoint if resuming mid-partition
+        resume_from_pk = partition_info.get("resume_from_pk")
+
+        # Cleanup logic (Gemini fix for stale checkpoints):
+        # 1. Full retry (no checkpoint): delete entire partition range
+        # 2. Checkpoint resume: delete rows AFTER checkpoint to handle stale checkpoint case
+        #    (worker may have committed rows but crashed before saving checkpoint)
+        pk_column = partition_info.get("pk_column")
+        min_pk = partition_info.get("min_pk")
+        max_pk = partition_info.get("max_pk")
+
+        if pk_column and max_pk is not None:
+            from airflow.providers.postgres.hooks.postgres import PostgresHook
+            pg_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
+
+            if cleanup_required and min_pk is not None:
+                # Full retry: delete entire partition range
+                delete_query = f"""
+                    DELETE FROM {target_schema}."{table_name}"
+                    WHERE "{pk_column}" >= %s AND "{pk_column}" <= %s
+                """
+                delete_params = (min_pk, max_pk)
+                cleanup_desc = f"PK {min_pk} to {max_pk}"
+
+                conn = None
+                try:
+                    conn = pg_hook.get_conn()
+                    with conn.cursor() as cursor:
+                        cursor.execute(delete_query, delete_params)
+                        deleted_count = cursor.rowcount
+                    conn.commit()
+                    logger.info(f"  Cleaned up {deleted_count:,} rows from failed partition ({cleanup_desc})")
+                except Exception as e:
+                    logger.warning(f"  Cleanup failed (non-fatal): {e}")
+                finally:
+                    if conn:
+                        conn.close()
+
+            elif resume_from_pk is not None:
+                # Checkpoint resume: delete rows AFTER checkpoint (handles stale checkpoint)
+                delete_query = f"""
+                    DELETE FROM {target_schema}."{table_name}"
+                    WHERE "{pk_column}" > %s AND "{pk_column}" <= %s
+                """
+                delete_params = (resume_from_pk, max_pk)
+                cleanup_desc = f"PK > {resume_from_pk} to {max_pk}"
+
+                conn = None
+                try:
+                    conn = pg_hook.get_conn()
+                    with conn.cursor() as cursor:
+                        cursor.execute(delete_query, delete_params)
+                        deleted_count = cursor.rowcount
+                    conn.commit()
+                    if deleted_count > 0:
+                        logger.info(f"  Cleaned up {deleted_count:,} stale rows after checkpoint ({cleanup_desc})")
+                    else:
+                        logger.info(f"  No stale rows to clean up after checkpoint")
+                except Exception as e:
+                    logger.warning(f"  Stale checkpoint cleanup failed (non-fatal): {e}")
+                finally:
+                    if conn:
+                        conn.close()
+
+        # Update partition status to 'running' and store PK bounds
+        if sync_id:
+            state_mgr.update_partition_status(
+                sync_id, partition_index, 'running',
+                min_pk=partition_info.get("min_pk"),
+                max_pk=partition_info.get("max_pk"),
+            )
+
+        if resume_from_pk is not None:
+            logger.info(f"  Resuming partition from checkpoint: PK > {resume_from_pk}")
 
         result = data_transfer.transfer_table_data(
             mssql_conn_id=params["source_conn_id"],
@@ -530,20 +958,42 @@ def mssql_to_postgres_migration():
             chunk_size=params["chunk_size"],
             truncate=partition_info.get("truncate_first", False),
             where_clause=partition_info.get("where_clause"),
+            resume_from_pk=resume_from_pk,
         )
 
         result["table_name"] = table_name
         result["source_schema"] = source_schema
-        result["target_schema"] = partition_info.get("target_schema", "unknown")
+        result["target_schema"] = target_schema
         result["partition_name"] = partition_name
+        result["partition_index"] = partition_index
         result["is_partition"] = True
+        result["sync_id"] = sync_id
         result["success"] = len(result.get("errors", [])) == 0 and result.get("rows_transferred", 0) > 0
 
         if result["success"]:
             logger.info(f"  {source_schema}.{table_name} {partition_name}: {result['rows_transferred']:,} rows "
                        f"in {result['elapsed_time_seconds']:.1f}s")
+            # Update partition status to 'completed'
+            if sync_id:
+                state_mgr.update_partition_status(
+                    sync_id, partition_index, 'completed',
+                    rows_transferred=result.get("rows_transferred", 0)
+                )
         else:
-            logger.error(f"  {source_schema}.{table_name} {partition_name}: FAILED")
+            errors = result.get('errors', [])
+            error_msg = '; '.join(str(e) for e in errors) if errors else 'Unknown error'
+            logger.error(f"  {source_schema}.{table_name} {partition_name}: FAILED - {error_msg}")
+            # Update partition status to 'failed' with checkpoint for resume
+            last_pk_synced = result.get("last_pk_synced")
+            if last_pk_synced is not None:
+                logger.info(f"  Saving checkpoint: last_pk_synced = {last_pk_synced}")
+            if sync_id:
+                state_mgr.update_partition_status(
+                    sync_id, partition_index, 'failed',
+                    rows_transferred=result.get("rows_transferred", 0),
+                    error=error_msg,
+                    last_pk_synced=last_pk_synced,
+                )
 
         return result
 
@@ -633,16 +1083,45 @@ def mssql_to_postgres_migration():
                 key = (r.get("source_schema", ""), r.get("table_name", "Unknown"))
                 table_partitions[key].append(r)
 
+        # Get target_conn_id from params for state updates
+        params = context["params"]
+        target_conn_id = params["target_conn_id"]
+        state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
+
         for (source_schema, table_name), parts in table_partitions.items():
             total_rows = sum(p.get("rows_transferred", 0) for p in parts)
             success = all(p.get("success", False) for p in parts)
+            target_schema = parts[0].get("target_schema", "unknown") if parts else "unknown"
+
+            # Finalize partitioned table state
+            sync_id = parts[0].get("sync_id") if parts else None
+            if sync_id:
+                if success:
+                    state_mgr.complete_sync(
+                        sync_id=sync_id,
+                        rows_inserted=total_rows,
+                        rows_updated=0,
+                        rows_unchanged=0,
+                        target_row_count=total_rows,
+                    )
+                else:
+                    # Find the first failed partition error
+                    failed_parts = [p for p in parts if not p.get("success", False)]
+                    error_msg = "Partition transfer failed"
+                    if failed_parts:
+                        errors = failed_parts[0].get("errors", [])
+                        if errors:
+                            error_msg = '; '.join(str(e) for e in errors)
+                    state_mgr.fail_sync(sync_id=sync_id, error=error_msg)
+
             all_results.append({
                 "table_name": table_name,
                 "source_schema": source_schema,
-                "target_schema": parts[0].get("target_schema", "unknown") if parts else "unknown",
+                "target_schema": target_schema,
                 "rows_transferred": total_rows,
                 "success": success,
                 "partitions": len(parts),
+                "sync_id": sync_id,
             })
 
         successful = sum(1 for r in all_results if r.get("success"))
@@ -797,23 +1276,26 @@ def mssql_to_postgres_migration():
     # =========================================================================
 
     # 1. Branch based on skip_schema_dag, then trigger schema DAG or skip
-    # 2. Discover tables from target PostgreSQL (using derived schemas)
-    tables = discover_target_tables()
-    # Both branches lead to tables discovery (trigger_rule handles skipped upstream)
-    [trigger_schema, skip_schema] >> tables
+    # 2. Initialize migration state (restartability)
+    migration_state = initialize_migration_state()
+    [trigger_schema, skip_schema] >> migration_state
 
-    # 3. Get row counts from source
+    # 3. Discover tables from target PostgreSQL (using derived schemas)
+    tables = discover_target_tables()
+    migration_state >> tables
+
+    # 4. Get row counts from source
     tables_with_counts = get_source_row_counts(tables)
 
-    # 4. Prepare transfer plan
-    plan = prepare_transfer_plan(tables_with_counts)
+    # 5. Prepare transfer plan (filters tables based on state in resume mode)
+    plan = prepare_transfer_plan(tables_with_counts, migration_state)
 
-    # 5. Extract from plan
+    # 6. Extract from plan
     regular = get_regular_tables(plan)
     first_parts = get_first_partitions(plan)
     remaining_parts = get_remaining_partitions(plan)
 
-    # 6. Transfer data
+    # 7. Transfer data
     regular_results = transfer_table_data.expand(table_info=regular)
     # Use explicit task IDs for partition transfers to avoid relying on auto-generated names
     first_results = transfer_partition.override(task_id="transfer_first_partitions").expand(partition_info=first_parts)
@@ -822,14 +1304,14 @@ def mssql_to_postgres_migration():
     # First partitions must complete before remaining (prevent truncate race)
     first_results >> remaining_results
 
-    # 7. Collect results (wait for all transfer tasks)
+    # 8. Collect results (wait for all transfer tasks)
     results = collect_results()
     [regular_results, first_results, remaining_results] >> results
 
-    # 8. Reset sequences
+    # 9. Reset sequences
     seq_status = reset_sequences(tables_with_counts, results)
 
-    # 9. Trigger validation
+    # 10. Trigger validation
     trigger_validation = TriggerDagRunOperator(
         task_id="trigger_validation_dag",
         trigger_dag_id="validate_migration_env",
@@ -845,7 +1327,7 @@ def mssql_to_postgres_migration():
 
     seq_status >> trigger_validation
 
-    # 10. Generate summary
+    # 11. Generate summary
     summary = generate_summary(results)
     trigger_validation >> summary
 
