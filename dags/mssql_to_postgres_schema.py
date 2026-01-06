@@ -64,13 +64,8 @@ DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
             description="PostgreSQL connection ID"
         ),
         "include_tables": Param(
-            default=[],
+            default=expand_include_tables_param(DEFAULT_INCLUDE_TABLES),
             description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
-        ),
-        "drop_existing": Param(
-            default=True,
-            type="boolean",
-            description="Drop existing tables before creating"
         ),
     },
     tags=["schema", "mssql", "postgres", "ddl"],
@@ -186,11 +181,11 @@ def mssql_to_postgres_schema():
         """
         Create all tables in PostgreSQL WITH primary keys.
 
+        Always drops and recreates tables to ensure clean state.
         Uses target_schema from each table's info dict.
         No foreign keys or secondary indexes are created.
         """
         params = context["params"]
-        drop_existing = params.get("drop_existing", True)
 
         generator = DDLGenerator(params["target_conn_id"])
         created_tables = []
@@ -206,11 +201,10 @@ def mssql_to_postgres_schema():
             try:
                 ddl_statements = []
 
-                # Drop existing table if requested
-                if drop_existing:
-                    ddl_statements.append(
-                        generator.generate_drop_table(table_name, target_schema, cascade=True)
-                    )
+                # Always drop existing table before recreating
+                ddl_statements.append(
+                    generator.generate_drop_table(table_name, target_schema, cascade=True)
+                )
 
                 # Create table WITH primary key (include_constraints=True)
                 ddl_statements.append(

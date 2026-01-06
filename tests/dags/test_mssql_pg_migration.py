@@ -50,13 +50,13 @@ class TestDAGValidation:
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
         params = dag.params
 
+        # Updated for schema.table format (PR #26)
         required_params = [
             "source_conn_id",
             "target_conn_id",
-            "source_schema",
-            "target_schema",
             "chunk_size",
-            "exclude_tables",
+            "include_tables",
+            "skip_schema_dag",
         ]
 
         for param in required_params:
@@ -67,12 +67,17 @@ class TestDAGValidation:
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
         task_ids = [task.task_id for task in dag.tasks]
 
+        # Updated for schema.table format (PR #26)
         expected_tasks = [
-            "extract_source_schema",
-            "create_target_schema",
-            "create_target_tables",
+            "check_skip_schema",
+            "trigger_schema_dag",
+            "discover_target_tables",
+            "get_source_row_counts",
+            "prepare_transfer_plan",
+            "collect_results",
+            "reset_sequences",
             "trigger_validation_dag",
-            "generate_migration_summary",
+            "generate_summary",
         ]
 
         for task_id in expected_tasks:
