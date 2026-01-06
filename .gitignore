@@ -18,3 +18,4 @@ logs/
 
 # Migration state directory
 ~/.mssql-pg-migrate/
+*.png
