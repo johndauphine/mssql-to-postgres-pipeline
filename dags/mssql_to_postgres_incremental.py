@@ -43,9 +43,6 @@ DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '10000
 PARTITION_THRESHOLD = int(os.environ.get('PARTITION_THRESHOLD', '1000000'))  # Tables > 1M rows get partitioned
 MAX_PARTITIONS_PER_TABLE = int(os.environ.get('MAX_PARTITIONS_PER_TABLE', '6'))
 
-# Default tables from environment variable (fallback)
-DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
-
 # Import migration modules
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.incremental_state import IncrementalStateManager
@@ -61,6 +58,7 @@ from mssql_pg_migration.table_config import (
     parse_include_tables,
     get_source_database,
     derive_target_schema,
+    load_include_tables_from_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,8 +92,9 @@ logger = logging.getLogger(__name__)
             description="PostgreSQL connection ID"
         ),
         "include_tables": Param(
-            default=[],
-            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
+            default=load_include_tables_from_config("mssql_source"),
+            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
+                        "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
         "use_staging": Param(
             default=True,
