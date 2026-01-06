@@ -553,7 +553,7 @@ def mssql_to_postgres_migration():
         Aggregate all transfer results by querying XCom table directly.
 
         NOTE: Airflow 3.0 changed xcom_pull() behavior for mapped tasks - it returns
-        None instead of all mapped task results (see github.com/apache/airflow/issues/50982).
+        None instead of all mapped task results (see https://github.com/apache/airflow/issues/50982).
         We work around this by querying the XCom table directly via the metadata database.
 
         Requires AIRFLOW_CONN_AIRFLOW_DB connection to be configured pointing to the
@@ -605,8 +605,11 @@ def mssql_to_postgres_migration():
             for row in rows:
                 try:
                     results.append(json.loads(row[0]))
-                except (json.JSONDecodeError, TypeError):
-                    pass
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(
+                        "Failed to decode XCom JSON value for task_id=%s, dag_id=%s, run_id=%s: %s",
+                        task_id, dag_id, run_id, e
+                    )
             return results
 
         regular_results = get_mapped_results("transfer_table_data")
@@ -722,6 +725,9 @@ def mssql_to_postgres_migration():
                             # Use sql.Identifier for proper escaping to prevent SQL injection
                             # NOTE: pg_get_serial_sequence requires quoted identifiers to preserve
                             # case sensitivity. Use "schema"."table" format in the literal string.
+                            # Escape double quotes within names (replace " with "") per SQL standard.
+                            safe_schema = target_schema.replace('"', '""')
+                            safe_table = table_name.replace('"', '""')
                             reset_sql = sql.SQL("""
                             SELECT setval(
                                 pg_get_serial_sequence({table}, {column}),
@@ -729,7 +735,7 @@ def mssql_to_postgres_migration():
                                 true
                             )
                             """).format(
-                                table=sql.Literal(f'"{target_schema}"."{table_name}"'),
+                                table=sql.Literal(f'"{safe_schema}"."{safe_table}"'),
                                 column=sql.Literal(col_name),
                                 col_id=sql.Identifier(col_name),
                                 schema=sql.Identifier(target_schema),
