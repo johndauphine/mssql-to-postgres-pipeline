@@ -30,7 +30,7 @@ from mssql_pg_migration.table_config import (
     validate_include_tables,
     parse_include_tables,
     derive_target_schema,
-    load_include_tables_from_config,
+    get_default_include_tables,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,9 +54,9 @@ logger = logging.getLogger(__name__)
         "source_conn_id": Param(default="mssql_source", type="string"),
         "target_conn_id": Param(default="postgres_target", type="string"),
         "include_tables": Param(
-            default=load_include_tables_from_config("mssql_source"),
+            default=get_default_include_tables(),
             description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
-                        "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
+                        "Defaults from INCLUDE_TABLES env var."
         ),
     },
     tags=["validation", "migration", "env-based"],
@@ -78,8 +78,8 @@ def validate_migration_env():
         include_tables = expand_include_tables_param(include_tables_raw)
 
         # Fall back to environment variable if empty
-        if not include_tables and DEFAULT_INCLUDE_TABLES:
-            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
+        if not include_tables:
+            include_tables = get_default_include_tables()
 
         # Validate include_tables
         validate_include_tables(include_tables)

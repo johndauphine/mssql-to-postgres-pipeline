@@ -41,7 +41,7 @@ from mssql_pg_migration.table_config import (
     parse_include_tables,
     get_source_database,
     derive_target_schema,
-    load_include_tables_from_config,
+    get_default_include_tables,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ def get_partition_count(row_count: int) -> int:
         "target_conn_id": Param(default="postgres_target", type="string"),
         "chunk_size": Param(default=DEFAULT_CHUNK_SIZE, type="integer", minimum=100, maximum=500000),
         "include_tables": Param(
-            default=load_include_tables_from_config("mssql_source"),
+            default=get_default_include_tables(),
             description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
                         "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
