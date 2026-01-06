@@ -65,6 +65,8 @@ x-airflow-common:
     # For PostgreSQL: postgresql://username:password@hostname:5432/database
     AIRFLOW_CONN_MSSQL_SOURCE: ${AIRFLOW_CONN_MSSQL_SOURCE:-generic://sa:YourStrong%40Passw0rd@mssql-server:1433/StackOverflow2010}
     AIRFLOW_CONN_POSTGRES_TARGET: ${AIRFLOW_CONN_POSTGRES_TARGET:-postgresql://postgres:PostgresPassword123@postgres-target:5432/stackoverflow}
+    # Airflow metadata database connection (for XCom queries in collect_results)
+    AIRFLOW_CONN_AIRFLOW_DB: ${AIRFLOW_CONN_AIRFLOW_DB:-postgresql://airflow:airflow@airflow-postgres:5432/airflow}
 
     # Notification Settings (enable Slack by default; set SLACK_WEBHOOK_URL in .env)
     NOTIFICATION_ENABLED: ${NOTIFICATION_ENABLED:-true}
