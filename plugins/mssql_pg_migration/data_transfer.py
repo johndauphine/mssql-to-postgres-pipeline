@@ -2855,6 +2855,7 @@ def transfer_incremental_staging_partitioned(
     pk_end: Any,
     partition_id: int,
     chunk_size: int = 100000,
+    resume_from_pk: Any = None,
 ) -> Dict[str, Any]:
     """
     Transfer a partition of table data using staging table pattern.
@@ -2870,9 +2871,10 @@ def transfer_incremental_staging_partitioned(
         pk_end: End of primary key range (inclusive)
         partition_id: Partition identifier for logging
         chunk_size: Rows per chunk for COPY to staging
+        resume_from_pk: Resume from this PK value (rows with PK > resume_from_pk)
 
     Returns:
-        Transfer result dictionary with rows_inserted, rows_updated, etc.
+        Transfer result dictionary with rows_inserted, rows_updated, last_pk_synced, etc.
     """
     import uuid
 
@@ -2910,10 +2912,18 @@ def transfer_incremental_staging_partitioned(
             'errors': ['Partition bounds must be integers'],
         }
 
-    logger.info(
-        f"Partition {partition_id}: Syncing {source_schema}.{source_table} "
-        f"(PK range: {pk_start} - {pk_end})"
-    )
+    # Determine starting point (resume_from_pk takes precedence)
+    is_resuming = resume_from_pk is not None
+    if is_resuming:
+        logger.info(
+            f"Partition {partition_id}: RESUMING {source_schema}.{source_table} "
+            f"from PK > {resume_from_pk} (original range: {pk_start} - {pk_end})"
+        )
+    else:
+        logger.info(
+            f"Partition {partition_id}: Syncing {source_schema}.{source_table} "
+            f"(PK range: {pk_start} - {pk_end})"
+        )
 
     transfer = DataTransfer(mssql_conn_id, postgres_conn_id)
 
@@ -2925,6 +2935,8 @@ def transfer_incremental_staging_partitioned(
     total_updated = 0
     rows_copied = 0
     errors = []
+    # Track last successfully processed PK for checkpoint (initialize to resume point or start-1)
+    last_pk_synced = resume_from_pk if resume_from_pk is not None else (pk_start - 1 if isinstance(pk_start, int) else None)
 
     # Generate unique staging table name for this partition
     staging_table = f"_staging_{source_table}_p{partition_id}_{uuid.uuid4().hex[:6]}"
@@ -2958,7 +2970,11 @@ def transfer_incremental_staging_partitioned(
             pk_index = columns.index(pk_column) if pk_column in columns else 0
 
             with transfer._mssql_connection() as mssql_conn:
-                last_key_value = pk_start - 1 if isinstance(pk_start, int) else None
+                # Use resume_from_pk if resuming, otherwise start from pk_start - 1
+                if resume_from_pk is not None:
+                    last_key_value = resume_from_pk
+                else:
+                    last_key_value = pk_start - 1 if isinstance(pk_start, int) else None
                 chunks_processed = 0
 
                 while True:
@@ -3000,6 +3016,8 @@ def transfer_incremental_staging_partitioned(
                     rows_copied += rows_written
                     chunks_processed += 1
                     postgres_conn.commit()
+                    # Update checkpoint after successful commit
+                    last_pk_synced = last_key_value
 
                     # Check if we've reached the end of our partition
                     if isinstance(pk_end, int) and last_key_value and last_key_value >= pk_end:
@@ -3048,6 +3066,7 @@ def transfer_incremental_staging_partitioned(
         'elapsed_time_seconds': elapsed_time,
         'success': len(errors) == 0,
         'errors': errors,
+        'last_pk_synced': last_pk_synced,  # For resume checkpoint
     }
 
     if result['success']:

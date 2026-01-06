@@ -863,6 +863,7 @@ class IncrementalStateManager:
         error: Optional[str] = None,
         min_pk: Any = None,
         max_pk: Any = None,
+        last_pk_synced: Any = None,
     ) -> None:
         """
         Update the status of a specific partition (with row locking).
@@ -878,6 +879,7 @@ class IncrementalStateManager:
             error: Optional error message for failed partitions
             min_pk: Optional minimum PK value for this partition (for resume)
             max_pk: Optional maximum PK value for this partition (for resume)
+            last_pk_synced: Optional last successfully synced PK (for checkpoint resume)
         """
         conn = None
         try:
@@ -915,8 +917,13 @@ class IncrementalStateManager:
                 # Store PK bounds for resume (only if provided)
                 if min_pk is not None:
                     partitions[partition_id]['min_pk'] = min_pk
+                    partitions[partition_id]['pk_start'] = min_pk  # Alias for compatibility
                 if max_pk is not None:
                     partitions[partition_id]['max_pk'] = max_pk
+                    partitions[partition_id]['pk_end'] = max_pk  # Alias for compatibility
+                # Store checkpoint for resume (last successfully processed PK)
+                if last_pk_synced is not None:
+                    partitions[partition_id]['last_pk_synced'] = last_pk_synced
 
                 partition_info['partitions'] = partitions
 

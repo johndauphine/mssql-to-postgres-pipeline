@@ -238,6 +238,9 @@ def mssql_to_postgres_incremental():
         Tables larger than PARTITION_THRESHOLD get split into multiple partitions.
         Each partition is processed as a separate task for better parallelism.
 
+        For partitioned tables, this also initializes the state record with partition_info
+        BEFORE fanning out to partition tasks, avoiding race conditions.
+
         Args:
             tables: List of table info dicts
 
@@ -246,6 +249,12 @@ def mssql_to_postgres_incremental():
         """
         params = context["params"]
         source_conn_id = params["source_conn_id"]
+        target_conn_id = params["target_conn_id"]
+        dag_run_id = context.get("run_id", "unknown")
+        resume_from_checkpoint = params.get("resume_from_checkpoint", True)
+
+        # State manager for initializing partitioned table state
+        state_manager = IncrementalStateManager(target_conn_id)
 
         sync_tasks = []
 
@@ -257,8 +266,83 @@ def mssql_to_postgres_incremental():
             # Check if table should be partitioned
             if row_count >= PARTITION_THRESHOLD and pk_columns:
                 pk_column = pk_columns[0]
+                source_schema = table['source_schema']
+                target_schema = table['target_schema']
 
-                # Get PK min/max for partitioning
+                # Check for existing incomplete partition state (for resume)
+                existing_state = None
+                if resume_from_checkpoint:
+                    existing_state = state_manager.get_partitioned_table_state(
+                        table_name=table_name,
+                        source_schema=source_schema,
+                        target_schema=target_schema,
+                        migration_type='incremental',
+                    )
+
+                # Resume from existing partition state if available
+                if existing_state and existing_state.get('partition_info'):
+                    partition_info = existing_state['partition_info']
+                    partitions = partition_info.get('partitions', [])
+                    sync_id = existing_state['sync_id']
+                    total_partitions = partition_info.get('total_partitions', len(partitions))
+
+                    # Count partition statuses
+                    completed = [p for p in partitions if p.get('status') == 'completed']
+                    failed = [p for p in partitions if p.get('status') in ('failed', 'running')]
+                    pending = [p for p in partitions if p.get('status') == 'pending']
+
+                    logger.info(
+                        f"[RESUME] {table_name}: {len(completed)} completed, "
+                        f"{len(failed)} failed/running, {len(pending)} pending"
+                    )
+
+                    for p in partitions:
+                        p_status = p.get('status', 'pending')
+                        p_id = p['id']
+
+                        if p_status == 'completed':
+                            logger.info(f"  Partition {p_id}: SKIP (completed)")
+                            continue  # Skip completed partitions
+
+                        elif p_status in ('failed', 'running'):
+                            # Resume from checkpoint
+                            resume_pk = p.get('last_pk_synced')
+                            if resume_pk:
+                                logger.info(
+                                    f"  Partition {p_id}: RESUME from PK > {resume_pk}"
+                                )
+                            else:
+                                logger.info(f"  Partition {p_id}: RETRY (no checkpoint)")
+
+                            sync_tasks.append({
+                                **table,
+                                "is_partition": True,
+                                "partition_id": p_id,
+                                "pk_start": p.get('pk_start', p.get('min_pk')),
+                                "pk_end": p.get('pk_end', p.get('max_pk')),
+                                "partition_row_estimate": p.get('rows', 0),
+                                "resume_from_pk": resume_pk,
+                                "is_resume": True,
+                                "sync_id": sync_id,
+                                "total_partitions": total_partitions,
+                            })
+
+                        else:  # pending
+                            logger.info(f"  Partition {p_id}: RUN (pending)")
+                            sync_tasks.append({
+                                **table,
+                                "is_partition": True,
+                                "partition_id": p_id,
+                                "pk_start": p.get('pk_start', p.get('min_pk')),
+                                "pk_end": p.get('pk_end', p.get('max_pk')),
+                                "partition_row_estimate": p.get('rows', 0),
+                                "sync_id": sync_id,
+                                "total_partitions": total_partitions,
+                            })
+
+                    continue  # Skip fresh partitioning
+
+                # Fresh partitioning - get PK min/max from source
                 try:
                     from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
                     helper = OdbcConnectionHelper(odbc_conn_id=source_conn_id)
@@ -270,7 +354,7 @@ def mssql_to_postgres_incremental():
                         # validate that pk_column comes from schema discovery (trusted source)
                         # and double any brackets to prevent SQL injection
                         safe_pk = pk_column.replace(']', ']]')
-                        safe_schema = table['source_schema'].replace(']', ']]')
+                        safe_schema = source_schema.replace(']', ']]')
                         safe_table = table_name.replace(']', ']]')
                         query = f"SELECT MIN([{safe_pk}]), MAX([{safe_pk}]) FROM [{safe_schema}].[{safe_table}]"
                         cursor.execute(query)
@@ -293,17 +377,46 @@ def mssql_to_postgres_incremental():
                             f"{num_partitions} partitions"
                         )
 
+                        # Build partition_info for state initialization
+                        partition_list = []
                         for i in range(num_partitions):
                             start_pk = pk_min + (i * partition_size)
                             end_pk = pk_max if i == num_partitions - 1 else start_pk + partition_size - 1
+                            partition_list.append({
+                                'id': i,
+                                'status': 'pending',
+                                'pk_start': start_pk,
+                                'pk_end': end_pk,
+                            })
 
+                        # Initialize state record with partition_info BEFORE creating tasks
+                        # This avoids race condition when parallel partition tasks start
+                        partition_info = {
+                            'total_partitions': num_partitions,
+                            'partitions': partition_list,
+                        }
+                        sync_id = state_manager.start_sync(
+                            table_name=table_name,
+                            source_schema=source_schema,
+                            target_schema=target_schema,
+                            source_row_count=row_count,
+                            migration_type='incremental',
+                            dag_run_id=dag_run_id,
+                            partition_info=partition_info,
+                        )
+                        logger.info(f"Initialized state for {table_name} with sync_id={sync_id}")
+
+                        # Create partition tasks with sync_id
+                        for p in partition_list:
                             sync_tasks.append({
                                 **table,
                                 "is_partition": True,
-                                "partition_id": i,
-                                "pk_start": start_pk,
-                                "pk_end": end_pk,
+                                "partition_id": p['id'],
+                                "pk_start": p['pk_start'],
+                                "pk_end": p['pk_end'],
                                 "partition_row_estimate": partition_size,
+                                "sync_id": sync_id,
+                                "total_partitions": num_partitions,
                             })
 
                         continue  # Skip adding as single task
@@ -364,11 +477,33 @@ def mssql_to_postgres_incremental():
             partition_id = task_info["partition_id"]
             pk_start = task_info["pk_start"]
             pk_end = task_info["pk_end"]
+            sync_id = task_info.get("sync_id")
+            resume_from_pk = task_info.get("resume_from_pk")
+            is_resume = task_info.get("is_resume", False)
 
-            logger.info(
-                f"Syncing partition {partition_id} of {source_schema}.{table_name} "
-                f"(PK range: {pk_start} - {pk_end})"
-            )
+            # Initialize state manager for partition tracking
+            state_manager = IncrementalStateManager(target_conn_id)
+
+            if is_resume and resume_from_pk:
+                logger.info(
+                    f"RESUMING partition {partition_id} of {source_schema}.{table_name} "
+                    f"from PK > {resume_from_pk} (range: {pk_start} - {pk_end})"
+                )
+            else:
+                logger.info(
+                    f"Syncing partition {partition_id} of {source_schema}.{table_name} "
+                    f"(PK range: {pk_start} - {pk_end})"
+                )
+
+            # Mark partition as running before transfer
+            if sync_id:
+                state_manager.update_partition_status(
+                    sync_id=sync_id,
+                    partition_id=partition_id,
+                    status='running',
+                    min_pk=pk_start,
+                    max_pk=pk_end,
+                )
 
             try:
                 result = transfer_incremental_staging_partitioned(
@@ -379,12 +514,33 @@ def mssql_to_postgres_incremental():
                     pk_end=pk_end,
                     partition_id=partition_id,
                     chunk_size=batch_size,
+                    resume_from_pk=resume_from_pk,
                 )
+
+                # Update partition state based on result
+                if sync_id:
+                    if result["success"]:
+                        state_manager.update_partition_status(
+                            sync_id=sync_id,
+                            partition_id=partition_id,
+                            status='completed',
+                            rows_transferred=result.get("rows_inserted", 0) + result.get("rows_updated", 0),
+                        )
+                    else:
+                        state_manager.update_partition_status(
+                            sync_id=sync_id,
+                            partition_id=partition_id,
+                            status='failed',
+                            rows_transferred=result.get("rows_copied_to_staging", 0),
+                            error=result.get("errors", ["Unknown error"])[0] if result.get("errors") else "Unknown error",
+                            last_pk_synced=result.get("last_pk_synced"),
+                        )
 
                 return {
                     "table_name": table_name,
                     "partition_id": partition_id,
                     "is_partition": True,
+                    "sync_id": sync_id,
                     "status": "synced" if result["success"] else "failed",
                     "rows_inserted": result.get("rows_inserted", 0),
                     "rows_updated": result.get("rows_updated", 0),
@@ -392,15 +548,27 @@ def mssql_to_postgres_incremental():
                     "elapsed_seconds": result.get("elapsed_time_seconds", 0),
                     "success": result["success"],
                     "errors": result.get("errors", []),
+                    "last_pk_synced": result.get("last_pk_synced"),
                 }
 
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error syncing partition {partition_id} of {table_name}: {error_msg}")
+
+                # Mark partition as failed with error
+                if sync_id:
+                    state_manager.update_partition_status(
+                        sync_id=sync_id,
+                        partition_id=partition_id,
+                        status='failed',
+                        error=error_msg[:500],  # Truncate long errors
+                    )
+
                 return {
                     "table_name": table_name,
                     "partition_id": partition_id,
                     "is_partition": True,
+                    "sync_id": sync_id,
                     "status": "failed",
                     "success": False,
                     "errors": [error_msg],
