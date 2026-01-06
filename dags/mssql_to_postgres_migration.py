@@ -550,49 +550,85 @@ def mssql_to_postgres_migration():
     @task(trigger_rule="all_done")
     def collect_results(**context) -> List[Dict[str, Any]]:
         """
-        Aggregate all transfer results by pulling XCom manually.
+        Aggregate all transfer results by querying XCom table directly.
 
-        This works around Airflow 3.0's buggy automatic XCom resolution
-        for dynamically mapped tasks.
+        NOTE: Airflow 3.0 changed xcom_pull() behavior for mapped tasks - it returns
+        None instead of all mapped task results (see https://github.com/apache/airflow/issues/50982).
+        We work around this by querying the XCom table directly via the metadata database.
+
+        Requires AIRFLOW_CONN_AIRFLOW_DB connection to be configured pointing to the
+        Airflow metadata database (PostgreSQL).
         """
+        import json
         from collections import defaultdict
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+        from airflow.models.connection import Connection
 
-        ti = context["ti"]
+        dag_run = context["dag_run"]
+        dag_id = dag_run.dag_id
+        run_id = dag_run.run_id
+
+        # Check if airflow_db connection exists before attempting to use it
+        try:
+            Connection.get_connection_from_secrets("airflow_db")
+        except Exception as e:
+            logger.error(
+                "airflow_db connection not found. This connection is required for "
+                "collect_results to work around Airflow 3.0 XCom bug. "
+                "Add AIRFLOW_CONN_AIRFLOW_DB to your environment pointing to the "
+                "Airflow metadata database. Error: %s", e
+            )
+            raise ValueError(
+                "Missing required connection 'airflow_db'. See logs for details."
+            ) from e
+
+        # Query XCom directly from metadata database to work around Airflow 3.0 bug
+        # where xcom_pull returns None for dynamically mapped tasks
+        pg_hook = PostgresHook(postgres_conn_id="airflow_db")
+
+        def get_mapped_results(task_id: str) -> List[Dict]:
+            """Pull all return_value XComs for a mapped task."""
+            query = """
+                SELECT value::text
+                FROM xcom
+                WHERE dag_id = %s
+                  AND run_id = %s
+                  AND task_id = %s
+                  AND key = 'return_value'
+                ORDER BY map_index
+            """
+            with pg_hook.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, [dag_id, run_id, task_id])
+                    rows = cur.fetchall()
+            results = []
+            for row in rows:
+                try:
+                    results.append(json.loads(row[0]))
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(
+                        "Failed to decode XCom JSON value for task_id=%s, dag_id=%s, run_id=%s: %s",
+                        task_id, dag_id, run_id, e
+                    )
+            return results
+
+        regular_results = get_mapped_results("transfer_table_data")
+        first_results = get_mapped_results("transfer_first_partitions")
+        remaining_results = get_mapped_results("transfer_remaining_partitions")
+
+        logger.info(f"Retrieved XCom results: {len(regular_results)} regular, "
+                   f"{len(first_results)} first partitions, {len(remaining_results)} remaining partitions")
+
         all_results = []
 
-        # Manually pull XCom from each transfer task (use explicit task IDs)
-        regular_results = ti.xcom_pull(
-            task_ids="transfer_table_data",
-            key="return_value",
-            default=[]
-        )
-        first_results = ti.xcom_pull(
-            task_ids="transfer_first_partitions",
-            key="return_value",
-            default=[]
-        )
-        remaining_results = ti.xcom_pull(
-            task_ids="transfer_remaining_partitions",
-            key="return_value",
-            default=[]
-        )
-
-        # Normalize to lists
-        if regular_results and not isinstance(regular_results, list):
-            regular_results = [regular_results]
-        if first_results and not isinstance(first_results, list):
-            first_results = [first_results]
-        if remaining_results and not isinstance(remaining_results, list):
-            remaining_results = [remaining_results]
-
-        # Process regular tables
-        for r in (regular_results or []):
+        # Process regular tables (non-partitioned)
+        for r in regular_results:
             if r and isinstance(r, dict):
                 all_results.append(r)
 
         # Aggregate partitions by table
         table_partitions = defaultdict(list)
-        for r in (first_results or []) + (remaining_results or []):
+        for r in first_results + remaining_results:
             if r and isinstance(r, dict):
                 key = (r.get("source_schema", ""), r.get("table_name", "Unknown"))
                 table_partitions[key].append(r)
@@ -687,6 +723,11 @@ def mssql_to_postgres_migration():
                             continue
                         try:
                             # Use sql.Identifier for proper escaping to prevent SQL injection
+                            # NOTE: pg_get_serial_sequence requires quoted identifiers to preserve
+                            # case sensitivity. Use "schema"."table" format in the literal string.
+                            # Escape double quotes within names (replace " with "") per SQL standard.
+                            safe_schema = target_schema.replace('"', '""')
+                            safe_table = table_name.replace('"', '""')
                             reset_sql = sql.SQL("""
                             SELECT setval(
                                 pg_get_serial_sequence({table}, {column}),
@@ -694,7 +735,7 @@ def mssql_to_postgres_migration():
                                 true
                             )
                             """).format(
-                                table=sql.Literal(f"{target_schema}.{table_name}"),
+                                table=sql.Literal(f'"{safe_schema}"."{safe_table}"'),
                                 column=sql.Literal(col_name),
                                 col_id=sql.Identifier(col_name),
                                 schema=sql.Identifier(target_schema),
