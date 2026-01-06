@@ -480,7 +480,10 @@ def mssql_to_postgres_incremental():
         Returns:
             Summary dict
         """
-        if not sync_results:
+        # Convert to list to avoid Airflow 3.0 lazy sequence __len__ bug
+        results_list = list(sync_results) if sync_results else []
+
+        if not results_list:
             return {
                 "status": "no_tables",
                 "message": "No tables were synced",
@@ -489,13 +492,13 @@ def mssql_to_postgres_incremental():
                 "total_updated": 0,
             }
 
-        tables_synced = len([r for r in sync_results if r.get("success")])
-        tables_failed = len([r for r in sync_results if not r.get("success")])
-        tables_no_changes = len([r for r in sync_results if r.get("status") == "no_changes"])
+        tables_synced = len([r for r in results_list if r.get("success")])
+        tables_failed = len([r for r in results_list if not r.get("success")])
+        tables_no_changes = len([r for r in results_list if r.get("status") == "no_changes"])
 
-        total_inserted = sum(r.get("rows_inserted", 0) for r in sync_results)
-        total_updated = sum(r.get("rows_updated", 0) for r in sync_results)
-        total_unchanged = sum(r.get("unchanged_count", 0) for r in sync_results)
+        total_inserted = sum(r.get("rows_inserted", 0) for r in results_list)
+        total_updated = sum(r.get("rows_updated", 0) for r in results_list)
+        total_unchanged = sum(r.get("unchanged_count", 0) for r in results_list)
 
         summary = {
             "status": "success" if tables_failed == 0 else "partial_failure",
@@ -517,7 +520,7 @@ def mssql_to_postgres_incremental():
         if tables_failed > 0:
             failed_tables = [
                 f"{r.get('source_schema', '')}.{r['table_name']}"
-                for r in sync_results if not r.get("success")
+                for r in results_list if not r.get("success")
             ]
             logger.error(f"Failed tables: {', '.join(failed_tables)}")
 
