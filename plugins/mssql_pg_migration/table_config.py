@@ -5,11 +5,16 @@ This module handles parsing of include_tables in 'schema.table' format
 and derives target PostgreSQL schema names from source database/schema.
 """
 
+import os
 import re
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Base path for config files (relative to Airflow home or project root)
+CONFIG_DIR = Path(os.environ.get("AIRFLOW_HOME", "/opt/airflow")) / "config"
 
 
 def parse_schema_table(entry: str) -> Tuple[str, str]:
@@ -227,6 +232,65 @@ def expand_include_tables_param(include_tables_raw) -> List[str]:
         "expand_include_tables_param received unsupported type %s; returning empty list.",
         type(include_tables_raw).__name__,
     )
+    return []
+
+
+def load_include_tables_from_config(mssql_conn_id: str = "mssql_source") -> List[str]:
+    """
+    Load include_tables from config file based on source database name.
+
+    Looks for: config/{databasename}_include_tables.txt
+
+    File format: One schema.table entry per line, e.g.:
+        dbo.Users
+        dbo.Posts
+        sales.Orders
+
+    Priority for defaults:
+    1. Config file (if exists)
+    2. INCLUDE_TABLES environment variable
+    3. Empty list
+
+    Args:
+        mssql_conn_id: Airflow connection ID for SQL Server
+
+    Returns:
+        List of schema.table strings from config file, env var, or empty list
+    """
+    # Try to load from config file first
+    try:
+        from airflow.hooks.base import BaseHook
+
+        conn = BaseHook.get_connection(mssql_conn_id)
+        database = conn.schema
+
+        if database:
+            config_file = CONFIG_DIR / f"{database}_include_tables.txt"
+            if config_file.exists():
+                logger.info(f"Loading include_tables from {config_file}")
+                with open(config_file, 'r') as f:
+                    tables = [
+                        line.strip()
+                        for line in f
+                        if line.strip() and not line.strip().startswith('#')
+                    ]
+                if tables:
+                    logger.info(f"Loaded {len(tables)} tables from config file")
+                    return tables
+                else:
+                    logger.warning(f"Config file {config_file} is empty")
+            else:
+                logger.debug(f"Config file not found: {config_file}")
+
+    except Exception as e:
+        # At DAG parse time, connection might not be available
+        logger.debug(f"Could not load from config file: {e}")
+
+    # Fall back to environment variable
+    env_tables = os.environ.get("INCLUDE_TABLES", "")
+    if env_tables:
+        return expand_include_tables_param(env_tables)
+
     return []
 
 

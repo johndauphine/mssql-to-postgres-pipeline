@@ -21,7 +21,6 @@ from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any
 import logging
-import os
 
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.ddl_generator import DDLGenerator
@@ -31,12 +30,10 @@ from mssql_pg_migration.table_config import (
     parse_include_tables,
     get_source_database,
     derive_target_schema,
+    load_include_tables_from_config,
 )
 
 logger = logging.getLogger(__name__)
-
-# Default tables from environment variable (fallback)
-DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
 
 
 @dag(
@@ -64,8 +61,9 @@ DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
             description="PostgreSQL connection ID"
         ),
         "include_tables": Param(
-            default=expand_include_tables_param(DEFAULT_INCLUDE_TABLES),
-            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
+            default=load_include_tables_from_config("mssql_source"),
+            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
+                        "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
     },
     tags=["schema", "mssql", "postgres", "ddl"],
@@ -85,12 +83,9 @@ def mssql_to_postgres_schema():
         source_conn_id = params["source_conn_id"]
 
         # Parse and expand include_tables parameter
+        # Defaults are loaded from config file or env var at DAG parse time
         include_tables_raw = params.get("include_tables", [])
         include_tables = expand_include_tables_param(include_tables_raw)
-
-        # Fall back to environment variable if empty
-        if not include_tables and DEFAULT_INCLUDE_TABLES:
-            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
 
         # Validate include_tables (will raise ValueError if empty or invalid)
         validate_include_tables(include_tables)
