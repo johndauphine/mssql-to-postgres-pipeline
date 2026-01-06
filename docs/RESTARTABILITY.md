@@ -123,7 +123,7 @@ For large tables (>1M rows), the DAG splits transfers into partitions. State tra
     "partitions": [
       {"id": 0, "status": "completed", "rows": 500000},
       {"id": 1, "status": "completed", "rows": 500000},
-      {"id": 2, "status": "failed", "rows": 0, "error": "timeout"},
+      {"id": 2, "status": "failed", "rows": 300000, "error": "timeout", "last_pk_synced": 1500000},
       {"id": 3, "status": "pending"}
     ]
   }
@@ -132,10 +132,31 @@ For large tables (>1M rows), the DAG splits transfers into partitions. State tra
 
 On resume:
 - Completed partitions (0, 1) are skipped
-- Failed partition (2) is retried with cleanup
+- Failed partition (2) resumes from checkpoint if available
 - Pending partitions (3) run normally
 
-**Important**: Before retrying a failed partition, its PK range is deleted to prevent duplicates.
+### Mid-Partition Checkpoint Resume
+
+When a partition fails mid-transfer, the DAG saves a checkpoint (`last_pk_synced`) indicating the last successfully committed row. On resume:
+
+1. **With checkpoint**: Transfer continues from `pk > last_pk_synced`, skipping already-transferred rows
+2. **Without checkpoint**: Full partition retry with cleanup (DELETE by PK range)
+
+```
+Partition fails at row 900K of 1M:
+  ├─ last_pk_synced = 900000 saved to state
+  └─ On resume:
+      ├─ DELETE rows WHERE pk > 900000 (cleanup stale data)
+      ├─ Transfer continues from pk > 900000
+      └─ Only ~100K rows transferred (not 1M)
+```
+
+**Limitations**:
+- Checkpoint resume only works for **keyset pagination** (single primary key)
+- **Composite PKs** use ROW_NUMBER pagination which doesn't support mid-partition resume
+- **Parallel readers** (`PARALLEL_READERS > 1`) disable checkpoint resume due to non-deterministic ordering
+
+**Stale Checkpoint Handling**: If the worker commits rows but crashes before saving the checkpoint, those rows would be re-transferred on resume, causing duplicate key errors. To prevent this, the DAG always deletes rows after the checkpoint (`pk > last_pk_synced`) before resuming, ensuring idempotency.
 
 ## Usage Scenarios
 
@@ -153,15 +174,24 @@ On resume:
 3. Fix the mapping in schema DAG
 4. Re-run only Users: `{"resume_mode": true, "force_refresh_tables": ["Users"]}`
 
-### Scenario 3: Partition 3 of 6 Keeps Failing
+### Scenario 3: Partition Fails Mid-Transfer
+
+1. Large table (Posts, 3.7M rows) split into 4 partitions
+2. Partition 2 fails after transferring 700K of 900K rows
+3. State shows: `"last_pk_synced": 2500000` in partition_info
+4. Resume: `{"resume_mode": true}`
+5. Partition 2 continues from pk > 2500000, only ~200K rows to transfer
+6. Logs show: `Resuming partition from checkpoint: PK > 2500000`
+
+### Scenario 4: Partition Keeps Failing (No Checkpoint)
 
 1. Large table split into 6 partitions
-2. Partitions 1-2 complete, partition 3 fails with timeout
+2. Partitions 1-2 complete, partition 3 fails immediately (no checkpoint)
 3. Increase `chunk_size` or check for blocking queries
 4. Resume: `{"resume_mode": true}`
-5. Only partition 3 onwards are retried
+5. Partition 3 is fully retried with cleanup (DELETE by PK range)
 
-### Scenario 4: Need to Re-migrate Everything
+### Scenario 5: Need to Re-migrate Everything
 
 1. Source data was refreshed, need full re-migration
 2. Clear state and start over: `{"reset_state": true}`
@@ -187,6 +217,15 @@ WHERE sync_status = 'failed';
 SELECT table_name, partition_info
 FROM _migration_state
 WHERE table_name = 'Posts';
+
+-- View checkpoint for failed partitions
+SELECT table_name,
+       p->>'id' as partition_id,
+       p->>'status' as status,
+       p->>'last_pk_synced' as checkpoint
+FROM _migration_state,
+     jsonb_array_elements(partition_info->'partitions') as p
+WHERE p->>'status' = 'failed';
 ```
 
 ## Logs

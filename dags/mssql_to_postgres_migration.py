@@ -525,11 +525,22 @@ def mssql_to_postgres_migration():
                         # Get pk_column from table_info for building WHERE clause
                         pk_column = pk_columns[0]['name'] if pk_columns else None
 
+                        # Check if table uses composite PK (ROW_NUMBER mode) - no checkpoint resume for that
+                        is_composite = pk_info.get("is_composite", False)
+
                         for stored_p in incomplete:
                             partition_idx = stored_p.get('id', 0)
                             min_pk = stored_p.get('min_pk')
                             max_pk = stored_p.get('max_pk')
                             was_failed = stored_p.get('status') == 'failed'
+                            last_pk_synced = stored_p.get('last_pk_synced')
+
+                            # Checkpoint resume only for keyset mode (single PK, sequential reader)
+                            # ROW_NUMBER mode and parallel readers don't support mid-partition resume
+                            resume_from_pk = None
+                            if last_pk_synced is not None and not is_composite:
+                                resume_from_pk = last_pk_synced
+                                logger.info(f"    partition_{partition_idx + 1}: checkpoint at PK={last_pk_synced}")
 
                             # Build WHERE clause if we have PK bounds
                             where_clause = None
@@ -552,6 +563,12 @@ def mssql_to_postgres_migration():
                                 else:
                                     where_clause = f"[{safe_pk}] >= {min_sql} AND [{safe_pk}] <= {max_sql}"
 
+                            # Cleanup logic (Gemini fix for stale checkpoints):
+                            # - If resuming from checkpoint: delete rows AFTER checkpoint (handles stale checkpoint)
+                            # - If no checkpoint (full retry): delete entire partition range
+                            # - If not failed: no cleanup needed
+                            cleanup_required = was_failed and resume_from_pk is None
+
                             resume_partition = {
                                 **table_info_with_state,
                                 "partition_name": f"partition_{partition_idx + 1}",
@@ -564,12 +581,18 @@ def mssql_to_postgres_migration():
                                 "truncate_first": False,  # Never truncate on resume
                                 "total_partitions": stored_partition_info.get('total_partitions', len(stored_partitions)),
                                 "is_resume": True,
-                                "cleanup_required": was_failed,  # DELETE before INSERT for failed partitions
+                                "cleanup_required": cleanup_required,
+                                "resume_from_pk": resume_from_pk,  # Checkpoint resume
                                 "sync_id": table_state.get('sync_id'),  # Preserve existing sync_id
                             }
                             partitions.append(resume_partition)
 
-                            status_msg = "RETRY (cleanup)" if was_failed else "RESUME"
+                            if resume_from_pk:
+                                status_msg = f"CHECKPOINT (pk > {resume_from_pk})"
+                            elif was_failed:
+                                status_msg = "RETRY (cleanup)"
+                            else:
+                                status_msg = "RESUME"
                             logger.info(f"    partition_{partition_idx + 1}: {status_msg}")
 
                         # Skip normal table processing - we've built resume partitions
@@ -853,33 +876,64 @@ def mssql_to_postgres_migration():
             finally:
                 conn.close()
 
-        # Cleanup for failed partition retry: DELETE by PK range before INSERT
-        if cleanup_required and partition_info.get("pk_column"):
-            pk_column = partition_info["pk_column"]
-            min_pk = partition_info.get("min_pk")
-            max_pk = partition_info.get("max_pk")
+        # Get resume checkpoint if resuming mid-partition
+        resume_from_pk = partition_info.get("resume_from_pk")
 
-            if min_pk is not None and max_pk is not None:
-                from airflow.providers.postgres.hooks.postgres import PostgresHook
-                pg_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
+        # Cleanup logic (Gemini fix for stale checkpoints):
+        # 1. Full retry (no checkpoint): delete entire partition range
+        # 2. Checkpoint resume: delete rows AFTER checkpoint to handle stale checkpoint case
+        #    (worker may have committed rows but crashed before saving checkpoint)
+        pk_column = partition_info.get("pk_column")
+        min_pk = partition_info.get("min_pk")
+        max_pk = partition_info.get("max_pk")
 
-                # Build DELETE query with proper PK bounds
-                # Use parameterized query to avoid SQL injection
+        if pk_column and max_pk is not None:
+            from airflow.providers.postgres.hooks.postgres import PostgresHook
+            pg_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
+
+            if cleanup_required and min_pk is not None:
+                # Full retry: delete entire partition range
                 delete_query = f"""
                     DELETE FROM {target_schema}."{table_name}"
                     WHERE "{pk_column}" >= %s AND "{pk_column}" <= %s
                 """
+                delete_params = (min_pk, max_pk)
+                cleanup_desc = f"PK {min_pk} to {max_pk}"
 
                 try:
                     conn = pg_hook.get_conn()
                     with conn.cursor() as cursor:
-                        cursor.execute(delete_query, (min_pk, max_pk))
+                        cursor.execute(delete_query, delete_params)
                         deleted_count = cursor.rowcount
                     conn.commit()
-                    logger.info(f"  Cleaned up {deleted_count:,} rows from failed partition "
-                               f"(PK {min_pk} to {max_pk})")
+                    logger.info(f"  Cleaned up {deleted_count:,} rows from failed partition ({cleanup_desc})")
                 except Exception as e:
                     logger.warning(f"  Cleanup failed (non-fatal): {e}")
+                finally:
+                    if conn:
+                        conn.close()
+
+            elif resume_from_pk is not None:
+                # Checkpoint resume: delete rows AFTER checkpoint (handles stale checkpoint)
+                delete_query = f"""
+                    DELETE FROM {target_schema}."{table_name}"
+                    WHERE "{pk_column}" > %s AND "{pk_column}" <= %s
+                """
+                delete_params = (resume_from_pk, max_pk)
+                cleanup_desc = f"PK > {resume_from_pk} to {max_pk}"
+
+                try:
+                    conn = pg_hook.get_conn()
+                    with conn.cursor() as cursor:
+                        cursor.execute(delete_query, delete_params)
+                        deleted_count = cursor.rowcount
+                    conn.commit()
+                    if deleted_count > 0:
+                        logger.info(f"  Cleaned up {deleted_count:,} stale rows after checkpoint ({cleanup_desc})")
+                    else:
+                        logger.info(f"  No stale rows to clean up after checkpoint")
+                except Exception as e:
+                    logger.warning(f"  Stale checkpoint cleanup failed (non-fatal): {e}")
                 finally:
                     if conn:
                         conn.close()
@@ -892,6 +946,9 @@ def mssql_to_postgres_migration():
                 max_pk=partition_info.get("max_pk"),
             )
 
+        if resume_from_pk is not None:
+            logger.info(f"  Resuming partition from checkpoint: PK > {resume_from_pk}")
+
         result = data_transfer.transfer_table_data(
             mssql_conn_id=params["source_conn_id"],
             postgres_conn_id=params["target_conn_id"],
@@ -899,6 +956,7 @@ def mssql_to_postgres_migration():
             chunk_size=params["chunk_size"],
             truncate=partition_info.get("truncate_first", False),
             where_clause=partition_info.get("where_clause"),
+            resume_from_pk=resume_from_pk,
         )
 
         result["table_name"] = table_name
@@ -923,12 +981,16 @@ def mssql_to_postgres_migration():
             errors = result.get('errors', [])
             error_msg = '; '.join(str(e) for e in errors) if errors else 'Unknown error'
             logger.error(f"  {source_schema}.{table_name} {partition_name}: FAILED - {error_msg}")
-            # Update partition status to 'failed'
+            # Update partition status to 'failed' with checkpoint for resume
+            last_pk_synced = result.get("last_pk_synced")
+            if last_pk_synced is not None:
+                logger.info(f"  Saving checkpoint: last_pk_synced = {last_pk_synced}")
             if sync_id:
                 state_mgr.update_partition_status(
                     sync_id, partition_index, 'failed',
                     rows_transferred=result.get("rows_transferred", 0),
-                    error=error_msg
+                    error=error_msg,
+                    last_pk_synced=last_pk_synced,
                 )
 
         return result

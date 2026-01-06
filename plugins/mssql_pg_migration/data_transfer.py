@@ -965,7 +965,8 @@ class DataTransfer:
         use_row_number: bool = False,
         order_by_columns: Optional[List[str]] = None,
         start_row: Optional[int] = None,
-        end_row: Optional[int] = None
+        end_row: Optional[int] = None,
+        resume_from_pk: Any = None,
     ) -> Dict[str, Any]:
         """
         Transfer data from SQL Server table to PostgreSQL table.
@@ -983,9 +984,10 @@ class DataTransfer:
             order_by_columns: Columns for ORDER BY when using ROW_NUMBER mode
             start_row: Starting row number (1-indexed) for ROW_NUMBER mode partition
             end_row: Ending row number for ROW_NUMBER mode partition
+            resume_from_pk: Resume from this PK value (keyset mode only, ignored for ROW_NUMBER/parallel)
 
         Returns:
-            Transfer result dictionary with statistics
+            Transfer result dictionary with statistics and last_pk_synced for checkpoint
         """
         start_time = time.time()
         logger.info(f"Starting transfer: {source_schema}.{source_table} -> {target_schema}.{target_table}")
@@ -1021,6 +1023,8 @@ class DataTransfer:
         rows_transferred = 0
         chunks_processed = 0
         errors = []
+        # Track last PK synced for checkpoint resume (initialized to resume point if provided)
+        last_pk_synced = resume_from_pk
 
         # Determine pagination mode
         # Auto-detect composite PKs and switch to ROW_NUMBER mode
@@ -1043,6 +1047,9 @@ class DataTransfer:
             pk_column = pk_columns[0] if pk_columns else columns[0]
             logger.info(f"Using '{pk_column}' for keyset pagination")
             pk_index = columns.index(pk_column) if pk_column in columns else 0
+            # Log if resuming from checkpoint
+            if resume_from_pk is not None:
+                logger.info(f"RESUMING from checkpoint: PK > {resume_from_pk}")
 
         try:
             with self._mssql_connection() as mssql_conn, self._postgres_connection() as postgres_conn:
@@ -1296,7 +1303,8 @@ class DataTransfer:
                                 f"using sequential keyset mode"
                             )
 
-                        last_key_value = None
+                        # Use resume_from_pk if provided (checkpoint resume)
+                        last_key_value = resume_from_pk if resume_from_pk is not None else None
                         while rows_transferred < source_row_count:
                             chunk_start_time = time.time()
 
@@ -1336,6 +1344,8 @@ class DataTransfer:
                             )
 
                             postgres_conn.commit()
+                            # Update checkpoint after successful commit
+                            last_pk_synced = last_key_value
 
         except Exception as e:
             error_msg = f"Error transferring data: {str(e)}"
@@ -1368,6 +1378,9 @@ class DataTransfer:
             'errors': errors,
             'timestamp': datetime.now().isoformat(),
         }
+        # Only include last_pk_synced if set (avoid XCom None serialization issues)
+        if last_pk_synced is not None:
+            result['last_pk_synced'] = last_pk_synced
 
         if result['success']:
             logger.info(
@@ -2194,7 +2207,8 @@ def transfer_table_data(
     table_info: Dict[str, Any],
     chunk_size: int = 200000,
     truncate: bool = True,
-    where_clause: Optional[str] = None
+    where_clause: Optional[str] = None,
+    resume_from_pk: Any = None,
 ) -> Dict[str, Any]:
     """
     Convenience function to transfer a single table.
@@ -2211,9 +2225,10 @@ def transfer_table_data(
         chunk_size: Rows per chunk
         truncate: Whether to truncate target before transfer
         where_clause: Optional WHERE clause for filtering source data
+        resume_from_pk: Resume from this PK value (for checkpoint resume)
 
     Returns:
-        Transfer result dictionary
+        Transfer result dictionary with last_pk_synced for checkpoint
     """
     import os
 
@@ -2247,6 +2262,7 @@ def transfer_table_data(
         order_by_columns=table_info.get('order_by_columns'),
         start_row=table_info.get('start_row'),
         end_row=table_info.get('end_row'),
+        resume_from_pk=resume_from_pk,
     )
 
 
@@ -2833,8 +2849,10 @@ def transfer_incremental_staging(
         'avg_rows_per_second': rows_copied / elapsed_time if elapsed_time > 0 else 0,
         'success': len(errors) == 0,
         'errors': errors,
-        'last_pk_synced': last_key_value,  # For resume support
     }
+    # Only include last_pk_synced if set (avoid XCom None serialization issues)
+    if last_key_value is not None:
+        result['last_pk_synced'] = last_key_value
 
     if result['success']:
         logger.info(
@@ -3066,8 +3084,10 @@ def transfer_incremental_staging_partitioned(
         'elapsed_time_seconds': elapsed_time,
         'success': len(errors) == 0,
         'errors': errors,
-        'last_pk_synced': last_pk_synced,  # For resume checkpoint
     }
+    # Only include last_pk_synced if set (avoid XCom None serialization issues)
+    if last_pk_synced is not None:
+        result['last_pk_synced'] = last_pk_synced
 
     if result['success']:
         logger.info(
