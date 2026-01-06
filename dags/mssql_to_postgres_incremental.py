@@ -6,17 +6,12 @@ This DAG performs incremental data synchronization from SQL Server to PostgreSQL
 Tables must be explicitly specified in 'schema.table' format in include_tables.
 Target PostgreSQL schema is derived as: {sourcedb}__{sourceschema} (lowercase)
 
-Default mode (use_staging=True):
-Uses a staging table pattern for efficient sync:
+Sync process:
 1. COPY all source rows to an UNLOGGED staging table
 2. Upsert from staging using INSERT...ON CONFLICT with IS DISTINCT FROM
 3. Only rows that actually changed are updated (PostgreSQL handles comparison)
 
-Legacy mode (use_staging=False):
-Uses hash-based comparison (slower):
-1. Compare source vs target primary keys to find new rows
-2. Optionally compare MD5 hashes to find changed rows
-3. Upsert only new/changed rows
+Large tables (>1M rows) are automatically partitioned for parallel processing.
 
 Requires:
 - Target tables already exist (run full migration first)
@@ -46,9 +41,7 @@ MAX_PARTITIONS_PER_TABLE = int(os.environ.get('MAX_PARTITIONS_PER_TABLE', '6'))
 # Import migration modules
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.incremental_state import IncrementalStateManager
-from mssql_pg_migration.diff_detector import DiffDetector
 from mssql_pg_migration.data_transfer import (
-    transfer_incremental,
     transfer_incremental_staging,
     transfer_incremental_staging_partitioned,
 )
@@ -97,29 +90,12 @@ logger = logging.getLogger(__name__)
             description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
                         "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
-        "use_staging": Param(
-            default=True,
-            type="boolean",
-            description="Use staging table pattern (fast). Set False for legacy hash-based comparison."
-        ),
-        "detect_changes": Param(
-            default=False,
-            type="boolean",
-            description="[Legacy mode only] Compare row hashes to detect changes"
-        ),
         "batch_size": Param(
             default=DEFAULT_BATCH_SIZE,
             type="integer",
             minimum=1000,
             maximum=500000,
-            description="Rows per batch for COPY to staging (or upsert in legacy mode)"
-        ),
-        "diff_batch_size": Param(
-            default=100000,
-            type="integer",
-            minimum=10000,
-            maximum=1000000,
-            description="[Legacy mode only] PKs per batch during diff detection"
+            description="Rows per batch for COPY to staging table"
         ),
     },
     tags=["migration", "mssql", "postgres", "etl", "incremental"],
@@ -345,7 +321,7 @@ def mssql_to_postgres_incremental():
     @task(max_active_tis_per_dagrun=MAX_PARALLEL_TRANSFERS)
     def sync_table(task_info: Dict[str, Any], **context) -> Dict[str, Any]:
         """
-        Sync a single table or partition incrementally.
+        Sync a single table or partition incrementally using staging table pattern.
 
         For partitioned tables:
         1. Create partition-specific staging table
@@ -353,7 +329,7 @@ def mssql_to_postgres_incremental():
         3. Upsert from staging to target
         4. Drop staging table
 
-        For non-partitioned tables (default staging mode):
+        For non-partitioned tables:
         1. Start sync in state table
         2. COPY all source rows to staging table
         3. Upsert from staging with IS DISTINCT FROM (only changed rows update)
@@ -368,7 +344,6 @@ def mssql_to_postgres_incremental():
         params = context["params"]
         source_conn_id = params["source_conn_id"]
         target_conn_id = params["target_conn_id"]
-        use_staging = params.get("use_staging", True)
         batch_size = params.get("batch_size", DEFAULT_BATCH_SIZE)
 
         is_partition = task_info.get("is_partition", False)
@@ -423,10 +398,9 @@ def mssql_to_postgres_incremental():
                     "errors": [error_msg],
                 }
 
-        # Non-partitioned table sync (original logic)
+        # Non-partitioned table sync
         logger.info(
-            f"Starting incremental sync for {source_schema}.{table_name} -> {target_schema}.{table_name} "
-            f"(mode: {'staging' if use_staging else 'legacy'})"
+            f"Starting incremental sync for {source_schema}.{table_name} -> {target_schema}.{table_name}"
         )
 
         # For non-partitioned tables, we need the full table_info
@@ -442,143 +416,45 @@ def mssql_to_postgres_incremental():
         )
 
         try:
-            if use_staging:
-                # Staging table approach - fast, handles change detection via IS DISTINCT FROM
-                transfer_result = transfer_incremental_staging(
-                    mssql_conn_id=source_conn_id,
-                    postgres_conn_id=target_conn_id,
-                    table_info=table_info,
-                    chunk_size=batch_size,
+            # Staging table approach - fast, handles change detection via IS DISTINCT FROM
+            transfer_result = transfer_incremental_staging(
+                mssql_conn_id=source_conn_id,
+                postgres_conn_id=target_conn_id,
+                table_info=table_info,
+                chunk_size=batch_size,
+            )
+
+            rows_inserted = transfer_result["rows_inserted"]
+            rows_updated = transfer_result["rows_updated"]
+            rows_unchanged = transfer_result.get("rows_unchanged", 0)
+
+            # Update state
+            if transfer_result["success"]:
+                state_manager.complete_sync(
+                    sync_id=sync_id,
+                    rows_inserted=rows_inserted,
+                    rows_updated=rows_updated,
+                    rows_unchanged=rows_unchanged,
                 )
-
-                rows_inserted = transfer_result["rows_inserted"]
-                rows_updated = transfer_result["rows_updated"]
-                rows_unchanged = transfer_result.get("rows_unchanged", 0)
-
-                # Update state
-                if transfer_result["success"]:
-                    state_manager.complete_sync(
-                        sync_id=sync_id,
-                        rows_inserted=rows_inserted,
-                        rows_updated=rows_updated,
-                        rows_unchanged=rows_unchanged,
-                    )
-                else:
-                    state_manager.fail_sync(
-                        sync_id=sync_id,
-                        error="; ".join(transfer_result.get("errors", ["Unknown error"])),
-                    )
-
-                return {
-                    "table_name": table_name,
-                    "source_schema": source_schema,
-                    "target_schema": target_schema,
-                    "status": "synced" if transfer_result["success"] else "failed",
-                    "rows_inserted": rows_inserted,
-                    "rows_updated": rows_updated,
-                    "unchanged_count": rows_unchanged,
-                    "rows_copied_to_staging": transfer_result.get("rows_copied_to_staging", 0),
-                    "elapsed_seconds": transfer_result.get("elapsed_time_seconds", 0),
-                    "success": transfer_result["success"],
-                    "errors": transfer_result.get("errors", []),
-                }
-
             else:
-                # Legacy hash-based approach
-                detect_changes = params.get("detect_changes", False)
-                diff_batch_size = params.get("diff_batch_size", 100000)
-                pk_columns = table_info["pk_columns"]
-                columns = table_info.get("columns", [])
-
-                # Detect changes
-                detector = DiffDetector(source_conn_id, target_conn_id, diff_batch_size)
-
-                # Determine columns to compare for change detection
-                compare_columns = None
-                if detect_changes:
-                    # Compare all non-PK columns
-                    compare_columns = [c for c in columns if c not in pk_columns]
-
-                diff_result = detector.detect_changes(
-                    source_schema=source_schema,
-                    source_table=table_name,
-                    target_schema=target_schema,
-                    target_table=table_name,
-                    pk_columns=pk_columns,
-                    compare_columns=compare_columns,
+                state_manager.fail_sync(
+                    sync_id=sync_id,
+                    error="; ".join(transfer_result.get("errors", ["Unknown error"])),
                 )
 
-                new_count = diff_result["new_count"]
-                changed_count = diff_result["changed_count"]
-                unchanged_count = diff_result["unchanged_count"]
-
-                logger.info(
-                    f"{source_schema}.{table_name}: {new_count:,} new, {changed_count:,} changed, "
-                    f"{unchanged_count:,} unchanged"
-                )
-
-                # If no changes, mark complete and return early
-                if new_count == 0 and changed_count == 0:
-                    state_manager.complete_sync(
-                        sync_id=sync_id,
-                        rows_inserted=0,
-                        rows_updated=0,
-                        rows_unchanged=unchanged_count,
-                        target_row_count=diff_result.get("target_count"),
-                    )
-                    return {
-                        "table_name": table_name,
-                        "source_schema": source_schema,
-                        "target_schema": target_schema,
-                        "status": "no_changes",
-                        "new_count": 0,
-                        "changed_count": 0,
-                        "unchanged_count": unchanged_count,
-                        "rows_inserted": 0,
-                        "rows_updated": 0,
-                        "success": True,
-                    }
-
-                # Combine new and changed PKs for transfer
-                pks_to_sync = diff_result["new_pks"] + diff_result["changed_pks"]
-
-                # Transfer rows
-                transfer_result = transfer_incremental(
-                    mssql_conn_id=source_conn_id,
-                    postgres_conn_id=target_conn_id,
-                    table_info=table_info,
-                    pk_values=pks_to_sync,
-                    batch_size=batch_size,
-                )
-
-                # Update state
-                if transfer_result["success"]:
-                    state_manager.complete_sync(
-                        sync_id=sync_id,
-                        rows_inserted=transfer_result["rows_inserted"],
-                        rows_updated=transfer_result["rows_updated"],
-                        rows_unchanged=unchanged_count,
-                    )
-                else:
-                    state_manager.fail_sync(
-                        sync_id=sync_id,
-                        error="; ".join(transfer_result.get("errors", ["Unknown error"])),
-                    )
-
-                return {
-                    "table_name": table_name,
-                    "source_schema": source_schema,
-                    "target_schema": target_schema,
-                    "status": "synced" if transfer_result["success"] else "failed",
-                    "new_count": new_count,
-                    "changed_count": changed_count,
-                    "unchanged_count": unchanged_count,
-                    "rows_inserted": transfer_result["rows_inserted"],
-                    "rows_updated": transfer_result["rows_updated"],
-                    "elapsed_seconds": transfer_result.get("elapsed_time_seconds", 0),
-                    "success": transfer_result["success"],
-                    "errors": transfer_result.get("errors", []),
-                }
+            return {
+                "table_name": table_name,
+                "source_schema": source_schema,
+                "target_schema": target_schema,
+                "status": "synced" if transfer_result["success"] else "failed",
+                "rows_inserted": rows_inserted,
+                "rows_updated": rows_updated,
+                "unchanged_count": rows_unchanged,
+                "rows_copied_to_staging": transfer_result.get("rows_copied_to_staging", 0),
+                "elapsed_seconds": transfer_result.get("elapsed_time_seconds", 0),
+                "success": transfer_result["success"],
+                "errors": transfer_result.get("errors", []),
+            }
 
         except Exception as e:
             error_msg = str(e)
@@ -604,7 +480,10 @@ def mssql_to_postgres_incremental():
         Returns:
             Summary dict
         """
-        if not sync_results:
+        # Convert to list to avoid Airflow 3.0 lazy sequence __len__ bug
+        results_list = list(sync_results) if sync_results else []
+
+        if not results_list:
             return {
                 "status": "no_tables",
                 "message": "No tables were synced",
@@ -613,13 +492,13 @@ def mssql_to_postgres_incremental():
                 "total_updated": 0,
             }
 
-        tables_synced = len([r for r in sync_results if r.get("success")])
-        tables_failed = len([r for r in sync_results if not r.get("success")])
-        tables_no_changes = len([r for r in sync_results if r.get("status") == "no_changes"])
+        tables_synced = len([r for r in results_list if r.get("success")])
+        tables_failed = len([r for r in results_list if not r.get("success")])
+        tables_no_changes = len([r for r in results_list if r.get("status") == "no_changes"])
 
-        total_inserted = sum(r.get("rows_inserted", 0) for r in sync_results)
-        total_updated = sum(r.get("rows_updated", 0) for r in sync_results)
-        total_unchanged = sum(r.get("unchanged_count", 0) for r in sync_results)
+        total_inserted = sum(r.get("rows_inserted", 0) for r in results_list)
+        total_updated = sum(r.get("rows_updated", 0) for r in results_list)
+        total_unchanged = sum(r.get("unchanged_count", 0) for r in results_list)
 
         summary = {
             "status": "success" if tables_failed == 0 else "partial_failure",
@@ -641,7 +520,7 @@ def mssql_to_postgres_incremental():
         if tables_failed > 0:
             failed_tables = [
                 f"{r.get('source_schema', '')}.{r['table_name']}"
-                for r in sync_results if not r.get("success")
+                for r in results_list if not r.get("success")
             ]
             logger.error(f"Failed tables: {', '.join(failed_tables)}")
 
