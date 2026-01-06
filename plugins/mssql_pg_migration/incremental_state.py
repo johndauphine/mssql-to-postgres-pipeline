@@ -63,9 +63,6 @@ CREATE TABLE IF NOT EXISTS _migration_state (
 
 CREATE INDEX IF NOT EXISTS idx_migration_state_lookup
     ON _migration_state(source_schema, table_name);
-
-CREATE INDEX IF NOT EXISTS idx_migration_state_status
-    ON _migration_state(sync_status, migration_type);
 """
 
 # Schema migration for existing tables (adds new columns if they don't exist)
