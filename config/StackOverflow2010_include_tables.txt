@@ -2,4 +2,13 @@
 # Format: schema.table (one per line)
 # Lines starting with # are comments
 
-dummy.TestTable
+dbo.Badges
+dbo.Comments
+dbo.CorrectnessTest
+dbo.LinkTypes
+dbo.PostLinks
+dbo.Posts
+dbo.PostTypes
+dbo.Users
+dbo.Votes
+dbo.VoteTypes
