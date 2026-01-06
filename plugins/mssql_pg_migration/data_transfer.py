@@ -1847,12 +1847,17 @@ class DataTransfer:
         """
         table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
 
-        quoted_columns = ', '.join([f'[{col}]' for col in columns])
+        # Escape identifiers to prevent SQL injection (double brackets)
+        safe_schema = schema_name.replace(']', ']]')
+        safe_table = table_name.replace(']', ']]')
+        safe_pk = pk_column.replace(']', ']]')
+        quoted_columns = ', '.join([f'[{col.replace("]", "]]")}]' for col in columns])
+
         query = f"""
         SELECT TOP {limit} {quoted_columns}
-        FROM [{schema_name}].[{table_name}]{table_hint}
+        FROM [{safe_schema}].[{safe_table}]{table_hint}
         WHERE {where_clause}
-        ORDER BY [{pk_column}]
+        ORDER BY [{safe_pk}]
         """
 
         try:
@@ -1888,19 +1893,24 @@ class DataTransfer:
         # P0.4: Conditionally use NOLOCK based on strict consistency mode
         table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
 
-        quoted_columns = ', '.join([f'[{col}]' for col in columns])
+        # Escape identifiers to prevent SQL injection (double brackets)
+        safe_schema = schema_name.replace(']', ']]')
+        safe_table = table_name.replace(']', ']]')
+        safe_pk = pk_column.replace(']', ']]')
+        quoted_columns = ', '.join([f'[{col.replace("]", "]]")}]' for col in columns])
+
         base_query = f"""
         SELECT TOP {limit} {quoted_columns}
-        FROM [{schema_name}].[{table_name}]{table_hint}
+        FROM [{safe_schema}].[{safe_table}]{table_hint}
         """
-        order_by = f"ORDER BY [{pk_column}]"
+        order_by = f"ORDER BY [{safe_pk}]"
 
         # Build WHERE clause combining filter and pagination
         where_conditions = []
         if where_clause:
             where_conditions.append(f"({where_clause})")
         if last_key_value is not None:
-            where_conditions.append(f"[{pk_column}] > ?")
+            where_conditions.append(f"[{safe_pk}] > ?")
 
         if where_conditions:
             where_part = "WHERE " + " AND ".join(where_conditions)
@@ -1959,14 +1969,17 @@ class DataTransfer:
         # P0.4: Conditionally use NOLOCK based on strict consistency mode
         table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
 
-        quoted_columns = ', '.join([f'[{col}]' for col in columns])
-        order_by = ', '.join([f'[{col}]' for col in order_by_columns])
+        # Escape identifiers to prevent SQL injection (double brackets)
+        safe_schema = schema_name.replace(']', ']]')
+        safe_table = table_name.replace(']', ']]')
+        quoted_columns = ', '.join([f'[{col.replace("]", "]]")}]' for col in columns])
+        order_by = ', '.join([f'[{col.replace("]", "]]")}]' for col in order_by_columns])
 
         # Build inner query with optional WHERE clause
         inner_query = f"""
         SELECT {quoted_columns},
                ROW_NUMBER() OVER (ORDER BY {order_by}) as _rn
-        FROM [{schema_name}].[{table_name}]{table_hint}
+        FROM [{safe_schema}].[{safe_table}]{table_hint}
         """
         if where_clause:
             inner_query += f"\nWHERE {where_clause}"

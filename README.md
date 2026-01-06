@@ -26,7 +26,7 @@ An Apache Airflow 3.0 pipeline for automated migrations from Microsoft SQL Serve
 ## Features
 
 - **Full Migration**: Complete schema and data migration with automatic type mapping
-- **Incremental Sync**: Efficient change detection using staging tables and PostgreSQL's IS DISTINCT FROM (legacy hash-based mode available)
+- **Incremental Sync**: Efficient change detection using staging tables and PostgreSQL's IS DISTINCT FROM
 - **Schema Discovery**: Automatically extract table structures, columns, and indexes from SQL Server
 - **Type Mapping**: Convert 30+ SQL Server data types to their PostgreSQL equivalents
 - **Streaming Data Transfer**: Move data efficiently using server-side cursors, keyset pagination, and PostgreSQL's COPY protocol
@@ -128,14 +128,10 @@ For ongoing synchronization, the pipeline supports efficient incremental loading
 | Users | 2.4M | 45s | ~55K rows/sec |
 | Badges | 8M | 110s | ~73K rows/sec |
 
-The staging table approach is ~7x faster than the legacy hash-based method because:
-- No MD5 hash computation on millions of rows
+The staging table approach is efficient because:
 - PostgreSQL's `IS DISTINCT FROM` handles NULL-safe comparison natively
-- Single bulk operation instead of per-row hash comparison
-
-**Legacy Mode** (`use_staging=False`):
-- Hash-based change detection using MD5
-- Useful for debugging or when staging tables aren't desired
+- Bulk COPY to unlogged staging table minimizes I/O
+- Single upsert operation instead of per-row comparison
 
 **State Tracking**:
 - The `_migration_state` table tracks sync progress, row counts, and errors
