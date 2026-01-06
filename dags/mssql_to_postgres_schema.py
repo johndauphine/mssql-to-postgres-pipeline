@@ -21,7 +21,6 @@ from pendulum import datetime
 from datetime import timedelta
 from typing import List, Dict, Any
 import logging
-import os
 
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.ddl_generator import DDLGenerator
@@ -31,12 +30,11 @@ from mssql_pg_migration.table_config import (
     parse_include_tables,
     get_source_database,
     derive_target_schema,
+    get_default_include_tables,
+    load_include_tables_from_config,
 )
 
 logger = logging.getLogger(__name__)
-
-# Default tables from environment variable (fallback)
-DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
 
 
 @dag(
@@ -64,13 +62,9 @@ DEFAULT_INCLUDE_TABLES = os.environ.get("INCLUDE_TABLES", "")
             description="PostgreSQL connection ID"
         ),
         "include_tables": Param(
-            default=[],
-            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts'])"
-        ),
-        "drop_existing": Param(
-            default=True,
-            type="boolean",
-            description="Drop existing tables before creating"
+            default=get_default_include_tables(),
+            description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
+                        "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
     },
     tags=["schema", "mssql", "postgres", "ddl"],
@@ -93,9 +87,9 @@ def mssql_to_postgres_schema():
         include_tables_raw = params.get("include_tables", [])
         include_tables = expand_include_tables_param(include_tables_raw)
 
-        # Fall back to environment variable if empty
-        if not include_tables and DEFAULT_INCLUDE_TABLES:
-            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
+        # If empty, try loading from config file at runtime
+        if not include_tables:
+            include_tables = load_include_tables_from_config(source_conn_id)
 
         # Validate include_tables (will raise ValueError if empty or invalid)
         validate_include_tables(include_tables)
@@ -186,11 +180,11 @@ def mssql_to_postgres_schema():
         """
         Create all tables in PostgreSQL WITH primary keys.
 
+        Always drops and recreates tables to ensure clean state.
         Uses target_schema from each table's info dict.
         No foreign keys or secondary indexes are created.
         """
         params = context["params"]
-        drop_existing = params.get("drop_existing", True)
 
         generator = DDLGenerator(params["target_conn_id"])
         created_tables = []
@@ -206,11 +200,10 @@ def mssql_to_postgres_schema():
             try:
                 ddl_statements = []
 
-                # Drop existing table if requested
-                if drop_existing:
-                    ddl_statements.append(
-                        generator.generate_drop_table(table_name, target_schema, cascade=True)
-                    )
+                # Always drop existing table before recreating
+                ddl_statements.append(
+                    generator.generate_drop_table(table_name, target_schema, cascade=True)
+                )
 
                 # Create table WITH primary key (include_constraints=True)
                 ddl_statements.append(

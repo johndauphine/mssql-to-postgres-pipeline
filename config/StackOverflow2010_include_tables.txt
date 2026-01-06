@@ -1,0 +1,5 @@
+# Tables to migrate from StackOverflow2010 database
+# Format: schema.table (one per line)
+# Lines starting with # are comments
+
+dummy.TestTable
