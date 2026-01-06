@@ -51,6 +51,7 @@ MAX_PARALLEL_TRANSFERS = int(os.environ.get('MAX_PARALLEL_TRANSFERS', '8'))
 MAX_ACTIVE_TASKS = int(os.environ.get('MAX_ACTIVE_TASKS', '16'))
 DEFAULT_CHUNK_SIZE = int(os.environ.get('DEFAULT_CHUNK_SIZE', '200000'))
 LARGE_TABLE_THRESHOLD = 1_000_000
+DEFAULT_INCLUDE_TABLES = get_default_include_tables()
 
 
 def validate_sql_identifier(identifier: str, identifier_type: str = "identifier") -> str:
@@ -623,7 +624,17 @@ def mssql_to_postgres_migration():
         results: List[Dict[str, Any]],
         **context
     ) -> str:
-        """Reset SERIAL sequences to MAX(column) value for all target schemas."""
+        """
+        Reset SERIAL/BIGSERIAL sequences to MAX(column) value after bulk data load.
+
+        When using COPY to bulk load data, PostgreSQL sequences don't auto-update.
+        This task finds all columns with sequences and resets them to avoid
+        duplicate key errors on subsequent INSERTs.
+
+        Only processes tables that:
+        1. Have SERIAL/BIGSERIAL columns (detected via column_default LIKE 'nextval%')
+        2. Were successfully transferred in this run
+        """
         params = context["params"]
         target_conn_id = params["target_conn_id"]
 
@@ -632,9 +643,11 @@ def mssql_to_postgres_migration():
             (r.get("target_schema"), r["table_name"])
             for r in results if r.get("success")
         }
+        logger.info(f"Found {len(successful)} successfully transferred tables")
 
         # Get unique target schemas from tables
         target_schemas = set(t.get("target_schema") for t in tables if t.get("target_schema"))
+        logger.info(f"Processing schemas: {sorted(target_schemas)}")
 
         from airflow.providers.postgres.hooks.postgres import PostgresHook
         pg_hook = PostgresHook(postgres_conn_id=target_conn_id)
@@ -645,13 +658,27 @@ def mssql_to_postgres_migration():
 
         for target_schema in target_schemas:
             # Find columns with sequences (SERIAL/BIGSERIAL) in this schema
+            # Only these columns need sequence reset - tables without sequences are skipped
             seq_query = """
                 SELECT table_name, column_name
                 FROM information_schema.columns
                 WHERE table_schema = %s
-                  AND column_default LIKE 'nextval%'
+                  AND column_default LIKE 'nextval%%'
             """
-            seq_columns = pg_hook.get_records(seq_query, parameters=[target_schema])
+            # NOTE: Using direct cursor instead of pg_hook.get_records() due to
+            # Airflow 3.0 bug where get_records() throws IndexError in _run_command
+            # when processing parameterized queries. This is a provider compatibility
+            # issue with airflow-providers-common-sql.
+            with pg_hook.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(seq_query, [target_schema])
+                    seq_columns = cur.fetchall()
+
+            if not seq_columns:
+                logger.info(f"Schema {target_schema}: no sequences found, skipping")
+                continue
+
+            logger.info(f"Schema {target_schema}: found {len(seq_columns)} columns with sequences")
 
             with pg_hook.get_conn() as conn:
                 with conn.cursor() as cursor:
