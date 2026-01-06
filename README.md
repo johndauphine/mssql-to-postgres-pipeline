@@ -15,10 +15,10 @@ An Apache Airflow 3.0 pipeline for automated migrations from Microsoft SQL Serve
 | Validation | Stable - standalone DAG with row count comparison |
 
 **Recent Updates**:
+- Config file support for table selection (`config/{database}_include_tables.txt`)
+- Explicit `schema.table` format with auto-derived target schemas (`{db}__{schema}`)
 - Staging table pattern for incremental sync (~7x faster than hash-based)
-- Added incremental loading with full-diff comparison
 - Implemented connection pooling for SQL Server and PostgreSQL
-- Parallel readers for overlapped read/write I/O
 - State tracking table for sync progress and resumability
 
 **See Also**: [mssql-pg-migrate-rs](https://github.com/johndauphine/mssql-pg-migrate-rs) - High-performance Rust CLI (2.5x faster, 50MB memory)
