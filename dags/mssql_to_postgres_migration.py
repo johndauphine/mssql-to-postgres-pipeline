@@ -900,6 +900,7 @@ def mssql_to_postgres_migration():
                 delete_params = (min_pk, max_pk)
                 cleanup_desc = f"PK {min_pk} to {max_pk}"
 
+                conn = None
                 try:
                     conn = pg_hook.get_conn()
                     with conn.cursor() as cursor:
@@ -922,6 +923,7 @@ def mssql_to_postgres_migration():
                 delete_params = (resume_from_pk, max_pk)
                 cleanup_desc = f"PK > {resume_from_pk} to {max_pk}"
 
+                conn = None
                 try:
                     conn = pg_hook.get_conn()
                     with conn.cursor() as cursor:
