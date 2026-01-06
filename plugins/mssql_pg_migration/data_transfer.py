@@ -2614,6 +2614,7 @@ def transfer_incremental_staging(
     postgres_conn_id: str,
     table_info: Dict[str, Any],
     chunk_size: int = 100000,
+    resume_from_pk: Any = None,
 ) -> Dict[str, Any]:
     """
     Transfer table data using staging table pattern for efficient incremental sync.
@@ -2632,6 +2633,7 @@ def transfer_incremental_staging(
         postgres_conn_id: PostgreSQL connection ID
         table_info: Table information including schema, columns, and pk_columns
         chunk_size: Rows per chunk for COPY to staging
+        resume_from_pk: Optional PK value to resume from (only sync rows with PK > this value)
 
     Returns:
         Transfer result dictionary with rows_inserted, rows_updated, etc.
@@ -2683,6 +2685,7 @@ def transfer_incremental_staging(
     total_updated = 0
     rows_copied = 0
     errors = []
+    last_key_value = resume_from_pk  # Track for resume support
 
     # Generate unique staging table name
     staging_table = f"_staging_{source_table}_{uuid.uuid4().hex[:8]}"
@@ -2718,8 +2721,20 @@ def transfer_incremental_staging(
                 logger.info(f"Using binary COPY for staging (column types: {len(column_types)})")
 
             with transfer._mssql_connection() as mssql_conn:
-                last_key_value = None
+                # last_key_value already initialized for resume support
                 chunks_processed = 0
+
+                if resume_from_pk is not None:
+                    logger.info(f"Resuming from PK > {resume_from_pk}")
+                    # Recalculate remaining rows for progress tracking
+                    remaining_query = f"""
+                        SELECT COUNT(*) FROM [{source_schema}].[{source_table}]
+                        WHERE [{pk_column}] > ?
+                    """
+                    with mssql_conn.cursor() as cursor:
+                        cursor.execute(remaining_query, (resume_from_pk,))
+                        source_count = cursor.fetchone()[0]
+                    logger.info(f"Remaining rows to sync: {source_count:,}")
 
                 while rows_copied < source_count:
                     chunk_start_time = time.time()
@@ -2818,6 +2833,7 @@ def transfer_incremental_staging(
         'avg_rows_per_second': rows_copied / elapsed_time if elapsed_time > 0 else 0,
         'success': len(errors) == 0,
         'errors': errors,
+        'last_pk_synced': last_key_value,  # For resume support
     }
 
     if result['success']:

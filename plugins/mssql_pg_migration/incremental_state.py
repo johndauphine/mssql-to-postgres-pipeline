@@ -861,6 +861,8 @@ class IncrementalStateManager:
         status: str,
         rows_transferred: int = 0,
         error: Optional[str] = None,
+        min_pk: Any = None,
+        max_pk: Any = None,
     ) -> None:
         """
         Update the status of a specific partition (with row locking).
@@ -874,6 +876,8 @@ class IncrementalStateManager:
             status: New status ('pending', 'running', 'completed', 'failed')
             rows_transferred: Number of rows transferred (for progress tracking)
             error: Optional error message for failed partitions
+            min_pk: Optional minimum PK value for this partition (for resume)
+            max_pk: Optional maximum PK value for this partition (for resume)
         """
         conn = None
         try:
@@ -908,6 +912,12 @@ class IncrementalStateManager:
                 elif 'error' in partitions[partition_id]:
                     del partitions[partition_id]['error']
 
+                # Store PK bounds for resume (only if provided)
+                if min_pk is not None:
+                    partitions[partition_id]['min_pk'] = min_pk
+                if max_pk is not None:
+                    partitions[partition_id]['max_pk'] = max_pk
+
                 partition_info['partitions'] = partitions
 
                 # Update the record
@@ -921,6 +931,66 @@ class IncrementalStateManager:
             logger.error(f"Error updating partition status: {e}")
             if conn:
                 conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+
+    def get_partitioned_table_state(
+        self,
+        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        migration_type: str = 'full',
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get state info for a partitioned table including partition details.
+
+        Used for partition-level resume: returns sync_id and partition_info
+        so prepare_transfer_plan can determine which partitions need to run.
+
+        Args:
+            table_name: Name of the table
+            source_schema: Source schema
+            target_schema: Target schema
+            migration_type: Migration type filter (default 'full')
+
+        Returns:
+            Dict with sync_id, sync_status, partition_info, or None if not found
+        """
+        conn = None
+        try:
+            conn = self._hook.get_conn()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, sync_status, partition_info, rows_inserted
+                    FROM _migration_state
+                    WHERE table_name = %s
+                      AND source_schema = %s
+                      AND target_schema = %s
+                      AND migration_type = %s
+                    """,
+                    (table_name, source_schema, target_schema, migration_type)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+
+                sync_id, sync_status, partition_info, rows_inserted = row
+
+                # Parse partition_info if it's a string
+                if isinstance(partition_info, str):
+                    partition_info = json.loads(partition_info)
+
+                return {
+                    'sync_id': sync_id,
+                    'sync_status': sync_status,
+                    'partition_info': partition_info,
+                    'rows_inserted': rows_inserted or 0,
+                }
+        except Exception as e:
+            logger.warning(f"Error getting partitioned table state: {e}")
+            return None
         finally:
             if conn:
                 conn.close()

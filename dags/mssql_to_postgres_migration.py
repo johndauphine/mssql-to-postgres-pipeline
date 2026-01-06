@@ -497,6 +497,84 @@ def mssql_to_postgres_migration():
                 "dag_run_id": dag_run_id,
             }
 
+            # Check for partition-level resume in resume mode
+            # If table was previously partitioned and has incomplete partitions, resume from there
+            if resume_mode and (table_name in running_tables or table_name in failed_tables):
+                table_state = state_mgr.get_partitioned_table_state(
+                    table_name, source_schema, target_schema, migration_type='full'
+                )
+                if table_state and table_state.get('partition_info'):
+                    stored_partition_info = table_state['partition_info']
+                    stored_partitions = stored_partition_info.get('partitions', [])
+
+                    # Find incomplete partitions (pending, running, or failed)
+                    incomplete = [
+                        p for p in stored_partitions
+                        if p.get('status') in ('pending', 'running', 'failed')
+                    ]
+                    completed_partitions = [
+                        p for p in stored_partitions
+                        if p.get('status') == 'completed'
+                    ]
+
+                    if incomplete and completed_partitions:
+                        # Have both completed and incomplete - do partition resume
+                        logger.info(f"  {source_schema}.{table_name} -> PARTITION RESUME "
+                                   f"({len(completed_partitions)} completed, {len(incomplete)} to retry)")
+
+                        # Get pk_column from table_info for building WHERE clause
+                        pk_column = pk_columns[0]['name'] if pk_columns else None
+
+                        for stored_p in incomplete:
+                            partition_idx = stored_p.get('id', 0)
+                            min_pk = stored_p.get('min_pk')
+                            max_pk = stored_p.get('max_pk')
+                            was_failed = stored_p.get('status') == 'failed'
+
+                            # Build WHERE clause if we have PK bounds
+                            where_clause = None
+                            if pk_column and min_pk is not None and max_pk is not None:
+                                safe_pk = validate_sql_identifier(pk_column, "pk column")
+                                # Format values for SQL
+                                if isinstance(min_pk, str):
+                                    min_sql = f"'{min_pk.replace(chr(39), chr(39)+chr(39))}'"
+                                    max_sql = f"'{max_pk.replace(chr(39), chr(39)+chr(39))}'"
+                                else:
+                                    min_sql = str(min_pk)
+                                    max_sql = str(max_pk)
+
+                                # Last partition uses >= only (no upper bound)
+                                total_parts = stored_partition_info.get('total_partitions', len(stored_partitions))
+                                if partition_idx == total_parts - 1:
+                                    where_clause = f"[{safe_pk}] >= {min_sql}"
+                                elif partition_idx == 0:
+                                    where_clause = f"[{safe_pk}] <= {max_sql}"
+                                else:
+                                    where_clause = f"[{safe_pk}] >= {min_sql} AND [{safe_pk}] <= {max_sql}"
+
+                            resume_partition = {
+                                **table_info_with_state,
+                                "partition_name": f"partition_{partition_idx + 1}",
+                                "partition_index": partition_idx,
+                                "where_clause": where_clause,
+                                "pk_column": pk_column,
+                                "min_pk": min_pk,
+                                "max_pk": max_pk,
+                                "estimated_rows": stored_p.get('rows', 0),
+                                "truncate_first": False,  # Never truncate on resume
+                                "total_partitions": stored_partition_info.get('total_partitions', len(stored_partitions)),
+                                "is_resume": True,
+                                "cleanup_required": was_failed,  # DELETE before INSERT for failed partitions
+                                "sync_id": table_state.get('sync_id'),  # Preserve existing sync_id
+                            }
+                            partitions.append(resume_partition)
+
+                            status_msg = "RETRY (cleanup)" if was_failed else "RESUME"
+                            logger.info(f"    partition_{partition_idx + 1}: {status_msg}")
+
+                        # Skip normal table processing - we've built resume partitions
+                        continue
+
             if row_count < LARGE_TABLE_THRESHOLD:
                 # Small table: regular transfer
                 regular_tables.append({
@@ -719,25 +797,33 @@ def mssql_to_postgres_migration():
         total_partitions = partition_info.get("total_partitions", 1)
         is_first_partition = partition_info.get("truncate_first", False)
         row_count = partition_info.get("row_count", 0)
+        is_resume = partition_info.get("is_resume", False)
+        cleanup_required = partition_info.get("cleanup_required", False)
+        provided_sync_id = partition_info.get("sync_id")
 
         logger.info(f"Transferring {source_schema}.{table_name} {partition_name} "
-                   f"(~{partition_info.get('estimated_rows', 0):,} rows)")
+                   f"(~{partition_info.get('estimated_rows', 0):,} rows)"
+                   f"{' [RESUME]' if is_resume else ''}"
+                   f"{' [CLEANUP]' if cleanup_required else ''}")
 
         # Initialize state manager
         state_mgr = IncrementalStateManager(postgres_conn_id=params["target_conn_id"])
 
-        # For first partition, create the parent table state record
+        # Determine sync_id: use provided one for resume, or create/find
         sync_id = None
-        if is_first_partition:
-            # Build initial partition_info structure
+        if is_resume and provided_sync_id:
+            # Resume mode: use the existing sync_id
+            sync_id = provided_sync_id
+        elif is_first_partition:
+            # First partition of fresh transfer: create state record
             initial_partition_info = {
                 "total_partitions": total_partitions,
                 "partitions": [
                     {
                         "id": i,
                         "status": "pending",
-                        "min_pk": partition_info.get("min_pk") if i == 0 else None,
-                        "max_pk": partition_info.get("max_pk") if i == 0 else None,
+                        "min_pk": partition_info.get("min_pk") if i == partition_index else None,
+                        "max_pk": partition_info.get("max_pk") if i == partition_index else None,
                     }
                     for i in range(total_partitions)
                 ]
@@ -752,27 +838,59 @@ def mssql_to_postgres_migration():
                 partition_info=initial_partition_info,
             )
         else:
-            # Get sync_id from existing state record
-            state_info = state_mgr.get_last_sync_info(table_name, source_schema, target_schema)
-            if state_info:
-                # Need to query the id explicitly
-                conn = state_mgr._hook.get_conn()
-                try:
-                    with conn.cursor() as cursor:
-                        cursor.execute(
-                            """SELECT id FROM _migration_state
-                               WHERE table_name = %s AND source_schema = %s AND target_schema = %s""",
-                            (table_name, source_schema, target_schema)
-                        )
-                        row = cursor.fetchone()
-                        if row:
-                            sync_id = row[0]
-                finally:
-                    conn.close()
+            # Non-first partition of fresh transfer: get sync_id from state
+            conn = state_mgr._hook.get_conn()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """SELECT id FROM _migration_state
+                           WHERE table_name = %s AND source_schema = %s AND target_schema = %s""",
+                        (table_name, source_schema, target_schema)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        sync_id = row[0]
+            finally:
+                conn.close()
 
-        # Update partition status to 'running'
+        # Cleanup for failed partition retry: DELETE by PK range before INSERT
+        if cleanup_required and partition_info.get("pk_column"):
+            pk_column = partition_info["pk_column"]
+            min_pk = partition_info.get("min_pk")
+            max_pk = partition_info.get("max_pk")
+
+            if min_pk is not None and max_pk is not None:
+                from airflow.providers.postgres.hooks.postgres import PostgresHook
+                pg_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
+
+                # Build DELETE query with proper PK bounds
+                # Use parameterized query to avoid SQL injection
+                delete_query = f"""
+                    DELETE FROM {target_schema}."{table_name}"
+                    WHERE "{pk_column}" >= %s AND "{pk_column}" <= %s
+                """
+
+                try:
+                    conn = pg_hook.get_conn()
+                    with conn.cursor() as cursor:
+                        cursor.execute(delete_query, (min_pk, max_pk))
+                        deleted_count = cursor.rowcount
+                    conn.commit()
+                    logger.info(f"  Cleaned up {deleted_count:,} rows from failed partition "
+                               f"(PK {min_pk} to {max_pk})")
+                except Exception as e:
+                    logger.warning(f"  Cleanup failed (non-fatal): {e}")
+                finally:
+                    if conn:
+                        conn.close()
+
+        # Update partition status to 'running' and store PK bounds
         if sync_id:
-            state_mgr.update_partition_status(sync_id, partition_index, 'running')
+            state_mgr.update_partition_status(
+                sync_id, partition_index, 'running',
+                min_pk=partition_info.get("min_pk"),
+                max_pk=partition_info.get("max_pk"),
+            )
 
         result = data_transfer.transfer_table_data(
             mssql_conn_id=params["source_conn_id"],

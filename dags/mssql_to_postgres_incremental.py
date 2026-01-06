@@ -454,30 +454,55 @@ def mssql_to_postgres_incremental():
 
         try:
             # Staging table approach - fast, handles change detection via IS DISTINCT FROM
-            # Note: For true checkpoint resume with staging tables, we would need to track
-            # which rows were already processed. Currently, staging approach reprocesses all
-            # rows but only updates changed ones. This is acceptable for incremental sync
-            # since it's idempotent.
+            # Now supports resume: if resume_point exists, skip rows already synced
+            resume_pk = None
+            if resumed and resume_point and resume_point.get('last_pk'):
+                last_pk_dict = resume_point['last_pk']
+                # Extract the pk value (stored as {"pk": value})
+                resume_pk = last_pk_dict.get('pk') if isinstance(last_pk_dict, dict) else last_pk_dict
+
             transfer_result = transfer_incremental_staging(
                 mssql_conn_id=source_conn_id,
                 postgres_conn_id=target_conn_id,
                 table_info=table_info,
                 chunk_size=batch_size,
+                resume_from_pk=resume_pk,
             )
 
             rows_inserted = transfer_result["rows_inserted"]
             rows_updated = transfer_result["rows_updated"]
             rows_unchanged = transfer_result.get("rows_unchanged", 0)
+            last_pk_synced = transfer_result.get("last_pk_synced")
 
             # Update state
             if transfer_result["success"]:
+                # Save checkpoint with last_pk for resume support
+                if last_pk_synced is not None:
+                    state_manager.save_checkpoint(
+                        sync_id=sync_id,
+                        last_pk={"pk": last_pk_synced},  # Wrap in dict for JSON
+                        batch_num=1,  # Staging uses single batch
+                        rows_inserted=rows_inserted + initial_inserted,
+                        rows_updated=rows_updated + initial_updated,
+                        rows_unchanged=rows_unchanged + initial_unchanged,
+                    )
                 state_manager.complete_sync(
                     sync_id=sync_id,
-                    rows_inserted=rows_inserted,
-                    rows_updated=rows_updated,
-                    rows_unchanged=rows_unchanged,
+                    rows_inserted=rows_inserted + initial_inserted,
+                    rows_updated=rows_updated + initial_updated,
+                    rows_unchanged=rows_unchanged + initial_unchanged,
                 )
             else:
+                # Save checkpoint even on failure for partial progress
+                if last_pk_synced is not None:
+                    state_manager.save_checkpoint(
+                        sync_id=sync_id,
+                        last_pk={"pk": last_pk_synced},
+                        batch_num=1,
+                        rows_inserted=rows_inserted + initial_inserted,
+                        rows_updated=rows_updated + initial_updated,
+                        rows_unchanged=rows_unchanged + initial_unchanged,
+                    )
                 state_manager.fail_sync(
                     sync_id=sync_id,
                     error="; ".join(transfer_result.get("errors", ["Unknown error"])),
