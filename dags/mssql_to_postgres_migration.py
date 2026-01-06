@@ -102,23 +102,6 @@ def get_partition_count(row_count: int) -> int:
                         "Defaults from config/{database}_include_tables.txt or INCLUDE_TABLES env var."
         ),
         "skip_schema_dag": Param(default=False, type="boolean", description="Skip schema DAG trigger"),
-        # Restartability parameters
-        "resume_mode": Param(
-            default=False, type="boolean",
-            description="Skip tables that completed in previous runs. Retry failed/running tables."
-        ),
-        "reset_state": Param(
-            default=False, type="boolean",
-            description="Clear all migration state before starting (fresh start)."
-        ),
-        "retry_failed_only": Param(
-            default=False, type="boolean",
-            description="Only retry tables that failed (skip pending tables). Requires resume_mode=True."
-        ),
-        "force_refresh_tables": Param(
-            default=[],
-            description="Force re-run specific tables even if completed (e.g., ['Users', 'Posts'])."
-        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "full-refresh"],
 )
@@ -164,91 +147,42 @@ def mssql_to_postgres_migration():
         Initialize migration state for restartability.
 
         - Creates state table if not exists (with schema migration)
-        - Clears state if reset_state=True
         - Resets zombie 'running' states from crashed DAG runs
-        - Returns migration summary for resume planning
+        - Returns migration summary for planning
         """
         params = context["params"]
         dag_run = context["dag_run"]
 
         target_conn_id = params["target_conn_id"]
-        resume_mode = params.get("resume_mode", False)
-        reset_state = params.get("reset_state", False)
-        retry_failed_only = params.get("retry_failed_only", False)
-        force_refresh_tables = params.get("force_refresh_tables", [])
-
         dag_run_id = dag_run.run_id if dag_run else "unknown"
 
         # Initialize state manager
         state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
         state_mgr.ensure_state_table_exists()
 
-        # Handle reset_state
-        if reset_state:
-            count = state_mgr.reset_all_state(migration_type='full')
-            logger.info(f"[STATE] Reset state for {count} tables (reset_state=True)")
-
-        # Handle zombie running states
-        if resume_mode:
-            zombies = state_mgr.reset_stale_running_states(
-                current_dag_run_id=dag_run_id,
-                migration_type='full'
-            )
-            if zombies > 0:
-                logger.warning(f"[STATE] Reset {zombies} zombie 'running' states from previous DAG runs")
-
-        # Handle force_refresh_tables (reset specific tables to pending)
-        if force_refresh_tables:
-            # Parse include_tables to get source_schema -> target_schema mapping
-            include_tables_raw = params.get("include_tables", [])
-            include_tables = expand_include_tables_param(include_tables_raw)
-            schema_tables = parse_include_tables(include_tables)
-            source_db = get_source_database(params["source_conn_id"])
-
-            for table_name in force_refresh_tables:
-                # Find source_schema for this table
-                for src_schema, tables in schema_tables.items():
-                    if table_name in tables:
-                        target_schema = derive_target_schema(source_db, src_schema)
-                        state_mgr.reset_table_state(table_name, src_schema, target_schema)
-                        logger.info(f"[STATE] Force reset state for {src_schema}.{table_name}")
-                        break
+        # Reset zombie running states from crashed DAG runs
+        zombies = state_mgr.reset_stale_running_states(
+            current_dag_run_id=dag_run_id,
+            migration_type='full'
+        )
+        if zombies > 0:
+            logger.warning(f"[STATE] Reset {zombies} zombie 'running' states from previous DAG runs")
 
         # Get migration summary
         summary = state_mgr.get_migration_summary(migration_type='full')
 
-        # Log resume plan
+        # Log migration plan
         logger.info("=" * 60)
-        logger.info("[PLAN] Migration State Summary")
+        logger.info("[PLAN] Migration Summary")
         logger.info("=" * 60)
-        logger.info(f"  resume_mode: {resume_mode}")
-        logger.info(f"  reset_state: {reset_state}")
-        logger.info(f"  retry_failed_only: {retry_failed_only}")
-        logger.info(f"  force_refresh_tables: {force_refresh_tables}")
-        logger.info("-" * 60)
-        logger.info(f"  Completed: {summary['completed']['count']} tables")
-        logger.info(f"  Failed:    {summary['failed']['count']} tables")
-        logger.info(f"  Running:   {summary['running']['count']} tables")
-        logger.info(f"  Pending:   {summary['pending']['count']} tables")
+        logger.info(f"  Completed: {summary['completed']['count']} tables (will skip)")
+        logger.info(f"  Failed:    {summary['failed']['count']} tables (will retry)")
+        logger.info(f"  Running:   {summary['running']['count']} tables (will retry)")
+        logger.info(f"  Pending:   {summary['pending']['count']} tables (will run)")
         logger.info("=" * 60)
-
-        if resume_mode:
-            skip_count = summary['completed']['count'] - len(force_refresh_tables)
-            retry_count = summary['failed']['count'] + summary['running']['count']
-            logger.info(f"[PLAN] Skipping: {skip_count} completed tables")
-            logger.info(f"[PLAN] Retrying: {retry_count} failed/running tables")
-            if summary['completed']['tables']:
-                logger.info(f"[PLAN] Completed tables: {', '.join(summary['completed']['tables'][:10])}" +
-                           ("..." if len(summary['completed']['tables']) > 10 else ""))
-            if summary['failed']['tables']:
-                logger.info(f"[PLAN] Failed tables: {', '.join(summary['failed']['tables'])}")
 
         return {
             "dag_run_id": dag_run_id,
-            "resume_mode": resume_mode,
-            "reset_state": reset_state,
-            "retry_failed_only": retry_failed_only,
-            "force_refresh_tables": force_refresh_tables,
             "summary": summary,
         }
 
@@ -440,22 +374,18 @@ def mssql_to_postgres_migration():
         Uses source_schema from each table's info dict.
         Large tables (>1M rows) are partitioned for parallel transfer.
 
-        In resume_mode, filters out completed tables unless in force_refresh_tables.
+        Smart defaults: skip completed tables, retry failed/running, run pending.
         """
         params = context["params"]
         dag_run = context["dag_run"]
         dag_run_id = dag_run.run_id if dag_run else "unknown"
 
-        resume_mode = migration_state.get("resume_mode", False)
-        retry_failed_only = migration_state.get("retry_failed_only", False)
-        force_refresh_tables = migration_state.get("force_refresh_tables", [])
         summary = migration_state.get("summary", {})
 
         # Get sets of tables by status for quick lookup
         completed_tables = set(summary.get('completed', {}).get('tables', []))
         failed_tables = set(summary.get('failed', {}).get('tables', []))
         running_tables = set(summary.get('running', {}).get('tables', []))
-        force_refresh_set = set(force_refresh_tables)
 
         regular_tables = []
         partitions = []
@@ -476,20 +406,11 @@ def mssql_to_postgres_migration():
             pk_info = table_info.get("pk_columns_info", {})
             pk_columns = pk_info.get("columns", [])
 
-            # Check if we should skip this table in resume mode
-            if resume_mode:
-                if table_name in completed_tables and table_name not in force_refresh_set:
-                    skipped_tables.append(table_name)
-                    logger.info(f"  {source_schema}.{table_name} -> SKIPPED (completed in previous run)")
-                    continue
-
-                if retry_failed_only:
-                    # Only process failed/running tables
-                    if table_name not in failed_tables and table_name not in running_tables:
-                        if table_name not in force_refresh_set:
-                            skipped_tables.append(table_name)
-                            logger.info(f"  {source_schema}.{table_name} -> SKIPPED (not failed, retry_failed_only=True)")
-                            continue
+            # Skip completed tables
+            if table_name in completed_tables:
+                skipped_tables.append(table_name)
+                logger.info(f"  {source_schema}.{table_name} -> SKIPPED (completed)")
+                continue
 
             # Add state tracking info to table_info
             table_info_with_state = {
@@ -497,9 +418,9 @@ def mssql_to_postgres_migration():
                 "dag_run_id": dag_run_id,
             }
 
-            # Check for partition-level resume in resume mode
+            # Check for partition-level resume
             # If table was previously partitioned and has incomplete partitions, resume from there
-            if resume_mode and (table_name in running_tables or table_name in failed_tables):
+            if table_name in running_tables or table_name in failed_tables:
                 table_state = state_mgr.get_partitioned_table_state(
                     table_name, source_schema, target_schema, migration_type='full'
                 )
