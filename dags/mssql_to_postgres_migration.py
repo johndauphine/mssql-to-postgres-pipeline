@@ -147,7 +147,10 @@ def mssql_to_postgres_migration():
         Initialize migration state for restartability.
 
         - Creates state table if not exists (with schema migration)
-        - Resets zombie 'running' states from crashed DAG runs
+        - Checks for REAL failures BEFORE zombie cleanup to determine mode
+        - Resets zombie 'running' states from crashed DAG runs (converts to 'pending')
+        - For FRESH runs (no real failures): resets all state for full reload
+        - For RECOVERY runs (has real failures): keeps completed, retries failed
         - Returns migration summary for planning
         """
         params = context["params"]
@@ -160,26 +163,51 @@ def mssql_to_postgres_migration():
         state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
         state_mgr.ensure_state_table_exists()
 
+        # Check for REAL failures BEFORE zombie cleanup
+        # This ensures zombie states (crashed runs) don't trigger recovery mode
+        pre_cleanup_summary = state_mgr.get_migration_summary(migration_type='full')
+        has_real_failures = pre_cleanup_summary['failed']['count'] > 0
+
         # Reset zombie running states from crashed DAG runs
         zombies = state_mgr.reset_stale_running_states(
             current_dag_run_id=dag_run_id,
             migration_type='full'
         )
         if zombies > 0:
-            logger.warning(f"[STATE] Reset {zombies} zombie 'running' states from previous DAG runs")
+            logger.info(f"[STATE] Reset {zombies} zombie 'running' states from crashed DAG runs")
 
-        # Get migration summary
+        # Get updated migration summary after cleanup
         summary = state_mgr.get_migration_summary(migration_type='full')
 
-        # Log migration plan
-        logger.info("=" * 60)
-        logger.info("[PLAN] Migration Summary")
-        logger.info("=" * 60)
-        logger.info(f"  Completed: {summary['completed']['count']} tables (will skip)")
-        logger.info(f"  Failed:    {summary['failed']['count']} tables (will retry)")
-        logger.info(f"  Running:   {summary['running']['count']} tables (will retry)")
-        logger.info(f"  Pending:   {summary['pending']['count']} tables (will run)")
-        logger.info("=" * 60)
+        # Determine if this is a recovery run based on REAL failures (not zombies)
+        # Zombie states are from crashed runs - user likely wants fresh run, not recovery
+        has_failures = has_real_failures
+
+        if has_failures:
+            # RECOVERY MODE: Keep completed tables, retry failed/running
+            logger.info("=" * 60)
+            logger.info("[PLAN] RECOVERY MODE - Resuming from failure")
+            logger.info("=" * 60)
+            logger.info(f"  Completed: {summary['completed']['count']} tables (will SKIP)")
+            logger.info(f"  Failed:    {summary['failed']['count']} tables (will RETRY)")
+            logger.info(f"  Running:   {summary['running']['count']} tables (will RETRY)")
+            logger.info("=" * 60)
+        else:
+            # FRESH RUN: Reset all state for full reload
+            if summary['completed']['count'] > 0:
+                logger.info("=" * 60)
+                logger.info("[PLAN] FRESH RUN - Resetting state for full reload")
+                logger.info("=" * 60)
+                reset_count = state_mgr.reset_all_state(migration_type='full')
+                logger.info(f"  Reset {reset_count} tables to pending")
+                # Refresh summary after reset
+                summary = state_mgr.get_migration_summary(migration_type='full')
+            else:
+                logger.info("=" * 60)
+                logger.info("[PLAN] FRESH RUN - No previous state")
+                logger.info("=" * 60)
+            logger.info(f"  Tables to migrate: {summary['pending']['count']}")
+            logger.info("=" * 60)
 
         return {
             "dag_run_id": dag_run_id,
