@@ -5,10 +5,40 @@ This module provides comprehensive data type mapping from Microsoft SQL Server
 to PostgreSQL, handling all common and special data types.
 """
 
-from typing import Optional, Dict, Any
+import re
+from typing import Optional, Dict, Any, List
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_identifier(name: str) -> str:
+    """
+    Sanitize an identifier for PostgreSQL compatibility.
+
+    - Convert to lowercase
+    - Replace spaces with underscores
+    - Replace other special characters with underscores
+
+    Args:
+        name: The identifier name to sanitize
+
+    Returns:
+        Sanitized identifier name
+
+    Examples:
+        sanitize_identifier("User Name") -> "user_name"
+        sanitize_identifier("OrderID") -> "orderid"
+        sanitize_identifier("First-Name") -> "first_name"
+    """
+    # Lowercase and replace spaces/special chars with underscores
+    sanitized = name.lower()
+    sanitized = re.sub(r'[^a-z0-9_]', '_', sanitized)
+    # Collapse multiple underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Remove leading/trailing underscores
+    sanitized = sanitized.strip('_')
+    return sanitized
 
 
 # Complete mapping of SQL Server data types to PostgreSQL
@@ -150,7 +180,8 @@ def map_column(column_info: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary with PostgreSQL column definition
     """
     result = {
-        'column_name': column_info['column_name'],
+        'column_name': sanitize_identifier(column_info['column_name']),
+        'original_column_name': column_info['column_name'],  # Keep original for data transfer
         'is_nullable': column_info.get('is_nullable', True),
         'default_value': None,
         'is_identity': column_info.get('is_identity', False),
@@ -243,11 +274,19 @@ def map_table_schema(table_schema: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Mapped table schema for PostgreSQL
     """
+    # Handle primary_key - can be dict {'columns': [...]} or list [...]
+    pk_raw = table_schema.get('primary_key', [])
+    if isinstance(pk_raw, dict):
+        pk_columns = pk_raw.get('columns', [])
+    else:
+        pk_columns = pk_raw if pk_raw else []
+
     result = {
-        'table_name': table_schema['table_name'],
+        'table_name': sanitize_identifier(table_schema['table_name']),
+        'original_table_name': table_schema['table_name'],  # Keep original for data transfer
         'schema_name': table_schema.get('schema_name', 'public'),
         'columns': [],
-        'primary_key': table_schema.get('primary_key', []),
+        'primary_key': [sanitize_identifier(pk) for pk in pk_columns],
         'indexes': [],
     }
 
@@ -258,8 +297,8 @@ def map_table_schema(table_schema: Dict[str, Any]) -> Dict[str, Any]:
     # Map indexes if present
     for index in table_schema.get('indexes', []):
         result['indexes'].append({
-            'index_name': index['index_name'],
-            'columns': index['columns'],
+            'index_name': sanitize_identifier(index['index_name']),
+            'columns': [sanitize_identifier(col) for col in index['columns']],
             'is_unique': index.get('is_unique', False),
             'is_clustered': False,  # PostgreSQL doesn't have clustered indexes like SQL Server
         })
