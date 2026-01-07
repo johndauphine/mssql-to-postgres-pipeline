@@ -36,6 +36,7 @@ import os
 from mssql_pg_migration import data_transfer
 from mssql_pg_migration.notifications import send_success_notification
 from mssql_pg_migration.incremental_state import IncrementalStateManager
+from mssql_pg_migration.type_mapping import sanitize_identifier
 from mssql_pg_migration.table_config import (
     expand_include_tables_param,
     validate_include_tables,
@@ -840,11 +841,14 @@ def mssql_to_postgres_migration():
             from airflow.providers.postgres.hooks.postgres import PostgresHook
             pg_hook = PostgresHook(postgres_conn_id=params["target_conn_id"])
 
+            # Sanitize pk_column for PostgreSQL (source has original case like "Id", target has "id")
+            pg_pk_column = sanitize_identifier(pk_column)
+
             if cleanup_required and min_pk is not None:
                 # Full retry: delete entire partition range
                 delete_query = f"""
                     DELETE FROM {target_schema}."{table_name}"
-                    WHERE "{pk_column}" >= %s AND "{pk_column}" <= %s
+                    WHERE "{pg_pk_column}" >= %s AND "{pg_pk_column}" <= %s
                 """
                 delete_params = (min_pk, max_pk)
                 cleanup_desc = f"PK {min_pk} to {max_pk}"
@@ -867,7 +871,7 @@ def mssql_to_postgres_migration():
                 # Checkpoint resume: delete rows AFTER checkpoint (handles stale checkpoint)
                 delete_query = f"""
                     DELETE FROM {target_schema}."{table_name}"
-                    WHERE "{pk_column}" > %s AND "{pk_column}" <= %s
+                    WHERE "{pg_pk_column}" > %s AND "{pg_pk_column}" <= %s
                 """
                 delete_params = (resume_from_pk, max_pk)
                 cleanup_desc = f"PK > {resume_from_pk} to {max_pk}"
@@ -1084,7 +1088,6 @@ def mssql_to_postgres_migration():
 
     @task(trigger_rule="all_done")
     def reset_sequences(
-        tables: List[Dict[str, Any]],
         results: List[Dict[str, Any]],
         **context
     ) -> str:
@@ -1098,6 +1101,9 @@ def mssql_to_postgres_migration():
         Only processes tables that:
         1. Have SERIAL/BIGSERIAL columns (detected via column_default LIKE 'nextval%')
         2. Were successfully transferred in this run
+
+        Note: Target schemas are derived from results to avoid Airflow 3.0 XCom
+        retrieval issues when pulling from multiple upstream tasks.
         """
         params = context["params"]
         target_conn_id = params["target_conn_id"]
@@ -1109,8 +1115,8 @@ def mssql_to_postgres_migration():
         }
         logger.info(f"Found {len(successful)} successfully transferred tables")
 
-        # Get unique target schemas from tables
-        target_schemas = set(t.get("target_schema") for t in tables if t.get("target_schema"))
+        # Get unique target schemas from results (avoids XCom retrieval issue)
+        target_schemas = set(r.get("target_schema") for r in results if r.get("target_schema"))
         logger.info(f"Processing schemas: {sorted(target_schemas)}")
 
         from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -1248,17 +1254,23 @@ def mssql_to_postgres_migration():
     regular_results = transfer_table_data.expand(table_info=regular)
     # Use explicit task IDs for partition transfers to avoid relying on auto-generated names
     first_results = transfer_partition.override(task_id="transfer_first_partitions").expand(partition_info=first_parts)
-    remaining_results = transfer_partition.override(task_id="transfer_remaining_partitions").expand(partition_info=remaining_parts)
+    # Use none_failed trigger rule so remaining partitions run even when first_partitions is skipped
+    # (happens in recovery mode when first partitions completed in a previous run)
+    remaining_results = transfer_partition.override(
+        task_id="transfer_remaining_partitions",
+        trigger_rule="none_failed"
+    ).expand(partition_info=remaining_parts)
 
     # First partitions must complete before remaining (prevent truncate race)
+    # This dependency is still respected when first_partitions has data
     first_results >> remaining_results
 
     # 8. Collect results (wait for all transfer tasks)
     results = collect_results()
     [regular_results, first_results, remaining_results] >> results
 
-    # 9. Reset sequences
-    seq_status = reset_sequences(tables_with_counts, results)
+    # 9. Reset sequences (derives target schemas from results to avoid XCom issues)
+    seq_status = reset_sequences(results)
 
     # 10. Trigger validation
     trigger_validation = TriggerDagRunOperator(

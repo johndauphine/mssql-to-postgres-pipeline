@@ -1610,16 +1610,19 @@ class DataTransfer:
         Args:
             schema_name: Target schema name
             table_name: Target table name
-            pk_columns: Primary key column names
+            pk_columns: Primary key column names (from source, may have original case)
             first_pk: First PK tuple (inclusive)
             last_pk: Last PK tuple (inclusive)
 
         Returns:
             Number of rows deleted
         """
+        # Sanitize column names for PostgreSQL (source has "Id", target has "id")
+        sanitized_pk_columns = [sanitize_identifier(col) for col in pk_columns]
+
         # Build tuple comparison for composite PKs
         pk_tuple = sql.SQL('({})').format(
-            sql.SQL(', ').join([sql.Identifier(col) for col in pk_columns])
+            sql.SQL(', ').join([sql.Identifier(col) for col in sanitized_pk_columns])
         )
 
         # Build placeholders for values
