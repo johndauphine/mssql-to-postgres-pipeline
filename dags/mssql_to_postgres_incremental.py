@@ -97,12 +97,6 @@ logger = logging.getLogger(__name__)
             maximum=500000,
             description="Rows per batch for COPY to staging table"
         ),
-        # Restartability parameter
-        "resume_from_checkpoint": Param(
-            default=True,
-            type="boolean",
-            description="Resume interrupted syncs from last checkpoint. Set False to restart from beginning."
-        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "incremental"],
 )
@@ -251,7 +245,6 @@ def mssql_to_postgres_incremental():
         source_conn_id = params["source_conn_id"]
         target_conn_id = params["target_conn_id"]
         dag_run_id = context.get("run_id", "unknown")
-        resume_from_checkpoint = params.get("resume_from_checkpoint", True)
 
         # State manager for initializing partitioned table state
         state_manager = IncrementalStateManager(target_conn_id)
@@ -270,14 +263,12 @@ def mssql_to_postgres_incremental():
                 target_schema = table['target_schema']
 
                 # Check for existing incomplete partition state (for resume)
-                existing_state = None
-                if resume_from_checkpoint:
-                    existing_state = state_manager.get_partitioned_table_state(
-                        table_name=table_name,
-                        source_schema=source_schema,
-                        target_schema=target_schema,
-                        migration_type='incremental',
-                    )
+                existing_state = state_manager.get_partitioned_table_state(
+                    table_name=table_name,
+                    source_schema=source_schema,
+                    target_schema=target_schema,
+                    migration_type='incremental',
+                )
 
                 # Resume from existing partition state if available
                 if existing_state and existing_state.get('partition_info'):
@@ -449,7 +440,7 @@ def mssql_to_postgres_incremental():
         4. Drop staging table
 
         For non-partitioned tables:
-        1. Check for resume point if resume_from_checkpoint=True
+        1. Check for resume point from last checkpoint
         2. Start sync in state table (or resume from checkpoint)
         3. COPY source rows to staging table (from last PK if resuming)
         4. Upsert from staging with IS DISTINCT FROM (only changed rows update)
@@ -465,7 +456,6 @@ def mssql_to_postgres_incremental():
         source_conn_id = params["source_conn_id"]
         target_conn_id = params["target_conn_id"]
         batch_size = params.get("batch_size", DEFAULT_BATCH_SIZE)
-        resume_from_checkpoint = params.get("resume_from_checkpoint", True)
 
         is_partition = task_info.get("is_partition", False)
         table_name = task_info["table_name"]
@@ -585,22 +575,20 @@ def mssql_to_postgres_incremental():
         # Initialize state tracking
         state_manager = IncrementalStateManager(target_conn_id)
 
-        # Check for resume point if enabled
-        resume_point = None
+        # Check for resume point
+        resume_point = state_manager.get_resume_point(
+            table_name=table_name,
+            source_schema=source_schema,
+            target_schema=target_schema,
+        )
         resumed = False
-        if resume_from_checkpoint:
-            resume_point = state_manager.get_resume_point(
-                table_name=table_name,
-                source_schema=source_schema,
-                target_schema=target_schema,
+        if resume_point:
+            logger.info(
+                f"Resuming {source_schema}.{table_name} from checkpoint: "
+                f"batch={resume_point['batch_num']}, last_pk={resume_point['last_pk']}, "
+                f"inserted={resume_point['rows_inserted']}, updated={resume_point['rows_updated']}"
             )
-            if resume_point:
-                logger.info(
-                    f"Resuming {source_schema}.{table_name} from checkpoint: "
-                    f"batch={resume_point['batch_num']}, last_pk={resume_point['last_pk']}, "
-                    f"inserted={resume_point['rows_inserted']}, updated={resume_point['rows_updated']}"
-                )
-                resumed = True
+            resumed = True
 
         # Start or resume sync
         if resumed and resume_point:
