@@ -223,10 +223,14 @@ class DDLGenerator:
         """
         ddl_statements = []
 
-        # Drop table if requested
+        # Map the schema to get sanitized table name
+        mapped_schema = map_table_schema(table_schema)
+        sanitized_table_name = mapped_schema['table_name']
+
+        # Drop table if requested (use sanitized name to match CREATE)
         if drop_if_exists:
             ddl_statements.append(self.generate_drop_table(
-                table_schema['table_name'],
+                sanitized_table_name,
                 target_schema,
                 cascade=True
             ))
@@ -427,11 +431,14 @@ def create_tables_ddl(
     generator = DDLGenerator.__new__(DDLGenerator)
 
     for table_schema in tables_schema:
-        table_name = table_schema['table_name']
+        # Map schema to get sanitized table name
+        mapped_schema = map_table_schema(table_schema)
+        sanitized_table_name = mapped_schema['table_name']
 
         # Generate DROP statements (in reverse order for dependencies)
+        # Use sanitized name to match CREATE TABLE
         if drop_if_exists:
-            result['drops'].insert(0, generator.generate_drop_table(table_name, target_schema, cascade=True))
+            result['drops'].insert(0, generator.generate_drop_table(sanitized_table_name, target_schema, cascade=True))
 
         # Generate CREATE TABLE statements
         result['creates'].append(generator.generate_create_table(
