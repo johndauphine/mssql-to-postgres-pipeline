@@ -147,9 +147,10 @@ def mssql_to_postgres_migration():
         Initialize migration state for restartability.
 
         - Creates state table if not exists (with schema migration)
-        - Resets zombie 'running' states from crashed DAG runs
-        - For FRESH runs (no failed/running tables): resets all state for full reload
-        - For RECOVERY runs (has failed/running): keeps completed, retries failed
+        - Checks for REAL failures BEFORE zombie cleanup to determine mode
+        - Resets zombie 'running' states from crashed DAG runs (converts to 'pending')
+        - For FRESH runs (no real failures): resets all state for full reload
+        - For RECOVERY runs (has real failures): keeps completed, retries failed
         - Returns migration summary for planning
         """
         params = context["params"]
@@ -162,19 +163,25 @@ def mssql_to_postgres_migration():
         state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
         state_mgr.ensure_state_table_exists()
 
+        # Check for REAL failures BEFORE zombie cleanup
+        # This ensures zombie states (crashed runs) don't trigger recovery mode
+        pre_cleanup_summary = state_mgr.get_migration_summary(migration_type='full')
+        has_real_failures = pre_cleanup_summary['failed']['count'] > 0
+
         # Reset zombie running states from crashed DAG runs
         zombies = state_mgr.reset_stale_running_states(
             current_dag_run_id=dag_run_id,
             migration_type='full'
         )
         if zombies > 0:
-            logger.warning(f"[STATE] Reset {zombies} zombie 'running' states from previous DAG runs")
+            logger.info(f"[STATE] Reset {zombies} zombie 'running' states from crashed DAG runs")
 
-        # Get migration summary to check if this is a recovery run
+        # Get updated migration summary after cleanup
         summary = state_mgr.get_migration_summary(migration_type='full')
 
-        # Determine if this is a recovery run (has failed/running tables to retry)
-        has_failures = summary['failed']['count'] > 0 or summary['running']['count'] > 0
+        # Determine if this is a recovery run based on REAL failures (not zombies)
+        # Zombie states are from crashed runs - user likely wants fresh run, not recovery
+        has_failures = has_real_failures
 
         if has_failures:
             # RECOVERY MODE: Keep completed tables, retry failed/running
