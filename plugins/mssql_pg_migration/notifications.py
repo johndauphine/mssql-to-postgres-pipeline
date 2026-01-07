@@ -817,6 +817,15 @@ def send_success_notification(
     if stats.get('rows_per_second', 0) > 0:
         fields.append({'title': 'Throughput', 'value': f"{format_number(stats['rows_per_second'])} rows/sec"})
 
+    # Add table names list (truncate if too many)
+    tables_list = stats.get('tables_list', [])
+    if tables_list:
+        if len(tables_list) <= 10:
+            tables_str = ', '.join(tables_list)
+        else:
+            tables_str = ', '.join(tables_list[:10]) + f', ... (+{len(tables_list) - 10} more)'
+        fields.append({'title': 'Table Names', 'value': tables_str, 'short': False})
+
     if 'slack' in channels:
         send_slack_notification(
             message=message,
