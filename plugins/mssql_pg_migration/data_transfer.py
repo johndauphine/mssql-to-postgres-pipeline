@@ -10,6 +10,7 @@ Airflow MSSQL hook's get_pandas_df method on large datasets.
 
 from typing import Dict, Any, Optional, List, Tuple, Iterable, Iterator
 from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
+from mssql_pg_migration.type_mapping import sanitize_identifier
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, date, time as dt_time
 from decimal import Decimal
@@ -1005,10 +1006,15 @@ class DataTransfer:
             self._truncate_table(target_schema, target_table)
             logger.info(f"Truncated target table {target_schema}.{target_table}")
 
-        # Get column list if not specified
+        # Get column list if not specified (source columns have original names)
         if not columns:
             columns = self._get_table_columns(source_schema, source_table)
             logger.info(f"Transferring {len(columns)} columns")
+
+        # Create sanitized target column names for PostgreSQL writes
+        # columns: original names for SQL Server queries (e.g., "User Name", "Log ID")
+        # target_columns: sanitized names for PostgreSQL (e.g., "user_name", "log_id")
+        target_columns = [sanitize_identifier(col) for col in columns]
 
         # Right-size chunk size for given table
         optimal_chunk_size = self._calculate_optimal_chunk_size(source_row_count, chunk_size)
@@ -1151,7 +1157,7 @@ class DataTransfer:
                                     rows,
                                     target_schema,
                                     target_table,
-                                    columns,
+                                    target_columns,
                                     postgres_conn
                                 )
 
@@ -1201,7 +1207,7 @@ class DataTransfer:
                                 rows,
                                 target_schema,
                                 target_table,
-                                columns,
+                                target_columns,
                                 postgres_conn
                             )
 
@@ -1268,7 +1274,7 @@ class DataTransfer:
                                         rows,
                                         target_schema,
                                         target_table,
-                                        columns,
+                                        target_columns,
                                         postgres_conn
                                     )
 
@@ -1327,7 +1333,7 @@ class DataTransfer:
                                 rows,
                                 target_schema,
                                 target_table,
-                                columns,
+                                target_columns,
                                 postgres_conn
                             )
 
