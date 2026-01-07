@@ -1011,12 +1011,10 @@ class DataTransfer:
             columns = self._get_table_columns(source_schema, source_table)
             logger.info(f"Transferring {len(columns)} columns")
 
-        # Create mapping from source columns to sanitized target columns
-        # Source columns: original names (e.g., "User Name", "Log ID")
-        # Target columns: sanitized names (e.g., "user_name", "log_id")
-        source_columns = columns  # Keep original names for SQL Server queries
+        # Create sanitized target column names for PostgreSQL writes
+        # columns: original names for SQL Server queries (e.g., "User Name", "Log ID")
+        # target_columns: sanitized names for PostgreSQL (e.g., "user_name", "log_id")
         target_columns = [sanitize_identifier(col) for col in columns]
-        column_mapping = dict(zip(source_columns, target_columns))
 
         # Right-size chunk size for given table
         optimal_chunk_size = self._calculate_optimal_chunk_size(source_row_count, chunk_size)

@@ -6,7 +6,7 @@ to PostgreSQL, handling all common and special data types.
 """
 
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,13 @@ def sanitize_identifier(name: str) -> str:
     - Convert to lowercase
     - Replace spaces with underscores
     - Replace other special characters with underscores
+    - Collapse multiple consecutive underscores to a single underscore
+    - Remove leading and trailing underscores
+    - Prefix with 'col_' if result starts with a digit or is empty
+
+    Note: This function does not handle naming collisions (e.g., "User-Name"
+    and "User Name" both become "user_name"). Collision detection should be
+    handled at the table/schema level if needed.
 
     Args:
         name: The identifier name to sanitize
@@ -30,6 +37,7 @@ def sanitize_identifier(name: str) -> str:
         sanitize_identifier("User Name") -> "user_name"
         sanitize_identifier("OrderID") -> "orderid"
         sanitize_identifier("First-Name") -> "first_name"
+        sanitize_identifier("123Column") -> "col_123column"
     """
     # Lowercase and replace spaces/special chars with underscores
     sanitized = name.lower()
@@ -38,6 +46,11 @@ def sanitize_identifier(name: str) -> str:
     sanitized = re.sub(r'_+', '_', sanitized)
     # Remove leading/trailing underscores
     sanitized = sanitized.strip('_')
+    # Handle empty result or leading digit
+    if not sanitized:
+        sanitized = 'col_'
+    elif re.match(r'^\d', sanitized):
+        sanitized = f'col_{sanitized}'
     return sanitized
 
 
