@@ -24,6 +24,7 @@ This directory contains documentation for the MSSQL to PostgreSQL Migration Pipe
 | [PARALLEL_PARTITIONING.md](PARALLEL_PARTITIONING.md) | How large tables are partitioned for parallel transfer |
 | [VALIDATION_DAG_SOLUTION.md](VALIDATION_DAG_SOLUTION.md) | Standalone validation DAG architecture |
 | [ENHANCEMENTS.md](ENHANCEMENTS.md) | Feature enhancements from related projects |
+| [Naming Conventions](../README.md#identifier-naming-conventions) | How SQL Server identifiers are sanitized for PostgreSQL |
 
 ## Performance
 

@@ -101,6 +101,14 @@ MAX_PARALLEL_TRANSFERS=8
 
 ## Key Behaviors
 
+### Identifier Naming
+All SQL Server names are sanitized for PostgreSQL:
+- **Lowercase**: `Users` → `users`, `PostTypes` → `posttypes`
+- **Underscores**: `User Name` → `user_name`, `First-Name` → `first_name`
+- **Prefix digits**: `123Col` → `col_123col`
+
+This ensures DDL operations (DROP/CREATE) use consistent names.
+
 ### Pagination Strategy
 - **Single-column PK**: Keyset pagination (fast, O(1) per page)
 - **Composite PK**: ROW_NUMBER pagination (auto-detected)

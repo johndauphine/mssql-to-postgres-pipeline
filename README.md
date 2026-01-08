@@ -366,6 +366,40 @@ dbo.Comments
 sales.Orders
 ```
 
+### Identifier Naming Conventions
+
+All SQL Server identifiers are sanitized for PostgreSQL compatibility:
+
+| SQL Server | PostgreSQL | Rule Applied |
+|------------|------------|--------------|
+| `Users` | `users` | Lowercase |
+| `PostTypes` | `posttypes` | Lowercase |
+| `User Name` | `user_name` | Spaces → underscores |
+| `First-Name` | `first_name` | Special chars → underscores |
+| `123Column` | `col_123column` | Leading digit → prefix with `col_` |
+
+**Why this matters:**
+
+PostgreSQL treats quoted identifiers as case-sensitive. When DDL uses quoted identifiers (e.g., `"Badges"` vs `"badges"`), these are treated as different objects:
+
+```sql
+-- These create TWO DIFFERENT tables in PostgreSQL:
+CREATE TABLE "Badges" (id INT);   -- Table named exactly "Badges"
+CREATE TABLE "badges" (id INT);   -- Table named exactly "badges"
+
+-- But these are the SAME table:
+CREATE TABLE badges (id INT);     -- Normalized to "badges"
+SELECT * FROM Badges;             -- Also normalized to "badges"
+```
+
+The pipeline sanitizes all identifiers to lowercase to ensure consistency between:
+- Schema extraction (source names like `Badges`)
+- DDL generation (DROP TABLE, CREATE TABLE)
+- Data transfer (INSERT/COPY operations)
+- Queries against target tables
+
+This sanitization is handled by `sanitize_identifier()` in `plugins/mssql_pg_migration/type_mapping.py`.
+
 ### Example: Trigger via CLI
 
 ```bash
@@ -455,6 +489,16 @@ docker-compose down
 ```
 
 ## Known Issues and Workarounds
+
+### DDL Case Sensitivity (Fixed)
+
+**Issue**: DROP TABLE and CREATE TABLE used different table names, causing "relation already exists" errors.
+
+- DROP TABLE used original SQL Server name: `DROP TABLE "Badges"`
+- CREATE TABLE used sanitized name: `CREATE TABLE "badges"`
+- PostgreSQL treated these as different tables due to case-sensitive quoted identifiers
+
+**Resolution**: Both DDL operations now use `sanitize_identifier()` to ensure consistent lowercase names. Fixed in `ddl_generator.py` and `mssql_to_postgres_schema.py`.
 
 ### Airflow 3.0 Callback Limitation
 
