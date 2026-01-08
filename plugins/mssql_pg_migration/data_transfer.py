@@ -1001,6 +1001,13 @@ class DataTransfer:
         source_row_count = self._get_row_count(source_schema, source_table, is_source=True, where_clause=where_clause)
         logger.info(f"Source table has {source_row_count:,} rows{' (filtered)' if where_clause else ''}")
 
+        # Sanitize target table name for PostgreSQL compatibility
+        # This ensures consistency: target_table="Badges" -> "badges" matches DDL-created table
+        # Source identifiers are NOT sanitized - they must match SQL Server exactly
+        # Note: target_schema is NOT sanitized here - it comes pre-sanitized from derive_target_schema()
+        # which uses double underscore separators (e.g., "stackoverflow2010__dbo")
+        target_table = sanitize_identifier(target_table)
+
         # Truncate target if requested
         if truncate_target:
             self._truncate_table(target_schema, target_table)
