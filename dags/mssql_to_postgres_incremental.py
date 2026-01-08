@@ -50,6 +50,7 @@ from mssql_pg_migration.table_config import (
     validate_include_tables,
     parse_include_tables,
     get_source_database,
+    get_instance_name,
     derive_target_schema,
     get_default_include_tables,
     load_include_tables_from_config,
@@ -155,14 +156,15 @@ def mssql_to_postgres_incremental():
         # Parse into {schema: [tables]} dict
         schema_tables = parse_include_tables(include_tables)
 
-        # Get source database name for deriving target schemas
+        # Get source database and instance name for deriving target schemas
         source_db = get_source_database(source_conn_id)
+        instance_name = get_instance_name(source_conn_id)
 
-        logger.info(f"Discovering tables from schemas: {list(schema_tables.keys())}")
+        logger.info(f"Discovering tables from instance: {instance_name}, schemas: {list(schema_tables.keys())}")
 
         # Build target schema map
         target_schema_map = {
-            src_schema: derive_target_schema(source_db, src_schema)
+            src_schema: derive_target_schema(source_db, src_schema, instance_name)
             for src_schema in schema_tables.keys()
         }
 

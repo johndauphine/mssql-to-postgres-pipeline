@@ -1,0 +1,14 @@
+# Hostname to Alias Mapping
+# Format: hostname = alias (one per line)
+# Lines starting with # are comments
+# Hostname matching is case-insensitive
+#
+# The alias is used in PostgreSQL target schema names:
+#   {alias}__{database}__{schema}
+#
+# Examples:
+#   sqlprod01 = prod_sales        -> prod_sales__mydb__dbo
+#   sqlprod01.company.com = prod  -> prod__mydb__dbo
+#   sqldev\INSTANCE1 = dev_inst1  -> dev_inst1__mydb__dbo
+
+mssql-server = dev

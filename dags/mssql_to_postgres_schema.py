@@ -30,6 +30,7 @@ from mssql_pg_migration.table_config import (
     validate_include_tables,
     parse_include_tables,
     get_source_database,
+    get_instance_name,
     derive_target_schema,
     get_default_include_tables,
     load_include_tables_from_config,
@@ -101,13 +102,14 @@ def mssql_to_postgres_schema():
         schema_tables = parse_include_tables(include_tables)
         logger.info(f"Grouped into schemas: {list(schema_tables.keys())}")
 
-        # Get source database name for deriving target schemas
+        # Get source database and instance name for deriving target schemas
         source_db = get_source_database(source_conn_id)
-        logger.info(f"Source database: {source_db}")
+        instance_name = get_instance_name(source_conn_id)
+        logger.info(f"Source instance: {instance_name}, database: {source_db}")
 
         # Build target schema map: {source_schema: target_schema}
         target_schema_map = {
-            src_schema: derive_target_schema(source_db, src_schema)
+            src_schema: derive_target_schema(source_db, src_schema, instance_name)
             for src_schema in schema_tables.keys()
         }
         logger.info(f"Target schemas: {target_schema_map}")

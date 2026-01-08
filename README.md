@@ -347,7 +347,7 @@ docker exec -it mssql-server /opt/mssql-tools18/bin/sqlcmd \
 
 ### Table Selection
 
-Tables must be explicitly specified in `schema.table` format. The target PostgreSQL schema is automatically derived as `{database}__{schema}` (lowercase). For example, `dbo.Users` from `StackOverflow2010` becomes `stackoverflow2010__dbo.Users`.
+Tables must be explicitly specified in `schema.table` format. The target PostgreSQL schema is automatically derived as `{instance}__{database}__{schema}` (lowercase). For example, `dbo.Users` from database `StackOverflow2010` on server `sqlprod01` becomes `sqlprod01__stackoverflow2010__dbo.users`.
 
 **Default value resolution (when param not provided):**
 
@@ -378,6 +378,41 @@ All SQL Server identifiers are sanitized for PostgreSQL compatibility:
 | `First-Name` | `first_name` | Special chars → underscores |
 | `123Column` | `col_123column` | Leading digit → prefix with `col_` |
 
+**Target Schema Naming:**
+
+The target PostgreSQL schema uses an alias mapped from the SQL Server hostname:
+
+```
+{alias}__{database}__{schema}
+```
+
+**Hostname Alias Configuration** (`config/hostname_alias.txt`):
+
+```
+# Format: hostname = alias (one per line)
+mssql-server = dev
+sqlprod01 = prod_sales
+sqlprod01.company.com = prod_sales
+sqldev\INSTANCE1 = dev_reporting
+```
+
+| Connection Host | Alias | Database | Target Schema |
+|-----------------|-------|----------|---------------|
+| `mssql-server` | `dev` | `StackOverflow2010` | `dev__stackoverflow2010__dbo` |
+| `sqlprod01` | `prod_sales` | `SalesDB` | `prod_sales__salesdb__orders` |
+| `sqldev\INSTANCE1` | `dev_reporting` | `ReportsDB` | `dev_reporting__reportsdb__dbo` |
+
+**Important**: If a hostname is not found in `hostname_alias.txt`, the DAG will fail with a clear error message listing available mappings. Add a mapping for each SQL Server host before running migrations.
+
+**Handling Long Names (>63 chars):**
+
+PostgreSQL has a 63-character limit for identifiers. If the full schema name exceeds this limit, the instance name is hashed (8-char MD5) while preserving the database and schema names:
+
+```
+verylonginstancename__verylongdatabasename__schema (68 chars)
+→ a1b2c3d4__verylongdatabasename__schema (42 chars)
+```
+
 **Why this matters:**
 
 PostgreSQL treats quoted identifiers as case-sensitive. When DDL uses quoted identifiers (e.g., `"Badges"` vs `"badges"`), these are treated as different objects:
@@ -398,7 +433,7 @@ The pipeline sanitizes all identifiers to lowercase to ensure consistency betwee
 - Data transfer (INSERT/COPY operations)
 - Queries against target tables
 
-This sanitization is handled by `sanitize_identifier()` in `plugins/mssql_pg_migration/type_mapping.py`.
+This sanitization is handled by `sanitize_identifier()` in `plugins/mssql_pg_migration/type_mapping.py` and `derive_target_schema()` in `plugins/mssql_pg_migration/table_config.py`.
 
 ### Example: Trigger via CLI
 

@@ -16,6 +16,125 @@ logger = logging.getLogger(__name__)
 # Base path for config files (relative to Airflow home or project root)
 CONFIG_DIR = Path(os.environ.get("AIRFLOW_HOME", "/opt/airflow")) / "config"
 
+# Hostname alias config file
+HOSTNAME_ALIAS_FILE = CONFIG_DIR / "hostname_alias.txt"
+
+
+def load_hostname_aliases() -> Dict[str, str]:
+    """
+    Load hostname to alias mappings from config file.
+
+    File: config/hostname_alias.txt
+    Format: hostname = alias (one per line, # for comments)
+
+    Returns:
+        Dict mapping lowercase hostnames to aliases
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        ValueError: If config file is empty or has no valid mappings
+    """
+    if not HOSTNAME_ALIAS_FILE.exists():
+        raise FileNotFoundError(
+            f"Hostname alias config file not found: {HOSTNAME_ALIAS_FILE}\n"
+            f"Create this file with hostname = alias mappings."
+        )
+
+    aliases: Dict[str, str] = {}
+
+    with open(HOSTNAME_ALIAS_FILE, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+
+            # Parse hostname = alias
+            if '=' not in line:
+                logger.warning(
+                    f"Invalid line {line_num} in {HOSTNAME_ALIAS_FILE}: '{line}' "
+                    f"(expected 'hostname = alias' format)"
+                )
+                continue
+
+            parts = line.split('=', 1)
+            hostname = parts[0].strip().lower()
+            alias = parts[1].strip()
+
+            if not hostname or not alias:
+                logger.warning(
+                    f"Invalid line {line_num} in {HOSTNAME_ALIAS_FILE}: '{line}' "
+                    f"(hostname and alias cannot be empty)"
+                )
+                continue
+
+            # Sanitize alias (lowercase, replace special chars)
+            alias_sanitized = re.sub(r'[^a-z0-9_]', '_', alias.lower()).strip('_')
+
+            if hostname in aliases:
+                logger.warning(
+                    f"Duplicate hostname '{hostname}' in {HOSTNAME_ALIAS_FILE} "
+                    f"(line {line_num}). Using latest mapping: '{alias_sanitized}'"
+                )
+
+            aliases[hostname] = alias_sanitized
+
+    if not aliases:
+        raise ValueError(
+            f"No valid hostname mappings found in {HOSTNAME_ALIAS_FILE}\n"
+            f"Add at least one mapping in 'hostname = alias' format."
+        )
+
+    logger.debug(f"Loaded {len(aliases)} hostname aliases from {HOSTNAME_ALIAS_FILE}")
+    return aliases
+
+
+def get_alias_for_hostname(hostname: str) -> str:
+    """
+    Look up alias for hostname from config file.
+
+    Matching is tried in order:
+    1. Exact match (case-insensitive)
+    2. Without port: 'server,1433' -> 'server'
+    3. Without instance: 'server\\instance' -> 'server'
+
+    Args:
+        hostname: SQL Server hostname (may include instance/port)
+
+    Returns:
+        Alias for the hostname (sanitized)
+
+    Raises:
+        ValueError: If hostname not found in mapping file
+    """
+    aliases = load_hostname_aliases()
+
+    # Normalize hostname for lookup
+    hostname_lower = hostname.lower()
+
+    # Try exact match first
+    if hostname_lower in aliases:
+        return aliases[hostname_lower]
+
+    # Try without port (server,port -> server)
+    hostname_no_port = hostname_lower.split(',')[0]
+    if hostname_no_port in aliases:
+        return aliases[hostname_no_port]
+
+    # Try without instance (server\instance -> server)
+    hostname_no_instance = hostname_no_port.split('\\')[0]
+    if hostname_no_instance in aliases:
+        return aliases[hostname_no_instance]
+
+    # Not found - fail with helpful error
+    available = '\n'.join(f"  {h} = {a}" for h, a in sorted(aliases.items()))
+    raise ValueError(
+        f"Hostname '{hostname}' not found in {HOSTNAME_ALIAS_FILE}\n"
+        f"Available mappings:\n{available}\n"
+        f"Add a mapping for this hostname and retry."
+    )
+
 
 def parse_schema_table(entry: str) -> Tuple[str, str]:
     """
@@ -120,40 +239,108 @@ def get_source_database(mssql_conn_id: str) -> str:
     return database
 
 
-def derive_target_schema(source_db: str, source_schema: str) -> str:
+def get_instance_name(mssql_conn_id: str) -> str:
     """
-    Return sanitized PostgreSQL schema name.
+    Get alias for SQL Server hostname from config file.
 
-    Format: {sourcedb}__{sourceschema} (lowercase)
+    Looks up the connection's hostname in config/hostname_alias.txt
+    and returns the configured alias. Fails if hostname not found.
+
+    Args:
+        mssql_conn_id: Airflow connection ID for SQL Server
+
+    Returns:
+        Alias for the hostname (sanitized, from config file)
+
+    Raises:
+        ValueError: If hostname not found in hostname_alias.txt
+        FileNotFoundError: If hostname_alias.txt doesn't exist
+
+    Examples:
+        Connection host 'mssql-server' with alias 'dev' -> 'dev'
+        Connection host 'sqlprod01' with alias 'prod_sales' -> 'prod_sales'
+    """
+    from airflow.hooks.base import BaseHook
+
+    conn = BaseHook.get_connection(mssql_conn_id)
+    host = conn.host or ''
+
+    if not host:
+        raise ValueError(
+            f"Cannot get instance name from connection '{mssql_conn_id}'. "
+            f"Connection has no host configured."
+        )
+
+    # Look up alias in config file (raises ValueError if not found)
+    alias = get_alias_for_hostname(host)
+
+    logger.info(f"Using alias '{alias}' for hostname '{host}'")
+    return alias
+
+
+def derive_target_schema(source_db: str, source_schema: str, instance_name: str) -> str:
+    """
+    Return sanitized PostgreSQL schema name with instance prefix.
+
+    Format: {instance}__{sourcedb}__{sourceschema} (lowercase)
 
     - Lowercase for PostgreSQL compatibility (avoids quoting issues)
     - Replace special chars with underscores
-    - Truncate to 63 chars (PostgreSQL identifier limit)
+    - If > 63 chars, hash only the instance name to fit PostgreSQL limit
 
     Note: The double underscore separator could cause ambiguity if source
-    schemas contain double underscores (e.g., "db__schema" vs "db" + "__schema").
-    Also, different source names may collide after sanitization
-    (e.g., "My-DB" and "My_DB" both become "my_db__*").
+    schemas contain double underscores. Different source names may collide
+    after sanitization (e.g., "My-DB" and "My_DB" both become "my_db").
 
     Args:
         source_db: Source database name
         source_schema: Source schema name
+        instance_name: SQL Server instance name (already sanitized)
 
     Returns:
         Sanitized PostgreSQL schema name
 
     Examples:
-        derive_target_schema("StackOverflow2010", "dbo")
-        -> "stackoverflow2010__dbo"
+        derive_target_schema("StackOverflow2010", "dbo", "sqlprod01")
+        -> "sqlprod01__stackoverflow2010__dbo"
 
-        derive_target_schema("My-DB", "sales")
-        -> "my_db__sales"
+        derive_target_schema("My-DB", "sales", "inst1")
+        -> "inst1__my_db__sales"
+
+        derive_target_schema("VeryLongDB", "schema", "verylonginstancename")
+        -> "a1b2c3d4__verylongdb__schema" (if > 63 chars)
     """
-    raw = f"{source_db}__{source_schema}".lower()
-    # Replace any non-alphanumeric/underscore chars with underscore
-    sanitized = re.sub(r'[^a-z0-9_]', '_', raw)
-    # Truncate to PostgreSQL limit
-    return sanitized[:63]
+    import hashlib
+
+    # Sanitize db and schema
+    db_sanitized = re.sub(r'[^a-z0-9_]', '_', source_db.lower())
+    schema_sanitized = re.sub(r'[^a-z0-9_]', '_', source_schema.lower())
+
+    # Build full schema name
+    full_name = f"{instance_name}__{db_sanitized}__{schema_sanitized}"
+
+    if len(full_name) <= 63:
+        return full_name
+
+    # Need to truncate - hash only the instance name
+    # Calculate how much space we need for db__schema
+    db_schema_part = f"{db_sanitized}__{schema_sanitized}"
+    # 8 chars for hash + 2 for separator = 10 chars for instance part
+    available_for_db_schema = 63 - 10  # 53 chars
+
+    if len(db_schema_part) > available_for_db_schema:
+        # Even with hashed instance, db__schema is too long
+        # This is an edge case - log warning and truncate db__schema too
+        logger.warning(
+            f"Schema name '{full_name}' exceeds 63 chars even with hashed instance. "
+            f"Truncating db__schema portion."
+        )
+        db_schema_part = db_schema_part[:available_for_db_schema]
+
+    # Hash the instance name (first 8 chars of MD5)
+    instance_hash = hashlib.md5(instance_name.encode()).hexdigest()[:8]
+
+    return f"{instance_hash}__{db_schema_part}"
 
 
 def validate_include_tables(include_tables: Optional[List[str]]) -> None:
@@ -327,18 +514,19 @@ def build_table_info_list(
     Example:
         build_table_info_list("mssql_source", ["dbo.Users", "dbo.Posts"])
         -> [
-            {"table_name": "Users", "source_schema": "dbo", "target_schema": "stackoverflow2010__dbo"},
-            {"table_name": "Posts", "source_schema": "dbo", "target_schema": "stackoverflow2010__dbo"},
+            {"table_name": "Users", "source_schema": "dbo", "target_schema": "sqlprod01__stackoverflow2010__dbo"},
+            {"table_name": "Posts", "source_schema": "dbo", "target_schema": "sqlprod01__stackoverflow2010__dbo"},
         ]
     """
     validate_include_tables(include_tables)
 
     source_db = get_source_database(mssql_conn_id)
+    instance_name = get_instance_name(mssql_conn_id)
     schema_tables = parse_include_tables(include_tables)
 
     result = []
     for source_schema, tables in schema_tables.items():
-        target_schema = derive_target_schema(source_db, source_schema)
+        target_schema = derive_target_schema(source_db, source_schema, instance_name)
 
         for table_name in tables:
             result.append({
@@ -366,14 +554,15 @@ def get_unique_target_schemas(
 
     Example:
         get_unique_target_schemas("mssql_source", ["dbo.Users", "sales.Orders"])
-        -> ["stackoverflow2010__dbo", "stackoverflow2010__sales"]
+        -> ["sqlprod01__stackoverflow2010__dbo", "sqlprod01__stackoverflow2010__sales"]
     """
     validate_include_tables(include_tables)
 
     source_db = get_source_database(mssql_conn_id)
+    instance_name = get_instance_name(mssql_conn_id)
     schema_tables = parse_include_tables(include_tables)
 
     return [
-        derive_target_schema(source_db, source_schema)
+        derive_target_schema(source_db, source_schema, instance_name)
         for source_schema in schema_tables.keys()
     ]
