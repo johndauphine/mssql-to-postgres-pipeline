@@ -24,6 +24,7 @@ import logging
 
 from mssql_pg_migration import schema_extractor
 from mssql_pg_migration.ddl_generator import DDLGenerator
+from mssql_pg_migration.type_mapping import sanitize_identifier
 from mssql_pg_migration.table_config import (
     expand_include_tables_param,
     validate_include_tables,
@@ -200,9 +201,13 @@ def mssql_to_postgres_schema():
             try:
                 ddl_statements = []
 
+                # Sanitize table name for PostgreSQL (lowercase)
+                # This must match what generate_create_table uses
+                pg_table_name = sanitize_identifier(table_name)
+
                 # Always drop existing table before recreating
                 ddl_statements.append(
-                    generator.generate_drop_table(table_name, target_schema, cascade=True)
+                    generator.generate_drop_table(pg_table_name, target_schema, cascade=True)
                 )
 
                 # Create table WITH primary key (include_constraints=True)
