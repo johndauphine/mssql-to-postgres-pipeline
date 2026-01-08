@@ -115,6 +115,22 @@ class SchemaExtractor:
 
         logger.info(f"Found {len(result)} tables in schema '{schema_name}'")
 
+        # Validate requested tables were found and warn about missing ones
+        if include_tables:
+            found_tables = {t['table_name'].upper() for t in result}
+            requested_tables = {t.upper() for t in include_tables}
+            missing_tables = requested_tables - found_tables
+
+            if missing_tables:
+                # Convert back to original case for clearer logging
+                original_case_missing = [
+                    t for t in include_tables if t.upper() in missing_tables
+                ]
+                logger.warning(
+                    f"Skipping {len(missing_tables)} non-existent table(s) in schema '{schema_name}': "
+                    f"{original_case_missing}"
+                )
+
         # Debug: if no tables found, list available schemas
         if not result and include_tables:
             try:
