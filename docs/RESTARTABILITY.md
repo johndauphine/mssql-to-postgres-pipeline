@@ -1,6 +1,6 @@
 # Migration DAG Restartability Guide
 
-This guide explains how to use the restartability features of the `mssql_to_postgres_migration` DAG to resume failed or partially completed migrations without restarting from scratch.
+This guide explains how the `mssql_to_postgres_migration` DAG handles failures and resumes interrupted migrations automatically.
 
 ## Overview
 
@@ -8,74 +8,83 @@ When migrating large datasets, failures can occur due to:
 - Network timeouts
 - Memory pressure
 - Database locks
-- Airflow scheduler issues
+- Airflow scheduler crashes
 
-The restartability feature allows you to:
-- Skip tables that already completed successfully
-- Retry only failed tables
-- Resume partitioned tables from the last completed partition
-- Force re-run specific tables without resetting everything
+The migration DAG automatically handles these scenarios with **smart defaults** - no manual parameters required. Simply re-trigger the DAG and it will do the right thing.
 
 ## Quick Start
 
-### Resume a Failed Migration
-
-If your migration failed partway through:
+### After a Failure - Just Re-trigger
 
 ```bash
-# Resume - skip completed tables, retry failed ones
-airflow dags trigger mssql_to_postgres_migration \
-  --conf '{"resume_mode": true}'
+# The DAG automatically detects failures and resumes
+airflow dags trigger mssql_to_postgres_migration
 ```
 
-### Start Fresh (Clear Previous State)
+That's it. The DAG will:
+- Skip tables that completed successfully
+- Retry tables that failed
+- Resume partitions from checkpoints when possible
 
-If you want to start over completely:
+### Start Fresh (Manual Reset)
 
-```bash
-# Clear state and run all tables
-airflow dags trigger mssql_to_postgres_migration \
-  --conf '{"reset_state": true}'
+If you need to force a complete re-migration, manually clear the state:
+
+```sql
+-- Connect to target PostgreSQL database
+UPDATE _migration_state
+SET sync_status = 'pending', partition_info = NULL
+WHERE migration_type = 'full';
 ```
 
-### Retry Only Failed Tables
-
-If you fixed an issue and want to retry only the tables that failed:
-
-```bash
-# Only retry tables that failed (skip new/pending tables)
-airflow dags trigger mssql_to_postgres_migration \
-  --conf '{"resume_mode": true, "retry_failed_only": true}'
-```
-
-### Force Re-run Specific Tables
-
-If you need to re-migrate specific tables that already succeeded:
-
-```bash
-# Re-run Users and Posts, skip other completed tables
-airflow dags trigger mssql_to_postgres_migration \
-  --conf '{"resume_mode": true, "force_refresh_tables": ["Users", "Posts"]}'
-```
-
-## Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `resume_mode` | boolean | `false` | Skip tables that completed in previous runs. Retry failed/running tables. |
-| `reset_state` | boolean | `false` | Clear all migration state before starting (fresh start). |
-| `retry_failed_only` | boolean | `false` | Only retry tables that failed (skip pending tables). Requires `resume_mode=true`. |
-| `force_refresh_tables` | array | `[]` | Force re-run specific tables even if completed (e.g., `["Users", "Posts"]`). |
+Then trigger the DAG normally.
 
 ## How It Works
 
+### Automatic Mode Detection
+
+The DAG automatically determines the appropriate mode at the start of each run:
+
+```
+                    ┌─────────────────────────────────────┐
+                    │   Check _migration_state table      │
+                    │   for previous 'failed' status      │
+                    └──────────────┬──────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+               Has Failures                  No Failures
+                    │                             │
+                    ▼                             ▼
+            ┌───────────────┐            ┌───────────────┐
+            │ RECOVERY MODE │            │  FRESH MODE   │
+            │               │            │               │
+            │ - Skip done   │            │ - Reset all   │
+            │ - Retry failed│            │ - Full reload │
+            └───────────────┘            └───────────────┘
+```
+
+**RECOVERY MODE** (triggered when failures exist):
+- Skips tables marked `completed`
+- Retries tables marked `failed` or `running`
+- Resumes partitions from checkpoints
+
+**FRESH MODE** (triggered when no failures):
+- Resets all state to `pending`
+- Performs full data reload for all tables
+- This is the default for clean re-runs
+
 ### State Tracking
 
-The migration DAG tracks state in a `_migration_state` table in the target PostgreSQL database. For each table, it records:
+The migration DAG tracks state in a `_migration_state` table in the target PostgreSQL database:
 
-- **sync_status**: `pending`, `running`, `completed`, or `failed`
-- **dag_run_id**: Which DAG run created/updated this state
-- **partition_info**: For large tables, tracks each partition's status
+| Column | Description |
+|--------|-------------|
+| `table_name` | Table being migrated |
+| `sync_status` | `pending`, `running`, `completed`, or `failed` |
+| `dag_run_id` | Which DAG run created/updated this state |
+| `partition_info` | JSONB tracking partition completion for large tables |
+| `error_message` | Error details for failed tables |
 
 ### State Transitions
 
@@ -94,112 +103,126 @@ The migration DAG tracks state in a `_migration_state` table in the target Postg
  │  COMPLETED  │                       │   FAILED    │
  └─────────────┘                       └─────────────┘
         │                                     │
-        │ reset_state=true                    │ resume_mode=true
-        └──────────────┬──────────────────────┘
-                       │
-                       ▼
-                ┌─────────────┐
-                │   PENDING   │ (retry)
-                └─────────────┘
+        │ fresh run (no failures)             │ re-trigger DAG
+        │                                     │
+        ▼                                     ▼
+ ┌─────────────┐                       ┌─────────────┐
+ │   PENDING   │ (reset for reload)    │   RUNNING   │ (retry)
+ └─────────────┘                       └─────────────┘
 ```
 
 ### Zombie State Handling
 
-If a DAG run crashes (OOM, node failure), tasks may be left in `running` state. On the next run with `resume_mode=true`:
+If a DAG run crashes (OOM, node failure, scheduler restart), tasks may be left in `running` state. The DAG handles this automatically:
 
-1. States from previous DAG runs that are still `running` are treated as `failed`
-2. They are automatically marked for retry
-3. The current run's `running` states are not affected
+1. At startup, checks for `running` states from **previous** DAG runs
+2. Marks these "zombie" states as `failed` (so they'll be retried)
+3. Current run's `running` states are not affected
 
-### Partition Handling
+This check happens **before** the failure detection, so zombie states don't accidentally trigger RECOVERY mode when a fresh run is intended.
 
-For large tables (>1M rows), the DAG splits transfers into partitions. State tracking includes:
+## Partition-Level Resume
+
+For large tables (>1M rows), the DAG splits transfers into partitions. State tracking includes checkpoint information for each partition.
+
+### Partition State Structure
 
 ```json
 {
-  "sync_status": "running",
-  "partition_info": {
-    "total_partitions": 4,
-    "partitions": [
-      {"id": 0, "status": "completed", "rows": 500000},
-      {"id": 1, "status": "completed", "rows": 500000},
-      {"id": 2, "status": "failed", "rows": 300000, "error": "timeout", "last_pk_synced": 1500000},
-      {"id": 3, "status": "pending"}
-    ]
-  }
+  "total_partitions": 4,
+  "partitions": [
+    {"id": 0, "status": "completed", "rows": 500000, "min_pk": 1, "max_pk": 500000},
+    {"id": 1, "status": "completed", "rows": 500000, "min_pk": 500001, "max_pk": 1000000},
+    {"id": 2, "status": "failed", "rows": 300000, "min_pk": 1000001, "max_pk": 1500000, "last_pk_synced": 1300000, "error": "timeout"},
+    {"id": 3, "status": "pending", "min_pk": 1500001}
+  ]
 }
 ```
 
-On resume:
-- Completed partitions (0, 1) are skipped
-- Failed partition (2) resumes from checkpoint if available
-- Pending partitions (3) run normally
+### Resume Behavior
+
+On re-trigger after a partition failure:
+
+| Partition Status | Action |
+|-----------------|--------|
+| `completed` | Skipped entirely |
+| `failed` with checkpoint | Resume from `last_pk_synced`, cleanup stale rows |
+| `failed` without checkpoint | Full partition retry with cleanup |
+| `pending` | Run normally |
+| `running` (zombie) | Treated as failed, retry |
 
 ### Mid-Partition Checkpoint Resume
 
 When a partition fails mid-transfer, the DAG saves a checkpoint (`last_pk_synced`) indicating the last successfully committed row. On resume:
 
-1. **With checkpoint**: Transfer continues from `pk > last_pk_synced`, skipping already-transferred rows
-2. **Without checkpoint**: Full partition retry with cleanup (DELETE by PK range)
-
 ```
 Partition fails at row 900K of 1M:
   ├─ last_pk_synced = 900000 saved to state
   └─ On resume:
-      ├─ DELETE rows WHERE pk > 900000 (cleanup stale data)
+      ├─ DELETE rows WHERE pk > 900000 AND pk <= max_pk (cleanup stale)
       ├─ Transfer continues from pk > 900000
       └─ Only ~100K rows transferred (not 1M)
 ```
 
-**Limitations**:
-- Checkpoint resume only works for **keyset pagination** (single primary key)
+**Checkpoint Limitations**:
+- Only works for **keyset pagination** (single primary key)
 - **Composite PKs** use ROW_NUMBER pagination which doesn't support mid-partition resume
-- **Parallel readers** (`PARALLEL_READERS > 1`) disable checkpoint resume due to non-deterministic ordering
+- **Parallel readers** (`PARALLEL_READERS > 1`) use sequential reads for checkpoint accuracy
 
-**Stale Checkpoint Handling**: If the worker commits rows but crashes before saving the checkpoint, those rows would be re-transferred on resume, causing duplicate key errors. To prevent this, the DAG always deletes rows after the checkpoint (`pk > last_pk_synced`) before resuming, ensuring idempotency.
+**Stale Checkpoint Handling**: If the worker commits rows but crashes before saving the checkpoint, those rows would be re-transferred on resume. To prevent duplicate key errors, the DAG always deletes rows after the checkpoint before resuming.
 
 ## Usage Scenarios
 
 ### Scenario 1: Network Timeout During Migration
 
-1. First run starts, 5 of 9 tables complete, then network timeout on table 6
-2. Tables 1-5 are marked `completed`, table 6 is `failed`
-3. Resume with: `{"resume_mode": true}`
-4. Second run skips tables 1-5, retries table 6, continues with 7-9
+1. First run starts, 5 of 9 tables complete, table 6 times out
+2. Tables 1-5 marked `completed`, table 6 marked `failed`
+3. Re-trigger the DAG
+4. DAG detects failures → RECOVERY MODE
+5. Second run skips tables 1-5, retries table 6, continues with 7-9
 
-### Scenario 2: Schema Change Requires Re-migration
-
-1. Migration completed successfully
-2. Discovered a column mapping issue in the `Users` table
-3. Fix the mapping in schema DAG
-4. Re-run only Users: `{"resume_mode": true, "force_refresh_tables": ["Users"]}`
-
-### Scenario 3: Partition Fails Mid-Transfer
+### Scenario 2: Partition Fails Mid-Transfer
 
 1. Large table (Posts, 3.7M rows) split into 4 partitions
 2. Partition 2 fails after transferring 700K of 900K rows
 3. State shows: `"last_pk_synced": 2500000` in partition_info
-4. Resume: `{"resume_mode": true}`
-5. Partition 2 continues from pk > 2500000, only ~200K rows to transfer
+4. Re-trigger the DAG
+5. Partition 2 continues from pk > 2500000
 6. Logs show: `Resuming partition from checkpoint: PK > 2500000`
 
-### Scenario 4: Partition Keeps Failing (No Checkpoint)
+### Scenario 3: Scheduler Crash Leaves Zombie States
 
-1. Large table split into 6 partitions
-2. Partitions 1-2 complete, partition 3 fails immediately (no checkpoint)
-3. Increase `chunk_size` or check for blocking queries
-4. Resume: `{"resume_mode": true}`
-5. Partition 3 is fully retried with cleanup (DELETE by PK range)
+1. DAG run crashes mid-execution
+2. Tables left in `running` state (zombies)
+3. Re-trigger the DAG
+4. DAG detects zombies from previous run_id
+5. Marks zombies as `failed`, then determines mode based on real failures
+6. If no pre-existing failures: FRESH MODE (zombies alone don't trigger recovery)
 
-### Scenario 5: Need to Re-migrate Everything
+### Scenario 4: Re-run After Successful Migration
 
-1. Source data was refreshed, need full re-migration
-2. Clear state and start over: `{"reset_state": true}`
-3. All tables are transferred from scratch
+1. Previous migration completed successfully (all tables `completed`)
+2. Source data updated, need full refresh
+3. Trigger the DAG
+4. DAG detects no failures → FRESH MODE
+5. Resets all state to `pending`, performs full reload
+
+### Scenario 5: Force Specific Table Re-migration
+
+1. Need to re-migrate just the `Users` table
+2. Manually reset that table's state:
+   ```sql
+   UPDATE _migration_state
+   SET sync_status = 'failed'
+   WHERE table_name = 'users' AND migration_type = 'full';
+   ```
+3. Trigger the DAG
+4. DAG detects failure → RECOVERY MODE
+5. Skips other completed tables, re-migrates Users
 
 ## Viewing Migration State
 
-You can query the state table directly:
+Query the state table directly to monitor progress:
 
 ```sql
 -- View all migration state
@@ -211,12 +234,12 @@ ORDER BY table_name;
 -- View failed tables
 SELECT table_name, error_message, retry_count
 FROM _migration_state
-WHERE sync_status = 'failed';
+WHERE sync_status = 'failed' AND migration_type = 'full';
 
 -- View partition status for a table
 SELECT table_name, partition_info
 FROM _migration_state
-WHERE table_name = 'Posts';
+WHERE table_name = 'posts' AND migration_type = 'full';
 
 -- View checkpoint for failed partitions
 SELECT table_name,
@@ -226,62 +249,94 @@ SELECT table_name,
 FROM _migration_state,
      jsonb_array_elements(partition_info->'partitions') as p
 WHERE p->>'status' = 'failed';
+
+-- Count tables by status
+SELECT sync_status, COUNT(*), ARRAY_AGG(table_name)
+FROM _migration_state
+WHERE migration_type = 'full'
+GROUP BY sync_status;
 ```
 
 ## Logs
 
 The `initialize_migration_state` task logs a summary at the start of each run:
 
+**RECOVERY MODE example:**
 ```
 ============================================================
-[PLAN] Migration State Summary
+[PLAN] RECOVERY MODE - Resuming from failure
 ============================================================
-  resume_mode: True
-  reset_state: False
-  retry_failed_only: False
-  force_refresh_tables: []
-------------------------------------------------------------
-  Completed: 5 tables
-  Failed:    2 tables
-  Running:   0 tables
-  Pending:   2 tables
+  Completed: 5 tables (will SKIP)
+  Failed:    2 tables (will RETRY)
+  Running:   0 tables (will RETRY)
 ============================================================
-[PLAN] Skipping: 5 completed tables
-[PLAN] Retrying: 2 failed/running tables
-[PLAN] Completed tables: Users, Posts, Comments, Badges, Votes
-[PLAN] Failed tables: LinkTypes, PostTypes
+```
+
+**FRESH MODE example:**
+```
+============================================================
+[PLAN] FRESH RUN - Resetting state for full reload
+============================================================
+  Reset 7 tables to pending
+  Tables to migrate: 9
+============================================================
 ```
 
 ## Troubleshooting
 
-### Tables Not Being Skipped in Resume Mode
+### Tables Not Being Skipped
 
-1. Check that the state table exists: `SELECT COUNT(*) FROM _migration_state`
-2. Verify table has `sync_status = 'completed'`
-3. Ensure `migration_type = 'full'` (not `incremental`)
+If completed tables are being re-migrated:
 
-### Partitioned Table Stuck in Running
+1. Check that state exists: `SELECT * FROM _migration_state WHERE migration_type = 'full'`
+2. Verify status is `completed` (not `running` or `pending`)
+3. Confirm there are failed tables (otherwise FRESH MODE resets everything)
 
-1. Check partition status: `SELECT partition_info FROM _migration_state WHERE table_name = 'YourTable'`
-2. If a partition is stuck in `running` from a previous DAG run, it will be auto-reset on next resume
-3. You can manually reset: `UPDATE _migration_state SET sync_status = 'pending' WHERE table_name = 'YourTable'`
+### Partition Resume Not Working
 
-### State Table Missing Columns
-
-The state table schema is automatically migrated when the DAG runs. If you see errors about missing columns:
-
-1. Run the migration DAG once to auto-migrate the schema
-2. Or manually add columns:
+1. Check partition_info has `last_pk_synced`:
    ```sql
-   ALTER TABLE _migration_state ADD COLUMN IF NOT EXISTS migration_type VARCHAR(20) DEFAULT 'incremental';
-   ALTER TABLE _migration_state ADD COLUMN IF NOT EXISTS dag_run_id VARCHAR(255);
-   ALTER TABLE _migration_state ADD COLUMN IF NOT EXISTS partition_info JSONB;
+   SELECT partition_info FROM _migration_state WHERE table_name = 'your_table'
    ```
+2. Verify table uses single PK (composite PKs don't support checkpoint resume)
+3. Check logs for "Resuming partition from checkpoint" message
+
+### Unexpected FRESH MODE
+
+If the DAG resets everything when you expected recovery:
+
+1. No `failed` status tables exist (zombies alone don't count)
+2. All tables are `completed` → fresh run is appropriate
+3. To force recovery mode, manually set a table to `failed`
+
+### State Table Missing
+
+If `_migration_state` doesn't exist:
+
+1. The table is auto-created on first DAG run
+2. Check for database connection issues
+3. Verify the target PostgreSQL connection has CREATE TABLE permissions
 
 ## Best Practices
 
-1. **Always use `resume_mode`** after a failure rather than starting fresh
-2. **Don't mix incremental and full migrations** - they use separate state (`migration_type`)
+1. **Trust the automatic behavior** - The DAG chooses the right mode based on state
+2. **Don't manually reset state** unless you specifically need a full re-migration
 3. **Monitor partition progress** for large tables in the Airflow logs
-4. **Use `force_refresh_tables`** sparingly - prefer fixing the root cause
-5. **Clear state periodically** after successful migrations to prevent state table bloat
+4. **Check state table** after failures to understand what will be retried
+5. **Use `skip_schema_dag=True`** when re-running after a data transfer failure (schema already exists)
+
+## DAG Parameters
+
+The migration DAG no longer has explicit resume/restart parameters. Instead, behavior is automatic:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `source_conn_id` | `mssql_source` | Airflow connection ID for SQL Server |
+| `target_conn_id` | `postgres_target` | Airflow connection ID for PostgreSQL |
+| `include_tables` | from config | Tables to migrate in `schema.table` format |
+| `chunk_size` | `200000` | Rows per batch during transfer |
+| `skip_schema_dag` | `false` | Skip schema creation (use for data-only retries) |
+
+---
+
+*Last updated: January 2026*
