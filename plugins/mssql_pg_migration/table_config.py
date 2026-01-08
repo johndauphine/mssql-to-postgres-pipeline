@@ -264,16 +264,11 @@ def load_include_tables_from_config(mssql_conn_id: str) -> List[str]:
         dbo.Posts
         sales.Orders
 
-    Priority:
-    1. Config file (if exists)
-    2. INCLUDE_TABLES environment variable
-    3. Empty list
-
     Args:
         mssql_conn_id: Airflow connection ID for SQL Server
 
     Returns:
-        List of schema.table strings from config file, env var, or empty list
+        List of schema.table strings from config file, or empty list if not found
     """
     from airflow.hooks.base import BaseHook
 
@@ -303,8 +298,7 @@ def load_include_tables_from_config(mssql_conn_id: str) -> List[str]:
         else:
             logger.debug(f"Config file not found: {config_file}")
 
-    # Fall back to environment variable
-    return get_default_include_tables()
+    return []
 
 
 def build_table_info_list(
