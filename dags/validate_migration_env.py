@@ -31,6 +31,7 @@ from mssql_pg_migration.table_config import (
     parse_include_tables,
     derive_target_schema,
     get_default_include_tables,
+    get_alias_for_hostname,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,9 +116,10 @@ def validate_migration_env():
             'password': os.environ.get('POSTGRES_PASSWORD', 'PostgresPassword123'),
         }
 
-        # Derive target schema from source database name
-        # Using mssql_database directly since we're using env vars, not Airflow connections
+        # Derive target schema from source instance and database name
+        # Using env vars directly since this DAG doesn't use Airflow connections
         source_db = mssql_database
+        instance_name = get_alias_for_hostname(mssql_host)
 
         # Connect to databases
         logger.info("Connecting to databases...")
@@ -147,7 +149,7 @@ def validate_migration_env():
         total = 0
 
         for source_schema, tables in schema_tables.items():
-            target_schema = derive_target_schema(source_db, source_schema)
+            target_schema = derive_target_schema(source_db, source_schema, instance_name)
             logger.info(f"Validating {len(tables)} tables: {source_schema} -> {target_schema}")
 
             for table_name in sorted(tables):
