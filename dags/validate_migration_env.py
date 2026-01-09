@@ -33,6 +33,7 @@ from mssql_pg_migration.table_config import (
     get_default_include_tables,
     get_alias_for_hostname,
 )
+from mssql_pg_migration.type_mapping import sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -175,16 +176,17 @@ def validate_migration_env():
                     missing += 1
                     continue
 
-                # Query target
+                # Query target (use sanitized table name for PostgreSQL)
+                target_table_name = sanitize_identifier(table_name)
                 try:
                     query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
                         sql.Identifier(target_schema),
-                        sql.Identifier(table_name),
+                        sql.Identifier(target_table_name),
                     )
                     postgres_cursor.execute(query)
                     target_count = postgres_cursor.fetchone()[0]
                 except Exception as e:
-                    logger.warning(f"Failed to count target table {target_schema}.{table_name}: {e}")
+                    logger.warning(f"Failed to count target table {target_schema}.{target_table_name}: {e}")
                     target_count = None
                     missing += 1
                     continue
@@ -198,7 +200,7 @@ def validate_migration_env():
 
                 diff = target_count - source_count if target_count is not None else 0
                 logger.info(
-                    f"{status} {source_schema}.{table_name:25} | "
+                    f"{status} {source_schema}.{table_name:25} -> {target_table_name:25} | "
                     f"Source: {source_count:>10,} | "
                     f"Target: {target_count:>10,} | "
                     f"Diff: {diff:>+10,}"
