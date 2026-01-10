@@ -57,6 +57,8 @@ x-airflow-common:
     INCLUDE_TABLES: ${INCLUDE_TABLES:-}
     # For testing: set to comma-separated table names to simulate failures
     SIMULATE_FAILURE_TABLES: ${SIMULATE_FAILURE_TABLES:-}
+    # Date column for incremental sync (only rows where column > last_sync_timestamp)
+    DATE_UPDATED_FIELD: ${DATE_UPDATED_FIELD:-}
 
     # Database Connection Strings
     # Set these in .env file or override here for local testing
