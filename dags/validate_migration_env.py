@@ -27,6 +27,7 @@ from mssql_pg_migration.table_config import (
     derive_target_schema,
     get_default_include_tables,
     get_alias_for_hostname,
+    load_include_tables_from_config,
 )
 from mssql_pg_migration.type_mapping import sanitize_identifier
 from psycopg2 import sql
@@ -99,13 +100,14 @@ def validate_migration_env():
         source_conn_id = params.get("source_conn_id", "mssql_source")
         target_conn_id = params.get("target_conn_id", "postgres_target")
 
-        # Parse and expand include_tables parameter
-        include_tables_raw = params.get("include_tables", [])
-        include_tables = expand_include_tables_param(include_tables_raw)
+        # Priority: config file > param/env var
+        # Try loading from database-specific config file first
+        include_tables = load_include_tables_from_config(source_conn_id)
 
-        # Fall back to environment variable if empty
+        # Fall back to param (which defaults from INCLUDE_TABLES env var)
         if not include_tables:
-            include_tables = get_default_include_tables()
+            include_tables_raw = params.get("include_tables", [])
+            include_tables = expand_include_tables_param(include_tables_raw)
 
         # Validate include_tables
         validate_include_tables(include_tables)

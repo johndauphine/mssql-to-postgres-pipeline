@@ -1,0 +1,9 @@
+# Tables to migrate from CaseTestDB database
+# Format: schema.table (one per line)
+# Lines starting with # are comments
+# Note: Mixed-case table names for testing case sensitivity
+
+TestSchema.CustomerOrders
+TestSchema.PRODUCT_CATALOG
+TestSchema.user_sessions
+TestSchema.orderItems

@@ -45,6 +45,7 @@ from mssql_pg_migration.table_config import (
     get_instance_name,
     derive_target_schema,
     get_default_include_tables,
+    load_include_tables_from_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,13 +228,14 @@ def mssql_to_postgres_migration():
         params = context["params"]
         source_conn_id = params["source_conn_id"]
 
-        # Parse and expand include_tables parameter
-        include_tables_raw = params.get("include_tables", [])
-        include_tables = expand_include_tables_param(include_tables_raw)
+        # Priority: config file > param/env var
+        # Try loading from database-specific config file first
+        include_tables = load_include_tables_from_config(source_conn_id)
 
-        # Fall back to environment variable if empty
-        if not include_tables and DEFAULT_INCLUDE_TABLES:
-            include_tables = expand_include_tables_param(DEFAULT_INCLUDE_TABLES)
+        # Fall back to param (which defaults from INCLUDE_TABLES env var)
+        if not include_tables:
+            include_tables_raw = params.get("include_tables", [])
+            include_tables = expand_include_tables_param(include_tables_raw)
 
         # Validate include_tables
         validate_include_tables(include_tables)
