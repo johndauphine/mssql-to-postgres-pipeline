@@ -460,6 +460,59 @@ docker exec airflow-scheduler airflow dags list-runs mssql_to_postgres_migration
 docker exec airflow-scheduler airflow dags list-runs validate_migration_env
 ```
 
+### Failure Recovery
+
+The migration pipeline supports automatic recovery from failures at multiple levels.
+
+#### Resuming After a Failure
+
+If the migration fails mid-way, re-trigger with `skip_schema=true` to resume:
+
+```bash
+# Resume from failure (preserves completed tables)
+docker exec airflow-scheduler airflow dags trigger mssql_to_postgres_migration \
+  --conf '{"skip_schema": true}'
+```
+
+**Important**: Without `skip_schema=true`, the schema DAG will DROP all tables and start fresh, losing any completed work.
+
+#### How Recovery Works
+
+**Table-Level Recovery:**
+- The `_migration_state` table tracks each table's status: `pending`, `running`, `completed`, `failed`
+- On restart with failures detected:
+  - `completed` tables → **SKIP** (already done)
+  - `failed` tables → **RETRY** (start fresh)
+  - `running` tables → **RESET** (zombie cleanup, then retry)
+
+**Partition-Level Recovery (Large Tables):**
+- Tables >1M rows are split into partitions (2-12 based on size)
+- Each partition's status is tracked in the state table
+- On restart:
+  - Completed partitions → **SKIP**
+  - Failed/pending partitions → **RETRY**
+  - Before retrying, existing rows in that PK range are deleted (idempotent)
+
+**Example State Table:**
+```sql
+SELECT table_name, status, rows_transferred, partition_info
+FROM _migration_state
+WHERE migration_type = 'full';
+
+-- table_name | status    | rows_transferred | partition_info
+-- users      | completed | 299406           | null
+-- posts      | completed | 3729195          | {"partitions": 4, "completed": 4}
+-- votes      | failed    | 5000000          | {"partitions": 12, "completed": 6}
+```
+
+#### Quick Reference
+
+| Scenario | Command |
+|----------|---------|
+| Fresh migration | `airflow dags trigger mssql_to_postgres_migration` |
+| Resume after failure | `airflow dags trigger mssql_to_postgres_migration --conf '{"skip_schema": true}'` |
+| Check state table | `SELECT * FROM _migration_state WHERE migration_type = 'full'` |
+
 ## Project Structure
 
 ```
