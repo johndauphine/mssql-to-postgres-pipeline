@@ -180,6 +180,14 @@ BEGIN
                 );
                 GET DIAGNOSTICS migrated_count = ROW_COUNT;
                 RAISE NOTICE 'Migrated % rows from public._migration_state to _migration._migration_state', migrated_count;
+
+                -- Reset sequence to max(id)+1 to avoid duplicate key errors on new inserts
+                PERFORM setval(
+                    '_migration._migration_state_id_seq',
+                    COALESCE((SELECT MAX(id) FROM _migration._migration_state), 0) + 1,
+                    false
+                );
+                RAISE NOTICE 'Reset _migration_state_id_seq to avoid duplicate key errors';
             END IF;
         END IF;
 
