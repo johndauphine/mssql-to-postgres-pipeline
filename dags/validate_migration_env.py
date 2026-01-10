@@ -156,7 +156,7 @@ def validate_migration_env():
             for table_name in sorted(tables):
                 total += 1
 
-                # Get source count (use COLLATE for case-insensitive matching)
+                # Get source count
                 try:
                     source_query = """
                         SELECT COALESCE(SUM(p.rows), 0)
@@ -164,8 +164,7 @@ def validate_migration_env():
                         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
                         LEFT JOIN sys.partitions p ON p.object_id = t.object_id
                             AND p.index_id IN (0, 1)
-                        WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
-                          AND t.name COLLATE SQL_Latin1_General_CI_AS = ?
+                        WHERE s.name = ? AND t.name = ?
                         GROUP BY t.name
                     """
                     mssql_cursor.execute(source_query, (source_schema, table_name))

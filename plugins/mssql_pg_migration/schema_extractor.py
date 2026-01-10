@@ -42,7 +42,6 @@ class SchemaExtractor:
             List of table information dictionaries
         """
         # Build query with optional IN clause for include_tables
-        # Use COLLATE for case-insensitive matching (works with case-sensitive collations)
         if include_tables:
             # Filter at SQL level for efficiency (case-insensitive comparison)
             placeholders = ', '.join(['?' for _ in include_tables])
@@ -59,13 +58,13 @@ class SchemaExtractor:
                    AND p.index_id IN (0, 1)) AS row_count
             FROM sys.tables t
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
+            WHERE UPPER(s.name) = ?
               AND t.is_ms_shipped = 0
-              AND t.name COLLATE SQL_Latin1_General_CI_AS IN ({placeholders})
+              AND UPPER(t.name) IN ({placeholders})
             ORDER BY t.name
             """
-            # Pass parameters as-is (COLLATE handles case-insensitivity)
-            parameters = [schema_name] + list(include_tables)
+            # Uppercase schema and table names for case-insensitive matching
+            parameters = [schema_name.upper()] + [t.upper() for t in include_tables]
             logger.info(f"Extracting {len(include_tables)} specific tables from schema '{schema_name}'")
             logger.info(f"SQL parameters: schema={parameters[0]}, tables={parameters[1:5]}{'...' if len(parameters) > 5 else ''}")
         else:
@@ -82,11 +81,11 @@ class SchemaExtractor:
                    AND p.index_id IN (0, 1)) AS row_count
             FROM sys.tables t
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
+            WHERE UPPER(s.name) = ?
               AND t.is_ms_shipped = 0  -- Exclude system tables
             ORDER BY t.name
             """
-            parameters = [schema_name]
+            parameters = [schema_name.upper()]
 
         tables = self.mssql_hook.get_records(query, parameters=parameters)
 
@@ -390,13 +389,12 @@ class SchemaExtractor:
         Returns:
             Complete table schema information
         """
-        # Get table object_id (use COLLATE for case-insensitive matching)
+        # Get table object_id
         query = """
         SELECT object_id
         FROM sys.tables t
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
-          AND t.name COLLATE SQL_Latin1_General_CI_AS = ?
+        WHERE s.name = ? AND t.name = ?
         """
 
         result = self.mssql_hook.get_first(query, parameters=[schema_name, table_name])

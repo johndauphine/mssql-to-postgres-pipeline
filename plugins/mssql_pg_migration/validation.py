@@ -114,15 +114,13 @@ class MigrationValidator:
         logger.info(f"Validating sample data for {source_table} (sample size: {sample_size})")
 
         # Get column names if not specified
-        # Use COLLATE for case-insensitive matching (supports case-sensitive collations)
         if not key_columns:
             columns_query = """
             SELECT c.name
             FROM sys.columns c
             INNER JOIN sys.tables t ON c.object_id = t.object_id
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name COLLATE SQL_Latin1_General_CI_AS = %s
-              AND t.name COLLATE SQL_Latin1_General_CI_AS = %s
+            WHERE s.name = %s AND t.name = %s
             ORDER BY c.column_id
             """
             columns = self.mssql_hook.get_records(columns_query, parameters=[source_schema, source_table])

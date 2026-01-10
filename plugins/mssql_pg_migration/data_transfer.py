@@ -1679,14 +1679,12 @@ class DataTransfer:
         Returns:
             List of column names
         """
-        # Use COLLATE for case-insensitive matching (supports case-sensitive collations)
         query = """
         SELECT c.name
         FROM sys.columns c
         INNER JOIN sys.tables t ON c.object_id = t.object_id
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
-          AND t.name COLLATE SQL_Latin1_General_CI_AS = ?
+        WHERE s.name = ? AND t.name = ?
         ORDER BY c.column_id
         """
         columns = self.mssql_hook.get_records(query, parameters=[schema_name, table_name])
@@ -1710,7 +1708,6 @@ class DataTransfer:
             List of PK column names in ordinal order, or fallback to single column
         """
         # Try to get actual primary key from database
-        # Use COLLATE for case-insensitive matching (supports case-sensitive collations)
         query = """
         SELECT c.name
         FROM sys.index_columns ic
@@ -1718,9 +1715,7 @@ class DataTransfer:
         INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
         INNER JOIN sys.tables t ON i.object_id = t.object_id
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
-          AND t.name COLLATE SQL_Latin1_General_CI_AS = ?
-          AND i.is_primary_key = 1
+        WHERE s.name = ? AND t.name = ? AND i.is_primary_key = 1
         ORDER BY ic.key_ordinal
         """
         try:

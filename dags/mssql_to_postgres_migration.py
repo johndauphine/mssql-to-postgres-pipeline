@@ -344,21 +344,17 @@ def mssql_to_postgres_migration():
 
             try:
                 # Get row count from SQL Server
-                # Use COLLATE for case-insensitive matching (supports case-sensitive collations)
                 count_query = f"""
                     SELECT SUM(p.rows) as row_count
                     FROM sys.partitions p
                     INNER JOIN sys.tables t ON p.object_id = t.object_id
                     INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                    WHERE s.name COLLATE SQL_Latin1_General_CI_AS = ?
-                      AND t.name COLLATE SQL_Latin1_General_CI_AS = ?
-                      AND p.index_id IN (0, 1)
+                    WHERE s.name = ? AND t.name = ? AND p.index_id IN (0, 1)
                 """
                 result = mssql_hook.get_first(count_query, parameters=[source_schema, table_name])
                 row_count = result[0] if result and result[0] else 0
 
                 # Get PK column info for partitioning
-                # Use COLLATE for case-insensitive matching (supports case-sensitive collations)
                 pk_query = """
                     SELECT c.name, t.name as data_type
                     FROM sys.indexes i
@@ -367,9 +363,7 @@ def mssql_to_postgres_migration():
                     JOIN sys.types t ON c.user_type_id = t.user_type_id
                     JOIN sys.tables tbl ON i.object_id = tbl.object_id
                     JOIN sys.schemas s ON tbl.schema_id = s.schema_id
-                    WHERE i.is_primary_key = 1
-                      AND s.name COLLATE SQL_Latin1_General_CI_AS = ?
-                      AND tbl.name COLLATE SQL_Latin1_General_CI_AS = ?
+                    WHERE i.is_primary_key = 1 AND s.name = ? AND tbl.name = ?
                     ORDER BY ic.key_ordinal
                 """
                 pk_result = mssql_hook.get_records(pk_query, parameters=[source_schema, table_name])
