@@ -317,6 +317,7 @@ def mssql_to_postgres_migration():
 
                 discovered_tables.append({
                     "table_name": found_table,
+                    "source_table": table_name,  # Original case for SQL Server queries
                     "source_schema": source_schema,
                     "target_schema": target_schema,
                     "columns": table_columns.get(found_table, []),
@@ -341,7 +342,8 @@ def mssql_to_postgres_migration():
         tables_with_counts = []
 
         for table_info in tables:
-            table_name = table_info["table_name"]
+            # Use source_table for SQL Server queries (preserves original case for case-sensitive collations)
+            source_table = table_info.get("source_table", table_info["table_name"])
             source_schema = table_info["source_schema"]
 
             try:
@@ -353,7 +355,7 @@ def mssql_to_postgres_migration():
                     INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
                     WHERE s.name = ? AND t.name = ? AND p.index_id IN (0, 1)
                 """
-                result = mssql_hook.get_first(count_query, parameters=[source_schema, table_name])
+                result = mssql_hook.get_first(count_query, parameters=[source_schema, source_table])
                 row_count = result[0] if result and result[0] else 0
 
                 # Get PK column info for partitioning
@@ -368,7 +370,7 @@ def mssql_to_postgres_migration():
                     WHERE i.is_primary_key = 1 AND s.name = ? AND tbl.name = ?
                     ORDER BY ic.key_ordinal
                 """
-                pk_result = mssql_hook.get_records(pk_query, parameters=[source_schema, table_name])
+                pk_result = mssql_hook.get_records(pk_query, parameters=[source_schema, source_table])
                 pk_columns_info = {
                     'columns': [{'name': r[0], 'data_type': r[1]} for r in pk_result] if pk_result else [],
                     'is_composite': len(pk_result) > 1 if pk_result else False,
@@ -380,10 +382,10 @@ def mssql_to_postgres_migration():
                     "pk_columns_info": pk_columns_info,
                 })
 
-                logger.info(f"  {source_schema}.{table_name}: {row_count:,} rows")
+                logger.info(f"  {source_schema}.{source_table}: {row_count:,} rows")
 
             except Exception as e:
-                logger.warning(f"Could not get row count for {source_schema}.{table_name}: {e}")
+                logger.warning(f"Could not get row count for {source_schema}.{source_table}: {e}")
                 tables_with_counts.append({
                     **table_info,
                     "row_count": 0,
@@ -432,7 +434,8 @@ def mssql_to_postgres_migration():
         state_mgr = IncrementalStateManager(postgres_conn_id=target_conn_id)
 
         for table_info in tables:
-            table_name = table_info["table_name"]
+            table_name = table_info["table_name"]  # PostgreSQL name (for state tracking)
+            source_table = table_info.get("source_table", table_name)  # Original case for SQL Server
             source_schema = table_info["source_schema"]
             target_schema = table_info.get("target_schema", "unknown")
             row_count = table_info.get("row_count", 0)
@@ -575,10 +578,10 @@ def mssql_to_postgres_migration():
             partition_count = get_partition_count(row_count)
 
             try:
-                safe_table = validate_sql_identifier(table_name, "table")
+                safe_table = validate_sql_identifier(source_table, "table")
                 safe_schema = validate_sql_identifier(source_schema, "schema")
             except ValueError as e:
-                logger.warning(f"  {source_schema}.{table_name}: {e}, using regular transfer")
+                logger.warning(f"  {source_schema}.{source_table}: {e}, using regular transfer")
                 regular_tables.append({**table_info_with_state, "truncate_first": True})
                 continue
 
@@ -626,7 +629,7 @@ def mssql_to_postgres_migration():
                 try:
                     boundaries = mssql_hook.get_records(boundaries_query)
                 except Exception as e:
-                    logger.warning(f"  {source_schema}.{table_name}: NTILE failed ({e}), using regular transfer")
+                    logger.warning(f"  {source_schema}.{source_table}: NTILE failed ({e}), using regular transfer")
                     regular_tables.append({**table_info_with_state, "truncate_first": True})
                     continue
 

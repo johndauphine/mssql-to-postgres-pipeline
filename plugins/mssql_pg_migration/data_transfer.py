@@ -2376,9 +2376,11 @@ def transfer_table_data(
     transfer = DataTransfer(mssql_conn_id, postgres_conn_id)
 
     source_schema = table_info.get('source_schema', table_info.get('schema_name', 'dbo'))
-    source_table = table_info['table_name']
+    # Use source_table for SQL Server queries (preserves original case for case-sensitive collations)
+    source_table = table_info.get('source_table', table_info['table_name'])
     target_schema = table_info.get('target_schema', 'public')
-    target_table = table_info.get('target_table', source_table)
+    # Use table_name for PostgreSQL target (sanitized/lowercase)
+    target_table = table_info.get('target_table', table_info['table_name'])
 
     return transfer.transfer_table(
         source_schema=source_schema,
@@ -2387,7 +2389,9 @@ def transfer_table_data(
         target_table=target_table,
         chunk_size=chunk_size,
         truncate_target=truncate,
-        columns=table_info.get('columns'),
+        # Don't pass columns - let transfer_table fetch from SQL Server with original case
+        # This supports case-sensitive collations where column names must match exactly
+        columns=None,
         where_clause=where_clause,
         use_row_number=table_info.get('use_row_number', False),
         order_by_columns=table_info.get('order_by_columns'),
