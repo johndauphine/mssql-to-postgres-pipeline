@@ -11,6 +11,7 @@ The _migration schema has restricted access for security.
 """
 
 from typing import Dict, Any, Optional, List
+from datetime import datetime
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 import json
 import logging
@@ -59,6 +60,9 @@ CREATE TABLE IF NOT EXISTS _migration._migration_state (
     rows_inserted BIGINT DEFAULT 0,
     rows_updated BIGINT DEFAULT 0,
     rows_unchanged BIGINT DEFAULT 0,
+
+    -- Date-based incremental tracking
+    last_sync_timestamp TIMESTAMP WITH TIME ZONE,  -- For date-based incremental loading
 
     -- Resumability
     last_pk_synced JSONB,
@@ -110,6 +114,14 @@ BEGIN
         WHERE table_schema = '_migration' AND table_name = '_migration_state' AND column_name = 'partition_info'
     ) THEN
         ALTER TABLE _migration._migration_state ADD COLUMN partition_info JSONB;
+    END IF;
+
+    -- Add last_sync_timestamp column if not exists (for date-based incremental loading)
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = '_migration' AND table_name = '_migration_state' AND column_name = 'last_sync_timestamp'
+    ) THEN
+        ALTER TABLE _migration._migration_state ADD COLUMN last_sync_timestamp TIMESTAMP WITH TIME ZONE;
     END IF;
 END;
 $$;
@@ -614,6 +626,117 @@ class IncrementalStateManager:
         except Exception as e:
             logger.warning(f"Error getting last sync info: {e}")
             return None
+        finally:
+            if conn:
+                conn.close()
+
+    # =========================================================================
+    # Date-Based Incremental Loading Methods
+    # =========================================================================
+
+    def get_last_sync_timestamp(
+        self,
+        table_name: str,
+        source_schema: str,
+        target_schema: str,
+    ) -> Optional[datetime]:
+        """
+        Get the last successful sync timestamp for date-based incremental loading.
+
+        Returns None if:
+        - No state record found for this table
+        - Last sync failed (status != 'completed')
+        - Timestamp is NULL (first sync or never recorded)
+
+        Args:
+            table_name: Name of the table
+            source_schema: Source schema name
+            target_schema: Target schema name
+
+        Returns:
+            datetime (UTC) of last successful sync, or None
+        """
+        conn = None
+        try:
+            conn = self._hook.get_conn()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT last_sync_timestamp, sync_status
+                    FROM _migration._migration_state
+                    WHERE table_name = %s
+                      AND source_schema = %s
+                      AND target_schema = %s
+                    """,
+                    (table_name, source_schema, target_schema)
+                )
+                row = cursor.fetchone()
+
+                if not row:
+                    logger.debug(
+                        f"No state record found for {source_schema}.{table_name}, "
+                        f"date-based incremental will do full load"
+                    )
+                    return None
+
+                timestamp, status = row
+
+                # Only return timestamp if last sync was successful
+                if status != 'completed':
+                    logger.debug(
+                        f"Last sync for {source_schema}.{table_name} was not completed "
+                        f"(status={status}), date-based incremental will do full load"
+                    )
+                    return None
+
+                if timestamp is None:
+                    logger.debug(
+                        f"No sync timestamp recorded for {source_schema}.{table_name}, "
+                        f"date-based incremental will do full load"
+                    )
+                    return None
+
+                return timestamp
+        except Exception as e:
+            logger.warning(f"Error getting last sync timestamp: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def update_sync_timestamp(
+        self,
+        sync_id: int,
+        sync_timestamp: datetime,
+    ) -> None:
+        """
+        Update the sync timestamp for a completed sync.
+
+        This should be called after a successful sync to record when the sync
+        started (for date-based incremental filtering on next run).
+
+        Args:
+            sync_id: State record ID
+            sync_timestamp: UTC timestamp of when the sync started
+        """
+        conn = None
+        try:
+            conn = self._hook.get_conn()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE _migration._migration_state SET
+                        last_sync_timestamp = %s
+                    WHERE id = %s
+                    """,
+                    (sync_timestamp, sync_id)
+                )
+            conn.commit()
+            logger.debug(f"Updated sync timestamp for sync_id={sync_id}: {sync_timestamp}")
+        except Exception as e:
+            logger.warning(f"Error updating sync timestamp: {e}")
+            if conn:
+                conn.rollback()
         finally:
             if conn:
                 conn.close()

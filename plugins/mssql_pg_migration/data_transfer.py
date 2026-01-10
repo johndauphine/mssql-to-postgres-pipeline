@@ -168,6 +168,88 @@ def get_table_row_width(columns: List[Dict[str, Any]]) -> int:
 
 
 # =============================================================================
+# DATE-BASED INCREMENTAL UTILITIES
+# =============================================================================
+
+# Valid SQL Server temporal types for date-based incremental filtering
+VALID_TEMPORAL_TYPES = frozenset([
+    'datetime', 'datetime2', 'smalldatetime', 'date', 'datetimeoffset'
+])
+
+
+def get_date_column_info(
+    mssql_conn_id: str,
+    source_schema: str,
+    table_name: str,
+    date_column_name: str,
+) -> Optional[Dict[str, str]]:
+    """
+    Check if table has a date column and validate it's a temporal type.
+
+    Uses parameterized queries for SQL injection prevention.
+    Performs case-sensitive exact match on column name.
+
+    Args:
+        mssql_conn_id: SQL Server Airflow connection ID
+        source_schema: Source schema name
+        table_name: Source table name
+        date_column_name: Column name to validate (case-sensitive match)
+
+    Returns:
+        Dict with 'column_name' and 'data_type' if valid temporal column found
+        None if column doesn't exist or isn't a temporal type
+    """
+    helper = OdbcConnectionHelper(mssql_conn_id)
+
+    # Use parameterized query to prevent SQL injection
+    # Case-sensitive match using COLLATE for exact column name match
+    query = """
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = ?
+          AND TABLE_NAME = ?
+          AND COLUMN_NAME = ? COLLATE Latin1_General_CS_AS
+    """
+
+    try:
+        result = helper.get_first(query, [source_schema, table_name, date_column_name])
+
+        if not result:
+            logger.debug(
+                f"Date column '{date_column_name}' not found in {source_schema}.{table_name}"
+            )
+            return None
+
+        column_name, data_type = result
+
+        # Validate that it's a temporal type
+        if data_type.lower() not in VALID_TEMPORAL_TYPES:
+            logger.warning(
+                f"Column '{column_name}' in {source_schema}.{table_name} is type "
+                f"'{data_type}', not a valid temporal type. "
+                f"Valid types: {', '.join(sorted(VALID_TEMPORAL_TYPES))}"
+            )
+            return None
+
+        logger.debug(
+            f"Found valid date column '{column_name}' ({data_type}) "
+            f"in {source_schema}.{table_name}"
+        )
+
+        return {
+            'column_name': column_name,  # Use the name from DB (verified)
+            'data_type': data_type,
+        }
+
+    except Exception as e:
+        logger.warning(
+            f"Error checking date column '{date_column_name}' "
+            f"in {source_schema}.{table_name}: {e}"
+        )
+        return None
+
+
+# =============================================================================
 # PARALLEL PROCESSING UTILITIES
 # =============================================================================
 
@@ -1916,9 +1998,26 @@ class DataTransfer:
         limit: int,
         pk_index: int,
         where_clause: Optional[str] = None,
+        where_params: Optional[List[Any]] = None,
     ) -> Tuple[List[Tuple[Any, ...]], Optional[Any]]:
-        """Read rows using keyset pagination with deterministic ordering."""
+        """
+        Read rows using keyset pagination with deterministic ordering.
 
+        Args:
+            conn: MSSQL connection
+            schema_name: Source schema
+            table_name: Source table
+            columns: List of column names to select
+            pk_column: Primary key column for pagination
+            last_key_value: Last PK value processed (for pagination)
+            limit: Maximum rows to fetch
+            pk_index: Index of PK column in columns list
+            where_clause: Optional WHERE clause with ? placeholders
+            where_params: Optional list of parameters for where_clause placeholders
+
+        Returns:
+            Tuple of (rows, last_key_value)
+        """
         # P0.4: Conditionally use NOLOCK based on strict consistency mode
         table_hint = "" if _is_strict_consistency_mode() else " WITH (NOLOCK)"
 
@@ -1941,10 +2040,15 @@ class DataTransfer:
         if last_key_value is not None:
             where_conditions.append(f"[{safe_pk}] > ?")
 
+        # Build params tuple: where_params first, then pk pagination param
+        params_list = list(where_params) if where_params else []
+        if last_key_value is not None:
+            params_list.append(last_key_value)
+
         if where_conditions:
             where_part = "WHERE " + " AND ".join(where_conditions)
             query = f"{base_query}\n{where_part}\n{order_by}"
-            params = (last_key_value,) if last_key_value is not None else None
+            params = tuple(params_list) if params_list else None
         else:
             query = f"{base_query}\n{order_by}"
             params = None
@@ -2647,6 +2751,8 @@ def transfer_incremental_staging(
     table_info: Dict[str, Any],
     chunk_size: int = 100000,
     resume_from_pk: Any = None,
+    date_column: Optional[str] = None,
+    last_sync_timestamp: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
     Transfer table data using staging table pattern for efficient incremental sync.
@@ -2660,12 +2766,19 @@ def transfer_incremental_staging(
     The IS DISTINCT FROM clause ensures only rows that actually changed
     are updated, eliminating the need for expensive hash comparisons.
 
+    When date_column and last_sync_timestamp are provided, only rows where:
+    - date_column > last_sync_timestamp, OR
+    - date_column IS NULL (to catch rows without timestamps)
+    are transferred. This enables efficient date-based incremental loading.
+
     Args:
         mssql_conn_id: SQL Server connection ID
         postgres_conn_id: PostgreSQL connection ID
         table_info: Table information including schema, columns, and pk_columns
         chunk_size: Rows per chunk for COPY to staging
         resume_from_pk: Optional PK value to resume from (only sync rows with PK > this value)
+        date_column: Optional date column name for incremental filtering (must be validated)
+        last_sync_timestamp: Optional timestamp to filter rows modified since
 
     Returns:
         Transfer result dictionary with rows_inserted, rows_updated, etc.
@@ -2742,6 +2855,21 @@ def transfer_incremental_staging(
             pk_column = pk_columns[0] if pk_columns else columns[0]
             pk_index = columns.index(pk_column) if pk_column in columns else 0
 
+            # Build date filter WHERE clause if date-based incremental is enabled
+            date_where_clause = None
+            date_where_params = None
+            if date_column and last_sync_timestamp:
+                # Escape column name to prevent SQL injection
+                safe_date_col = date_column.replace(']', ']]')
+                # Include rows where date > timestamp OR date IS NULL
+                # NULL dates are always included to catch rows without timestamps
+                date_where_clause = f"([{safe_date_col}] > ? OR [{safe_date_col}] IS NULL)"
+                date_where_params = [last_sync_timestamp]
+                logger.info(
+                    f"Date-based incremental sync: filtering rows where "
+                    f"{date_column} > {last_sync_timestamp} OR {date_column} IS NULL"
+                )
+
             # Check if binary COPY is enabled
             use_binary = transfer._use_binary_copy
             column_types = None
@@ -2756,17 +2884,33 @@ def transfer_incremental_staging(
                 # last_key_value already initialized for resume support
                 chunks_processed = 0
 
-                if resume_from_pk is not None:
-                    logger.info(f"Resuming from PK > {resume_from_pk}")
-                    # Recalculate remaining rows for progress tracking
+                # Update source count for date filter and/or resume
+                if date_where_clause or resume_from_pk is not None:
+                    # Build count query with applicable filters
+                    safe_schema = source_schema.replace(']', ']]')
+                    safe_table = source_table.replace(']', ']]')
+                    safe_pk = pk_column.replace(']', ']]')
+
+                    count_conditions = []
+                    count_params = []
+
+                    if date_where_clause:
+                        count_conditions.append(date_where_clause)
+                        count_params.extend(date_where_params)
+
+                    if resume_from_pk is not None:
+                        count_conditions.append(f"[{safe_pk}] > ?")
+                        count_params.append(resume_from_pk)
+                        logger.info(f"Resuming from PK > {resume_from_pk}")
+
                     remaining_query = f"""
-                        SELECT COUNT(*) FROM [{source_schema}].[{source_table}]
-                        WHERE [{pk_column}] > ?
+                        SELECT COUNT(*) FROM [{safe_schema}].[{safe_table}]
+                        WHERE {' AND '.join(count_conditions)}
                     """
                     with mssql_conn.cursor() as cursor:
-                        cursor.execute(remaining_query, (resume_from_pk,))
+                        cursor.execute(remaining_query, tuple(count_params))
                         source_count = cursor.fetchone()[0]
-                    logger.info(f"Remaining rows to sync: {source_count:,}")
+                    logger.info(f"Rows to sync (with filters): {source_count:,}")
 
                 while rows_copied < source_count:
                     chunk_start_time = time.time()
@@ -2780,6 +2924,8 @@ def transfer_incremental_staging(
                         last_key_value,
                         chunk_size,
                         pk_index,
+                        where_clause=date_where_clause,
+                        where_params=date_where_params,
                     )
 
                     if not rows:
@@ -2890,12 +3036,19 @@ def transfer_incremental_staging_partitioned(
     partition_id: int,
     chunk_size: int = 100000,
     resume_from_pk: Any = None,
+    date_column: Optional[str] = None,
+    last_sync_timestamp: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
     Transfer a partition of table data using staging table pattern.
 
     This is used for parallel processing of large tables. Each partition
     handles a range of primary keys independently.
+
+    When date_column and last_sync_timestamp are provided, only rows where:
+    - date_column > last_sync_timestamp, OR
+    - date_column IS NULL (to catch rows without timestamps)
+    within the partition's PK range are transferred.
 
     Args:
         mssql_conn_id: SQL Server connection ID
@@ -2906,6 +3059,8 @@ def transfer_incremental_staging_partitioned(
         partition_id: Partition identifier for logging
         chunk_size: Rows per chunk for COPY to staging
         resume_from_pk: Resume from this PK value (rows with PK > resume_from_pk)
+        date_column: Optional date column name for incremental filtering (must be validated)
+        last_sync_timestamp: Optional timestamp to filter rows modified since
 
     Returns:
         Transfer result dictionary with rows_inserted, rows_updated, last_pk_synced, etc.
@@ -2991,7 +3146,23 @@ def transfer_incremental_staging_partitioned(
             # Step 2: Copy partition data to staging
             # Build WHERE clause for partition - pk_column is escaped, values are validated integers
             safe_pk = pk_column.replace(']', ']]')
-            where_clause = f"[{safe_pk}] >= {int(pk_start)} AND [{safe_pk}] <= {int(pk_end)}"
+
+            # Build WHERE clause with partition bounds and optional date filter
+            where_conditions = [f"[{safe_pk}] >= {int(pk_start)} AND [{safe_pk}] <= {int(pk_end)}"]
+            where_params = []
+
+            # Add date filter if date-based incremental is enabled
+            if date_column and last_sync_timestamp:
+                safe_date_col = date_column.replace(']', ']]')
+                # Include rows where date > timestamp OR date IS NULL
+                where_conditions.append(f"([{safe_date_col}] > ? OR [{safe_date_col}] IS NULL)")
+                where_params.append(last_sync_timestamp)
+                logger.info(
+                    f"Partition {partition_id}: Date-based filter: "
+                    f"{date_column} > {last_sync_timestamp} OR {date_column} IS NULL"
+                )
+
+            where_clause = " AND ".join(where_conditions)
 
             # Check if binary COPY is enabled
             use_binary = transfer._use_binary_copy
@@ -3022,6 +3193,7 @@ def transfer_incremental_staging_partitioned(
                         chunk_size,
                         pk_index,
                         where_clause=where_clause,
+                        where_params=where_params if where_params else None,
                     )
 
                     if not rows:

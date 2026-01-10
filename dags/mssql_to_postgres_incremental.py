@@ -23,7 +23,8 @@ State is tracked in _migration._migration_state table in target database.
 from airflow.decorators import dag, task
 from airflow.models.param import Param
 from pendulum import datetime
-from datetime import timedelta
+from datetime import timedelta, timezone
+from datetime import datetime as dt
 from typing import List, Dict, Any
 import logging
 import os
@@ -37,6 +38,9 @@ DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '10000
 # Partitioning settings for large tables
 PARTITION_THRESHOLD = int(os.environ.get('PARTITION_THRESHOLD', '1000000'))  # Tables > 1M rows get partitioned
 MAX_PARTITIONS_PER_TABLE = int(os.environ.get('MAX_PARTITIONS_PER_TABLE', '6'))
+# Date-based incremental: if set, only sync rows where this column > last_sync_timestamp
+# Column must exist in source table and be a datetime/datetime2/smalldatetime/date/datetimeoffset type
+DATE_UPDATED_FIELD = os.environ.get('DATE_UPDATED_FIELD', '')
 
 # Import migration modules
 from mssql_pg_migration import schema_extractor
@@ -44,6 +48,7 @@ from mssql_pg_migration.incremental_state import IncrementalStateManager
 from mssql_pg_migration.data_transfer import (
     transfer_incremental_staging,
     transfer_incremental_staging_partitioned,
+    get_date_column_info,
 )
 from mssql_pg_migration.table_config import (
     expand_include_tables_param,
@@ -98,6 +103,13 @@ logger = logging.getLogger(__name__)
             maximum=500000,
             description="Rows per batch for COPY to staging table"
         ),
+        "date_updated_field": Param(
+            default=DATE_UPDATED_FIELD,
+            type="string",
+            description="Column name for date-based incremental sync (e.g., 'updated_at'). "
+                        "If set and column exists, only rows where column > last_sync_timestamp are synced. "
+                        "Column must be a datetime type. Tables without this column fall back to full sync."
+        ),
     },
     tags=["migration", "mssql", "postgres", "etl", "incremental"],
 )
@@ -141,6 +153,7 @@ def mssql_to_postgres_incremental():
         """
         params = context["params"]
         source_conn_id = params["source_conn_id"]
+        date_updated_field = params.get("date_updated_field", "")
 
         # Priority: config file > param/env var
         # Try loading from database-specific config file first
@@ -205,6 +218,29 @@ def mssql_to_postgres_incremental():
                     )
                     continue
 
+                # Check for date column if date_updated_field is configured
+                has_date_column = False
+                date_column = None
+                if date_updated_field:
+                    date_col_info = get_date_column_info(
+                        mssql_conn_id=source_conn_id,
+                        source_schema=source_schema,
+                        table_name=table_name,
+                        date_column_name=date_updated_field,
+                    )
+                    if date_col_info:
+                        has_date_column = True
+                        date_column = date_col_info['column_name']  # Use name from DB
+                        logger.info(
+                            f"{source_schema}.{table_name}: date column '{date_column}' found "
+                            f"(type: {date_col_info['data_type']})"
+                        )
+                    else:
+                        logger.warning(
+                            f"{source_schema}.{table_name}: date column '{date_updated_field}' "
+                            f"not found or not a valid datetime type, falling back to full sync"
+                        )
+
                 # Build table info for sync
                 table_info = {
                     "table_name": table_name,
@@ -214,6 +250,8 @@ def mssql_to_postgres_incremental():
                     "row_count": table.get("row_count", 0),
                     "columns": [col["column_name"] for col in table["columns"]],
                     "pk_columns": [col["name"] for col in pk_columns.get("columns", [])],
+                    "has_date_column": has_date_column,
+                    "date_column": date_column,
                 }
                 syncable_tables.append(table_info)
 
@@ -572,11 +610,35 @@ def mssql_to_postgres_incremental():
             f"Starting incremental sync for {source_schema}.{table_name} -> {target_schema}.{table_name}"
         )
 
+        # Capture sync_start_time BEFORE any queries (for date-based incremental)
+        sync_start_time = dt.now(timezone.utc)
+
         # For non-partitioned tables, we need the full table_info
         table_info = task_info
 
         # Initialize state tracking
         state_manager = IncrementalStateManager(target_conn_id)
+
+        # Date-based incremental: check if table has date column
+        has_date_column = task_info.get("has_date_column", False)
+        date_column = task_info.get("date_column")
+        last_sync_timestamp = None
+
+        if has_date_column and date_column:
+            # Try to get last_sync_timestamp from state
+            last_sync_timestamp = state_manager.get_last_sync_timestamp(
+                table_name=table_name,
+                source_schema=source_schema,
+                target_schema=target_schema,
+            )
+            if last_sync_timestamp:
+                logger.info(
+                    f"Date-based incremental: syncing rows where {date_column} > {last_sync_timestamp}"
+                )
+            else:
+                logger.info(
+                    f"Date-based incremental: no previous sync timestamp, doing full sync"
+                )
 
         # Check for resume point
         resume_point = state_manager.get_resume_point(
@@ -626,6 +688,8 @@ def mssql_to_postgres_incremental():
                 table_info=table_info,
                 chunk_size=batch_size,
                 resume_from_pk=resume_pk,
+                date_column=date_column if has_date_column else None,
+                last_sync_timestamp=last_sync_timestamp,
             )
 
             rows_inserted = transfer_result["rows_inserted"]
@@ -651,6 +715,13 @@ def mssql_to_postgres_incremental():
                     rows_updated=rows_updated + initial_updated,
                     rows_unchanged=rows_unchanged + initial_unchanged,
                 )
+                # Update sync timestamp for date-based incremental
+                # This records when this sync started, so next sync can use it
+                if has_date_column:
+                    state_manager.update_sync_timestamp(sync_id, sync_start_time)
+                    logger.info(
+                        f"Updated sync timestamp to {sync_start_time} for next date-based sync"
+                    )
             else:
                 # Save checkpoint even on failure for partial progress
                 if last_pk_synced is not None:
