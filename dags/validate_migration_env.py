@@ -1,30 +1,25 @@
 """
-Migration Validation DAG using Environment Variables
+Migration Validation DAG
 
 This DAG validates SQL Server to PostgreSQL migration by comparing row counts.
 Tables must be explicitly specified in 'schema.table' format in include_tables.
-Target PostgreSQL schema is derived as: {sourcedb}__{sourceschema} (lowercase)
+Target PostgreSQL schema is derived as: {instance}__{sourcedb}__{sourceschema} (lowercase)
 
-Uses environment variables for connection details to avoid hardcoding and
-to work around Airflow 3 SDK connection resolution issues.
-
-Set these environment variables before running:
-- MSSQL_HOST, MSSQL_PORT, MSSQL_DATABASE, MSSQL_USERNAME, MSSQL_PASSWORD
-- POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DATABASE, POSTGRES_USERNAME, POSTGRES_PASSWORD
-
-Or use the default test values if not set.
+Uses the same Airflow connections as the migration DAGs:
+- source_conn_id: Airflow connection ID for SQL Server (default: mssql_source)
+- target_conn_id: Airflow connection ID for PostgreSQL (default: postgres_target)
 """
 
 from airflow.decorators import dag, task
 from airflow.models.param import Param
+from airflow.hooks.base import BaseHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from pendulum import datetime
 from datetime import timedelta
+from typing import Tuple
 import logging
-import os
-import pyodbc
-import psycopg2
-from psycopg2 import sql
 
+from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 from mssql_pg_migration.table_config import (
     expand_include_tables_param,
     validate_include_tables,
@@ -34,13 +29,43 @@ from mssql_pg_migration.table_config import (
     get_alias_for_hostname,
 )
 from mssql_pg_migration.type_mapping import sanitize_identifier
+from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
 
 
+def get_connection_info(conn_id: str) -> Tuple[str, str]:
+    """
+    Get database name and instance alias from Airflow connection.
+
+    Retrieves the connection once and extracts both values to avoid
+    duplicate BaseHook.get_connection() calls.
+
+    Args:
+        conn_id: Airflow connection ID
+
+    Returns:
+        Tuple of (database_name, instance_alias)
+    """
+    conn = BaseHook.get_connection(conn_id)
+
+    database = conn.schema
+    if not database:
+        raise ValueError(
+            f"Cannot extract database name from connection '{conn_id}'. "
+            f"Ensure the connection has a database/schema configured."
+        )
+
+    host = conn.host or ''
+    instance_alias = get_alias_for_hostname(host)
+
+    return database, instance_alias
+
+
 @dag(
+    dag_id="validate_migration_env",
     start_date=datetime(2025, 1, 1),
-    schedule=None,  # Run manually
+    schedule=None,  # Run manually or triggered by migration DAG
     catchup=False,
     max_active_runs=1,
     is_paused_upon_creation=False,
@@ -50,9 +75,6 @@ logger = logging.getLogger(__name__)
         "retries": 2,
     },
     params={
-        # Note: source_conn_id/target_conn_id are accepted for API compatibility when
-        # triggered by other DAGs, but this DAG uses environment variables for actual
-        # connections due to Airflow 3.0 SDK connection resolution issues.
         "source_conn_id": Param(default="mssql_source", type="string"),
         "target_conn_id": Param(default="postgres_target", type="string"),
         "include_tables": Param(
@@ -61,19 +83,21 @@ logger = logging.getLogger(__name__)
                         "Defaults from INCLUDE_TABLES env var."
         ),
     },
-    tags=["validation", "migration", "env-based"],
+    tags=["validation", "migration"],
 )
 def validate_migration_env():
     """
-    Validate migration using environment variables for connections.
+    Validate migration by comparing row counts between source and target.
     """
 
     @task
     def validate_tables(**context) -> str:
         """
-        Validate all tables using environment variable connections.
+        Validate all tables by comparing row counts.
         """
         params = context["params"]
+        source_conn_id = params.get("source_conn_id", "mssql_source")
+        target_conn_id = params.get("target_conn_id", "postgres_target")
 
         # Parse and expand include_tables parameter
         include_tables_raw = params.get("include_tables", [])
@@ -91,155 +115,114 @@ def validate_migration_env():
 
         logger.info(f"Validating {len(include_tables)} tables from schemas: {list(schema_tables.keys())}")
 
-        # Get connection details from environment - passwords are required
-        mssql_host = os.environ.get('MSSQL_HOST', 'mssql-server')
-        mssql_port = int(os.environ.get('MSSQL_PORT', '1433'))
-        mssql_database = os.environ.get('MSSQL_DATABASE', 'StackOverflow2010')
-        mssql_user = os.environ.get('MSSQL_USERNAME', 'sa')
-        mssql_password = os.environ.get('MSSQL_PASSWORD')
+        # Get source database and instance name from connection (single lookup)
+        source_db, instance_name = get_connection_info(source_conn_id)
 
-        # Require password environment variables for security
-        if not mssql_password:
-            raise ValueError("MSSQL_PASSWORD environment variable is required")
+        # Create connection helpers using Airflow connections
+        mssql_helper = OdbcConnectionHelper(source_conn_id)
+        pg_hook = PostgresHook(postgres_conn_id=target_conn_id)
 
-        # Build ODBC connection string
-        server = f"{mssql_host},{mssql_port}" if mssql_port != 1433 else mssql_host
-        mssql_conn_str = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={server};"
-            f"DATABASE={mssql_database};"
-            f"UID={mssql_user};"
-            f"PWD={mssql_password};"
-            f"TrustServerCertificate=yes;"
-        )
-
-        postgres_password = os.environ.get('POSTGRES_PASSWORD')
-        if not postgres_password:
-            raise ValueError("POSTGRES_PASSWORD environment variable is required")
-
-        postgres_config = {
-            'host': os.environ.get('POSTGRES_HOST', 'postgres-target'),
-            'port': int(os.environ.get('POSTGRES_PORT', '5432')),
-            'database': os.environ.get('POSTGRES_DATABASE', 'stackoverflow'),
-            'user': os.environ.get('POSTGRES_USERNAME', 'postgres'),
-            'password': postgres_password,
-        }
-
-        # Derive target schema from source instance and database name
-        # Using env vars directly since this DAG doesn't use Airflow connections
-        source_db = mssql_database
-        instance_name = get_alias_for_hostname(mssql_host)
-
-        # Connect to databases
-        logger.info("Connecting to databases...")
-
-        try:
-            mssql_conn = pyodbc.connect(mssql_conn_str)
-            mssql_cursor = mssql_conn.cursor()
-            logger.info(f"Connected to SQL Server: {mssql_host}/{mssql_database}")
-        except Exception as e:
-            logger.error(f"SQL Server connection failed: {e}")
-            return f"SQL Server connection failed: {e}"
-
-        try:
-            postgres_conn = psycopg2.connect(**postgres_config)
-            postgres_cursor = postgres_conn.cursor()
-            logger.info(f"Connected to PostgreSQL: {postgres_config['host']}")
-        except Exception as e:
-            logger.error(f"PostgreSQL connection failed: {e}")
-            mssql_conn.close()
-            return f"PostgreSQL connection failed: {e}"
+        logger.info(f"Using connections: source={source_conn_id}, target={target_conn_id}")
+        logger.info(f"Source database: {source_db}, instance: {instance_name}")
 
         # Validate tables
-        results = []
         passed = 0
         failed = 0
         missing = 0
-        total = 0
+        total_requested = len(include_tables)
 
-        for source_schema, tables in schema_tables.items():
-            target_schema = derive_target_schema(source_db, source_schema, instance_name)
-            logger.info(f"Validating {len(tables)} tables: {source_schema} -> {target_schema}")
+        mssql_conn = None
+        pg_conn = None
 
-            for table_name in sorted(tables):
-                total += 1
+        try:
+            # Get connections
+            mssql_conn = mssql_helper.get_conn()
+            mssql_cursor = mssql_conn.cursor()
+            pg_conn = pg_hook.get_conn()
+            pg_cursor = pg_conn.cursor()
 
-                # Get source count
-                try:
-                    source_query = """
-                        SELECT COALESCE(SUM(p.rows), 0)
-                        FROM sys.tables t
-                        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                        LEFT JOIN sys.partitions p ON p.object_id = t.object_id
-                            AND p.index_id IN (0, 1)
-                        WHERE s.name = ? AND t.name = ?
-                        GROUP BY t.name
-                    """
-                    mssql_cursor.execute(source_query, (source_schema, table_name))
-                    result = mssql_cursor.fetchone()
-                    source_count = result[0] if result else 0
-                except Exception as e:
-                    logger.warning(f"Failed to count source table {source_schema}.{table_name}: {e}")
-                    source_count = None
-                    missing += 1
-                    continue
+            for source_schema, tables in schema_tables.items():
+                target_schema = derive_target_schema(source_db, source_schema, instance_name)
+                logger.info(f"Validating {len(tables)} tables: {source_schema} -> {target_schema}")
 
-                # Query target (use sanitized table name for PostgreSQL)
-                target_table_name = sanitize_identifier(table_name)
-                try:
-                    query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
-                        sql.Identifier(target_schema),
-                        sql.Identifier(target_table_name),
+                for table_name in sorted(tables):
+                    # Get source count using actual COUNT(*) for accuracy
+                    # Note: Using dynamic SQL with QUOTENAME for safe identifier handling
+                    try:
+                        source_query = """
+                            DECLARE @sql NVARCHAR(500);
+                            SET @sql = N'SELECT COUNT(*) FROM ' + QUOTENAME(?) + N'.' + QUOTENAME(?);
+                            EXEC sp_executesql @sql;
+                        """
+                        mssql_cursor.execute(source_query, (source_schema, table_name))
+                        result = mssql_cursor.fetchone()
+                        source_count = result[0] if result else 0
+                    except Exception as e:
+                        logger.warning(f"Failed to count source table {source_schema}.{table_name}: {e}")
+                        missing += 1
+                        continue
+
+                    # Query target (use sanitized table name for PostgreSQL)
+                    target_table_name = sanitize_identifier(table_name)
+                    try:
+                        query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                            sql.Identifier(target_schema),
+                            sql.Identifier(target_table_name),
+                        )
+                        pg_cursor.execute(query)
+                        target_count = pg_cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Failed to count target table {target_schema}.{target_table_name}: {e}")
+                        missing += 1
+                        continue
+
+                    # Both counts retrieved successfully - compare them
+                    if source_count == target_count:
+                        status = "PASS"
+                        passed += 1
+                    else:
+                        status = "FAIL"
+                        failed += 1
+
+                    diff = target_count - source_count
+                    logger.info(
+                        f"{status} {source_schema}.{table_name:25} -> {target_table_name:25} | "
+                        f"Source: {source_count:>10,} | "
+                        f"Target: {target_count:>10,} | "
+                        f"Diff: {diff:>+10,}"
                     )
-                    postgres_cursor.execute(query)
-                    target_count = postgres_cursor.fetchone()[0]
-                except Exception as e:
-                    logger.warning(f"Failed to count target table {target_schema}.{target_table_name}: {e}")
-                    target_count = None
-                    missing += 1
-                    continue
 
-                if source_count == target_count:
-                    status = "PASS"
-                    passed += 1
-                else:
-                    status = "FAIL"
-                    failed += 1
+        finally:
+            # Clean up connections
+            if mssql_conn:
+                mssql_helper.release_conn(mssql_conn)
+            if pg_conn:
+                pg_conn.close()
 
-                diff = target_count - source_count if target_count is not None else 0
-                logger.info(
-                    f"{status} {source_schema}.{table_name:25} -> {target_table_name:25} | "
-                    f"Source: {source_count:>10,} | "
-                    f"Target: {target_count:>10,} | "
-                    f"Diff: {diff:>+10,}"
-                )
-
-        # Clean up
-        mssql_conn.close()
-        postgres_conn.close()
-
-        # Summary
-        success_rate = (passed / total * 100) if total > 0 else 0
+        # Summary - calculate success rate based on validated tables only
+        validated = passed + failed
+        success_rate = (passed / validated * 100) if validated > 0 else 0
 
         summary = (
             f"\n{'='*60}\n"
             f"VALIDATION SUMMARY\n"
             f"{'='*60}\n"
-            f"Tables Checked: {total}\n"
+            f"Tables Requested: {total_requested}\n"
+            f"Tables Validated: {validated}\n"
             f"Passed: {passed}\n"
             f"Failed: {failed}\n"
-            f"Missing: {missing}\n"
-            f"Success Rate: {success_rate:.1f}%\n"
+            f"Missing/Errors: {missing}\n"
+            f"Success Rate: {success_rate:.1f}% (of validated)\n"
             f"{'='*60}"
         )
         logger.info(summary)
 
         if missing > 0:
-            return f"Incomplete: {missing} tables missing"
+            return f"Incomplete: {missing}/{total_requested} tables could not be validated"
         elif failed > 0:
-            return f"Failed: {failed} tables have mismatches"
+            return f"Failed: {failed}/{validated} tables have row count mismatches"
         else:
-            return f"Success: All {total} tables match"
+            return f"Success: All {validated} tables match"
 
     # Execute
     validate_tables()
