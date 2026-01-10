@@ -6,7 +6,8 @@ This module manages sync state for incremental loading, including:
 - Checkpoint tracking for resumability
 - Sync statistics and error recording
 
-State is stored in a PostgreSQL table (_migration_state) in the target database.
+State is stored in a PostgreSQL table (_migration._migration_state) in the target database.
+The _migration schema has restricted access for security.
 """
 
 from typing import Dict, Any, Optional, List
@@ -20,9 +21,27 @@ logger = logging.getLogger(__name__)
 # Keeps error_message column manageable while preserving useful context
 MAX_ERROR_MESSAGE_LENGTH = 4000
 
-# State table DDL
+# Schema name for migration metadata (isolated from public for security)
+MIGRATION_SCHEMA = '_migration'
+
+# Schema creation DDL with restricted access
+SCHEMA_DDL = """
+-- Create dedicated schema for migration metadata
+CREATE SCHEMA IF NOT EXISTS _migration;
+
+-- Revoke default public access for security
+REVOKE ALL ON SCHEMA _migration FROM PUBLIC;
+
+-- Grant minimal required permissions to current user (principle of least privilege)
+-- Only SELECT, INSERT, UPDATE needed for state management operations
+GRANT USAGE ON SCHEMA _migration TO CURRENT_USER;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA _migration TO CURRENT_USER;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA _migration TO CURRENT_USER;
+"""
+
+# State table DDL (in _migration schema)
 STATE_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS _migration_state (
+CREATE TABLE IF NOT EXISTS _migration._migration_state (
     id SERIAL PRIMARY KEY,
     table_name VARCHAR(255) NOT NULL,
     source_schema VARCHAR(128) NOT NULL,
@@ -62,7 +81,7 @@ CREATE TABLE IF NOT EXISTS _migration_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_migration_state_lookup
-    ON _migration_state(source_schema, table_name);
+    ON _migration._migration_state(source_schema, table_name);
 """
 
 # Schema migration for existing tables (adds new columns if they don't exist)
@@ -72,36 +91,36 @@ BEGIN
     -- Add migration_type column if not exists
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = '_migration_state' AND column_name = 'migration_type'
+        WHERE table_schema = '_migration' AND table_name = '_migration_state' AND column_name = 'migration_type'
     ) THEN
-        ALTER TABLE _migration_state ADD COLUMN migration_type VARCHAR(20) DEFAULT 'incremental';
+        ALTER TABLE _migration._migration_state ADD COLUMN migration_type VARCHAR(20) DEFAULT 'incremental';
     END IF;
 
     -- Add dag_run_id column if not exists
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = '_migration_state' AND column_name = 'dag_run_id'
+        WHERE table_schema = '_migration' AND table_name = '_migration_state' AND column_name = 'dag_run_id'
     ) THEN
-        ALTER TABLE _migration_state ADD COLUMN dag_run_id VARCHAR(255);
+        ALTER TABLE _migration._migration_state ADD COLUMN dag_run_id VARCHAR(255);
     END IF;
 
     -- Add partition_info column if not exists
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = '_migration_state' AND column_name = 'partition_info'
+        WHERE table_schema = '_migration' AND table_name = '_migration_state' AND column_name = 'partition_info'
     ) THEN
-        ALTER TABLE _migration_state ADD COLUMN partition_info JSONB;
+        ALTER TABLE _migration._migration_state ADD COLUMN partition_info JSONB;
     END IF;
 END;
 $$;
 
 -- Create index for status/type lookup if not exists
 CREATE INDEX IF NOT EXISTS idx_migration_state_status
-    ON _migration_state(sync_status, migration_type);
+    ON _migration._migration_state(sync_status, migration_type);
 """
 
 UPDATE_TIMESTAMP_FUNCTION = """
-CREATE OR REPLACE FUNCTION update_migration_state_timestamp()
+CREATE OR REPLACE FUNCTION _migration.update_migration_state_timestamp()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
@@ -114,13 +133,71 @@ UPDATE_TIMESTAMP_TRIGGER = """
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_migration_state_updated'
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trg_migration_state_updated'
+          AND tgrelid = '_migration._migration_state'::regclass
     ) THEN
         CREATE TRIGGER trg_migration_state_updated
-            BEFORE UPDATE ON _migration_state
+            BEFORE UPDATE ON _migration._migration_state
             FOR EACH ROW
-            EXECUTE FUNCTION update_migration_state_timestamp();
+            EXECUTE FUNCTION _migration.update_migration_state_timestamp();
     END IF;
+END;
+$$;
+"""
+
+# Migration DDL to move existing state from public schema (if exists)
+# Uses dynamic column detection for safe migration across schema versions
+MIGRATE_FROM_PUBLIC_DDL = """
+DO $$
+DECLARE
+    common_columns TEXT;
+    migrated_count INTEGER;
+BEGIN
+    -- Check if old table exists in public schema
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = '_migration_state'
+    ) THEN
+        -- Copy data from old table to new table (if new table is empty)
+        IF NOT EXISTS (SELECT 1 FROM _migration._migration_state LIMIT 1) THEN
+            -- Get columns that exist in BOTH tables (safe for schema version differences)
+            SELECT STRING_AGG(c1.column_name, ', ' ORDER BY c1.ordinal_position)
+            INTO common_columns
+            FROM information_schema.columns c1
+            INNER JOIN information_schema.columns c2
+                ON c1.column_name = c2.column_name
+            WHERE c1.table_schema = 'public' AND c1.table_name = '_migration_state'
+              AND c2.table_schema = '_migration' AND c2.table_name = '_migration_state';
+
+            -- Execute dynamic INSERT with only common columns
+            -- ON CONFLICT handles edge cases like partial prior migration
+            IF common_columns IS NOT NULL THEN
+                EXECUTE format(
+                    'INSERT INTO _migration._migration_state (%s) SELECT %s FROM public._migration_state ' ||
+                    'ON CONFLICT (table_name, source_schema, target_schema) DO NOTHING',
+                    common_columns, common_columns
+                );
+                GET DIAGNOSTICS migrated_count = ROW_COUNT;
+                RAISE NOTICE 'Migrated % rows from public._migration_state to _migration._migration_state', migrated_count;
+            END IF;
+        END IF;
+
+        -- Rename old table to indicate it's been migrated (don't drop to be safe)
+        ALTER TABLE public._migration_state RENAME TO _migration_state_old_backup;
+        RAISE NOTICE 'Renamed public._migration_state to public._migration_state_old_backup';
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    -- Check if old table still exists to help operators distinguish failure modes
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = '_migration_state'
+    ) THEN
+        RAISE WARNING 'Migration from public._migration_state failed; old table still exists. Manual intervention may be required. Error: %', SQLERRM;
+    ELSE
+        RAISE WARNING 'Migration from public._migration_state failed; old table no longer exists (may have been renamed). Error: %', SQLERRM;
+    END IF;
+    -- Continue anyway, don't fail the entire migration setup
 END;
 $$;
 """
@@ -149,16 +226,19 @@ class IncrementalStateManager:
 
     def ensure_state_table_exists(self) -> None:
         """
-        Create the _migration_state table if it doesn't exist.
+        Create the _migration._migration_state table if it doesn't exist.
 
         This should be called once at the start of a migration run.
         Safe to call multiple times (idempotent).
         Also migrates schema for existing tables (adds new columns).
+        Migrates data from public._migration_state if it exists.
         """
         conn = None
         try:
             conn = self._hook.get_conn()
             with conn.cursor() as cursor:
+                # Create _migration schema with restricted access
+                cursor.execute(SCHEMA_DDL)
                 # Create table and index
                 cursor.execute(STATE_TABLE_DDL)
                 # Migrate schema for existing tables (add new columns)
@@ -167,8 +247,10 @@ class IncrementalStateManager:
                 cursor.execute(UPDATE_TIMESTAMP_FUNCTION)
                 # Create trigger
                 cursor.execute(UPDATE_TIMESTAMP_TRIGGER)
+                # Migrate data from old public._migration_state if exists
+                cursor.execute(MIGRATE_FROM_PUBLIC_DDL)
             conn.commit()
-            logger.info("Ensured _migration_state table exists (with schema migration)")
+            logger.info("Ensured _migration._migration_state table exists (with schema migration)")
         except Exception as e:
             logger.error(f"Error creating state table: {e}")
             if conn:
@@ -213,7 +295,7 @@ class IncrementalStateManager:
                 # Upsert state record
                 cursor.execute(
                     """
-                    INSERT INTO _migration_state (
+                    INSERT INTO _migration._migration_state (
                         table_name, source_schema, target_schema,
                         sync_status, last_sync_start, source_row_count,
                         rows_inserted, rows_updated, rows_unchanged,
@@ -286,7 +368,7 @@ class IncrementalStateManager:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE _migration_state SET
+                    UPDATE _migration._migration_state SET
                         last_pk_synced = %s,
                         checkpoint_batch_num = %s,
                         rows_inserted = %s,
@@ -341,7 +423,7 @@ class IncrementalStateManager:
                     SELECT id, last_pk_synced, checkpoint_batch_num,
                            rows_inserted, rows_updated, rows_unchanged,
                            sync_status
-                    FROM _migration_state
+                    FROM _migration._migration_state
                     WHERE table_name = %s
                       AND source_schema = %s
                       AND target_schema = %s
@@ -408,7 +490,7 @@ class IncrementalStateManager:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE _migration_state SET
+                    UPDATE _migration._migration_state SET
                         sync_status = 'completed',
                         last_sync_end = CURRENT_TIMESTAMP,
                         sync_duration_seconds = EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_sync_start)),
@@ -449,7 +531,7 @@ class IncrementalStateManager:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE _migration_state SET
+                    UPDATE _migration._migration_state SET
                         sync_status = 'failed',
                         last_sync_end = CURRENT_TIMESTAMP,
                         sync_duration_seconds = EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_sync_start)),
@@ -497,7 +579,7 @@ class IncrementalStateManager:
                            sync_duration_seconds, source_row_count, target_row_count,
                            rows_inserted, rows_updated, rows_unchanged,
                            retry_count
-                    FROM _migration_state
+                    FROM _migration._migration_state
                     WHERE table_name = %s
                       AND source_schema = %s
                       AND target_schema = %s
@@ -548,7 +630,7 @@ class IncrementalStateManager:
                 query = """
                     SELECT table_name, source_schema, target_schema,
                            sync_status, last_sync_end, rows_inserted, rows_updated
-                    FROM _migration_state
+                    FROM _migration._migration_state
                 """
                 params = []
                 if source_schema:
@@ -654,7 +736,7 @@ class IncrementalStateManager:
                            sync_status, last_sync_end, rows_inserted,
                            migration_type, dag_run_id, partition_info,
                            error_message, retry_count
-                    FROM _migration_state
+                    FROM _migration._migration_state
                     WHERE sync_status = ANY(%s)
                 """
                 params = [statuses]
@@ -720,7 +802,7 @@ class IncrementalStateManager:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE _migration_state SET
+                    UPDATE _migration._migration_state SET
                         sync_status = 'pending',
                         last_pk_synced = NULL,
                         checkpoint_batch_num = 0,
@@ -766,7 +848,7 @@ class IncrementalStateManager:
             conn = self._hook.get_conn()
             with conn.cursor() as cursor:
                 query = """
-                    UPDATE _migration_state SET
+                    UPDATE _migration._migration_state SET
                         sync_status = 'pending',
                         last_pk_synced = NULL,
                         checkpoint_batch_num = 0,
@@ -823,7 +905,7 @@ class IncrementalStateManager:
             conn = self._hook.get_conn()
             with conn.cursor() as cursor:
                 query = """
-                    UPDATE _migration_state SET
+                    UPDATE _migration._migration_state SET
                         sync_status = 'failed',
                         error_message = 'Zombie state: previous DAG run did not complete'
                     WHERE sync_status = 'running'
@@ -887,7 +969,7 @@ class IncrementalStateManager:
             with conn.cursor() as cursor:
                 # Lock the row for update
                 cursor.execute(
-                    "SELECT partition_info FROM _migration_state WHERE id = %s FOR UPDATE",
+                    "SELECT partition_info FROM _migration._migration_state WHERE id = %s FOR UPDATE",
                     (sync_id,)
                 )
                 row = cursor.fetchone()
@@ -929,7 +1011,7 @@ class IncrementalStateManager:
 
                 # Update the record
                 cursor.execute(
-                    "UPDATE _migration_state SET partition_info = %s WHERE id = %s",
+                    "UPDATE _migration._migration_state SET partition_info = %s WHERE id = %s",
                     (json.dumps(partition_info), sync_id)
                 )
             conn.commit()
@@ -971,7 +1053,7 @@ class IncrementalStateManager:
                 cursor.execute(
                     """
                     SELECT id, sync_status, partition_info, rows_inserted
-                    FROM _migration_state
+                    FROM _migration._migration_state
                     WHERE table_name = %s
                       AND source_schema = %s
                       AND target_schema = %s
@@ -1022,7 +1104,7 @@ class IncrementalStateManager:
             conn = self._hook.get_conn()
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT partition_info FROM _migration_state WHERE id = %s",
+                    "SELECT partition_info FROM _migration._migration_state WHERE id = %s",
                     (sync_id,)
                 )
                 row = cursor.fetchone()
@@ -1067,7 +1149,7 @@ class IncrementalStateManager:
             with conn.cursor() as cursor:
                 query = """
                     SELECT sync_status, COUNT(*), ARRAY_AGG(table_name ORDER BY table_name)
-                    FROM _migration_state
+                    FROM _migration._migration_state
                     WHERE 1=1
                 """
                 params = []
