@@ -785,12 +785,24 @@ def mssql_to_postgres_incremental():
                 "status": "no_tables",
                 "message": "No tables were synced",
                 "tables_synced": 0,
+                "sync_tasks": 0,
                 "total_inserted": 0,
                 "total_updated": 0,
             }
 
-        tables_synced = len([r for r in results_list if r.get("success")])
-        tables_failed = len([r for r in results_list if not r.get("success")])
+        # Count sync tasks (includes partitions)
+        tasks_succeeded = len([r for r in results_list if r.get("success")])
+        tasks_failed = len([r for r in results_list if not r.get("success")])
+
+        # Count unique tables (not partitions) for clearer reporting
+        successful_tables = set(
+            r["table_name"] for r in results_list if r.get("success")
+        )
+        failed_tables = set(
+            r["table_name"] for r in results_list if not r.get("success")
+        )
+        tables_synced = len(successful_tables)
+        tables_failed = len(failed_tables)
         tables_no_changes = len([r for r in results_list if r.get("status") == "no_changes"])
 
         total_inserted = sum(r.get("rows_inserted", 0) for r in results_list)
@@ -798,10 +810,13 @@ def mssql_to_postgres_incremental():
         total_unchanged = sum(r.get("unchanged_count", 0) for r in results_list)
 
         summary = {
-            "status": "success" if tables_failed == 0 else "partial_failure",
+            "status": "success" if tasks_failed == 0 else "partial_failure",
             "tables_synced": tables_synced,
             "tables_failed": tables_failed,
             "tables_no_changes": tables_no_changes,
+            "sync_tasks": tasks_succeeded + tasks_failed,
+            "sync_tasks_succeeded": tasks_succeeded,
+            "sync_tasks_failed": tasks_failed,
             "total_inserted": total_inserted,
             "total_updated": total_updated,
             "total_unchanged": total_unchanged,
@@ -809,17 +824,20 @@ def mssql_to_postgres_incremental():
         }
 
         logger.info(
-            f"Incremental sync complete: {tables_synced} tables synced, "
-            f"{tables_failed} failed, {tables_no_changes} had no changes. "
+            f"Incremental sync complete: {tables_synced} tables synced "
+            f"({tasks_succeeded} tasks), {tables_failed} tables failed. "
             f"Total: {total_inserted:,} inserted, {total_updated:,} updated"
         )
 
         if tables_failed > 0:
-            failed_tables = [
+            failed_table_names = [
                 f"{r.get('source_schema', '')}.{r['table_name']}"
                 for r in results_list if not r.get("success")
             ]
-            logger.error(f"Failed tables: {', '.join(failed_tables)}")
+            # Dedupe while preserving order
+            seen = set()
+            unique_failed = [x for x in failed_table_names if not (x in seen or seen.add(x))]
+            logger.error(f"Failed tables: {', '.join(unique_failed)}")
 
         return summary
 
