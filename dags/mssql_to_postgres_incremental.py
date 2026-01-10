@@ -22,9 +22,8 @@ State is tracked in _migration._migration_state table in target database.
 
 from airflow.decorators import dag, task
 from airflow.models.param import Param
-from pendulum import datetime
-from datetime import timedelta, timezone
-from datetime import datetime as dt
+from pendulum import datetime as pendulum_datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 import logging
 import os
@@ -38,9 +37,11 @@ DEFAULT_BATCH_SIZE = int(os.environ.get('DEFAULT_INCREMENTAL_BATCH_SIZE', '10000
 # Partitioning settings for large tables
 PARTITION_THRESHOLD = int(os.environ.get('PARTITION_THRESHOLD', '1000000'))  # Tables > 1M rows get partitioned
 MAX_PARTITIONS_PER_TABLE = int(os.environ.get('MAX_PARTITIONS_PER_TABLE', '6'))
-# Date-based incremental: if set, only sync rows where this column > last_sync_timestamp
-# Column must exist in source table and be a datetime/datetime2/smalldatetime/date/datetimeoffset type
-DATE_UPDATED_FIELD = os.environ.get('DATE_UPDATED_FIELD', '')
+# Date-based incremental: comma-separated list of column names to try in order
+# For each table, uses the first matching column that exists and is a valid datetime type
+# Tables without any matching column fall back to full sync
+DATE_UPDATED_FIELD_RAW = os.environ.get('DATE_UPDATED_FIELD', '')
+DATE_UPDATED_FIELDS = [f.strip() for f in DATE_UPDATED_FIELD_RAW.split(',') if f.strip()]
 
 # Import migration modules
 from mssql_pg_migration import schema_extractor
@@ -65,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 
 @dag(
-    start_date=datetime(2025, 1, 1),
+    start_date=pendulum_datetime(2025, 1, 1),
     schedule=None,  # Run manually or on schedule
     catchup=False,
     max_active_runs=1,
@@ -104,11 +105,12 @@ logger = logging.getLogger(__name__)
             description="Rows per batch for COPY to staging table"
         ),
         "date_updated_field": Param(
-            default=DATE_UPDATED_FIELD,
+            default=DATE_UPDATED_FIELD_RAW,
             type="string",
-            description="Column name for date-based incremental sync (e.g., 'updated_at'). "
-                        "If set and column exists, only rows where column > last_sync_timestamp are synced. "
-                        "Column must be a datetime type. Tables without this column fall back to full sync."
+            description="Comma-separated list of column names to try for date-based incremental sync "
+                        "(e.g., 'ModifiedDate,UpdatedAt,CreationDate'). For each table, uses the first "
+                        "matching column that exists and is a valid datetime type. "
+                        "Tables without any matching column fall back to full sync."
         ),
     },
     tags=["migration", "mssql", "postgres", "etl", "incremental"],
@@ -153,7 +155,9 @@ def mssql_to_postgres_incremental():
         """
         params = context["params"]
         source_conn_id = params["source_conn_id"]
-        date_updated_field = params.get("date_updated_field", "")
+        # Parse comma-separated list of date column candidates
+        date_updated_field_raw = params.get("date_updated_field", "")
+        date_updated_fields = [f.strip() for f in date_updated_field_raw.split(',') if f.strip()]
 
         # Priority: config file > param/env var
         # Try loading from database-specific config file first
@@ -218,27 +222,27 @@ def mssql_to_postgres_incremental():
                     )
                     continue
 
-                # Check for date column if date_updated_field is configured
+                # Check for date column if date_updated_fields is configured
                 has_date_column = False
                 date_column = None
-                if date_updated_field:
+                if date_updated_fields:
                     date_col_info = get_date_column_info(
                         mssql_conn_id=source_conn_id,
                         source_schema=source_schema,
                         table_name=table_name,
-                        date_column_name=date_updated_field,
+                        date_column_names=date_updated_fields,
                     )
                     if date_col_info:
                         has_date_column = True
                         date_column = date_col_info['column_name']  # Use name from DB
                         logger.info(
-                            f"{source_schema}.{table_name}: date column '{date_column}' found "
+                            f"{source_schema}.{table_name}: using date column '{date_column}' "
                             f"(type: {date_col_info['data_type']})"
                         )
                     else:
                         logger.warning(
-                            f"{source_schema}.{table_name}: date column '{date_updated_field}' "
-                            f"not found or not a valid datetime type, falling back to full sync"
+                            f"{source_schema}.{table_name}: no matching date column found "
+                            f"from candidates {date_updated_fields}, falling back to full sync"
                         )
 
                 # Build table info for sync
@@ -611,7 +615,7 @@ def mssql_to_postgres_incremental():
         )
 
         # Capture sync_start_time BEFORE any queries (for date-based incremental)
-        sync_start_time = dt.now(timezone.utc)
+        sync_start_time = datetime.now(timezone.utc)
 
         # For non-partitioned tables, we need the full table_info
         table_info = task_info

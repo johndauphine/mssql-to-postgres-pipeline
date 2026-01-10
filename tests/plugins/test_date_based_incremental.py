@@ -33,7 +33,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Users',
-            date_column_name='updated_at',
+            date_column_names=['updated_at'],
         )
 
         assert result is not None
@@ -50,7 +50,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Orders',
-            date_column_name='ModifiedDate',
+            date_column_names=['ModifiedDate'],
         )
 
         assert result is not None
@@ -66,7 +66,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Events',
-            date_column_name='last_update',
+            date_column_names=['last_update'],
         )
 
         assert result is not None
@@ -82,7 +82,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Users',
-            date_column_name='nonexistent_column',
+            date_column_names=['nonexistent_column'],
         )
 
         assert result is None
@@ -98,7 +98,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Users',
-            date_column_name='status',
+            date_column_names=['status'],
         )
 
         assert result is None
@@ -113,7 +113,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Users',
-            date_column_name='version',
+            date_column_names=['version'],
         )
 
         assert result is None
@@ -128,7 +128,7 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Users',
-            date_column_name='updated_at',
+            date_column_names=['updated_at'],
         )
 
         # Verify get_first was called with parameterized query
@@ -153,10 +153,96 @@ class TestGetDateColumnInfo:
             mssql_conn_id='test_conn',
             source_schema='dbo',
             table_name='Users',
-            date_column_name='updated_at',
+            date_column_names=['updated_at'],
         )
 
         assert result is None
+
+    def test_returns_none_for_empty_list(self, mock_helper):
+        """Test returns None when column list is empty."""
+        from mssql_pg_migration.data_transfer import get_date_column_info
+
+        result = get_date_column_info(
+            mssql_conn_id='test_conn',
+            source_schema='dbo',
+            table_name='Users',
+            date_column_names=[],
+        )
+
+        assert result is None
+        # Should not call get_first if list is empty
+        mock_helper.get_first.assert_not_called()
+
+    def test_tries_columns_in_order_returns_first_match(self, mock_helper):
+        """Test tries columns in order and returns first valid match."""
+        from mssql_pg_migration.data_transfer import get_date_column_info
+
+        # First column doesn't exist, second is valid datetime
+        def mock_get_first(query, params):
+            col_name = params[2]
+            if col_name == 'ModifiedDate':
+                return None  # Not found
+            elif col_name == 'UpdatedAt':
+                return ('UpdatedAt', 'datetime')  # Found and valid
+            elif col_name == 'CreationDate':
+                return ('CreationDate', 'datetime')  # Would match but not tried
+            return None
+
+        mock_helper.get_first.side_effect = mock_get_first
+
+        result = get_date_column_info(
+            mssql_conn_id='test_conn',
+            source_schema='dbo',
+            table_name='Users',
+            date_column_names=['ModifiedDate', 'UpdatedAt', 'CreationDate'],
+        )
+
+        assert result is not None
+        assert result['column_name'] == 'UpdatedAt'
+        # Should have been called twice (ModifiedDate, then UpdatedAt)
+        assert mock_helper.get_first.call_count == 2
+
+    def test_skips_non_temporal_continues_to_next(self, mock_helper):
+        """Test skips non-temporal column and continues to next candidate."""
+        from mssql_pg_migration.data_transfer import get_date_column_info
+
+        # First column exists but is varchar, second is valid datetime
+        def mock_get_first(query, params):
+            col_name = params[2]
+            if col_name == 'status':
+                return ('status', 'varchar')  # Found but invalid type
+            elif col_name == 'updated_at':
+                return ('updated_at', 'datetime')  # Found and valid
+            return None
+
+        mock_helper.get_first.side_effect = mock_get_first
+
+        result = get_date_column_info(
+            mssql_conn_id='test_conn',
+            source_schema='dbo',
+            table_name='Users',
+            date_column_names=['status', 'updated_at'],
+        )
+
+        assert result is not None
+        assert result['column_name'] == 'updated_at'
+        assert result['data_type'] == 'datetime'
+
+    def test_returns_none_when_all_candidates_fail(self, mock_helper):
+        """Test returns None when all candidate columns fail."""
+        from mssql_pg_migration.data_transfer import get_date_column_info
+
+        mock_helper.get_first.return_value = None  # All columns not found
+
+        result = get_date_column_info(
+            mssql_conn_id='test_conn',
+            source_schema='dbo',
+            table_name='Users',
+            date_column_names=['col1', 'col2', 'col3'],
+        )
+
+        assert result is None
+        assert mock_helper.get_first.call_count == 3  # Tried all 3
 
 
 class TestIncrementalStateDateMethods:

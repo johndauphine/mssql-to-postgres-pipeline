@@ -181,24 +181,28 @@ def get_date_column_info(
     mssql_conn_id: str,
     source_schema: str,
     table_name: str,
-    date_column_name: str,
+    date_column_names: List[str],
 ) -> Optional[Dict[str, str]]:
     """
-    Check if table has a date column and validate it's a temporal type.
+    Check if table has any of the specified date columns.
 
+    Tries each column name in order, returns the first valid temporal column found.
     Uses parameterized queries for SQL injection prevention.
-    Performs case-sensitive exact match on column name.
+    Performs case-sensitive exact match on column names.
 
     Args:
         mssql_conn_id: SQL Server Airflow connection ID
         source_schema: Source schema name
         table_name: Source table name
-        date_column_name: Column name to validate (case-sensitive match)
+        date_column_names: List of column names to try in priority order
 
     Returns:
         Dict with 'column_name' and 'data_type' if valid temporal column found
-        None if column doesn't exist or isn't a temporal type
+        None if no columns exist or none are valid temporal types
     """
+    if not date_column_names:
+        return None
+
     helper = OdbcConnectionHelper(mssql_conn_id)
 
     # Use parameterized query to prevent SQL injection
@@ -211,42 +215,49 @@ def get_date_column_info(
           AND COLUMN_NAME = ? COLLATE Latin1_General_CS_AS
     """
 
-    try:
-        result = helper.get_first(query, [source_schema, table_name, date_column_name])
+    for date_column_name in date_column_names:
+        try:
+            result = helper.get_first(query, [source_schema, table_name, date_column_name])
 
-        if not result:
+            if not result:
+                logger.debug(
+                    f"Date column '{date_column_name}' not found in {source_schema}.{table_name}"
+                )
+                continue
+
+            column_name, data_type = result
+
+            # Validate that it's a temporal type
+            if data_type.lower() not in VALID_TEMPORAL_TYPES:
+                logger.debug(
+                    f"Column '{column_name}' in {source_schema}.{table_name} is type "
+                    f"'{data_type}', not a valid temporal type, trying next candidate"
+                )
+                continue
+
             logger.debug(
-                f"Date column '{date_column_name}' not found in {source_schema}.{table_name}"
+                f"Found valid date column '{column_name}' ({data_type}) "
+                f"in {source_schema}.{table_name}"
             )
-            return None
 
-        column_name, data_type = result
+            return {
+                'column_name': column_name,  # Use the name from DB (verified)
+                'data_type': data_type,
+            }
 
-        # Validate that it's a temporal type
-        if data_type.lower() not in VALID_TEMPORAL_TYPES:
+        except Exception as e:
             logger.warning(
-                f"Column '{column_name}' in {source_schema}.{table_name} is type "
-                f"'{data_type}', not a valid temporal type. "
-                f"Valid types: {', '.join(sorted(VALID_TEMPORAL_TYPES))}"
+                f"Error checking date column '{date_column_name}' "
+                f"in {source_schema}.{table_name}: {e}"
             )
-            return None
+            continue
 
-        logger.debug(
-            f"Found valid date column '{column_name}' ({data_type}) "
-            f"in {source_schema}.{table_name}"
-        )
-
-        return {
-            'column_name': column_name,  # Use the name from DB (verified)
-            'data_type': data_type,
-        }
-
-    except Exception as e:
-        logger.warning(
-            f"Error checking date column '{date_column_name}' "
-            f"in {source_schema}.{table_name}: {e}"
-        )
-        return None
+    # No valid column found after trying all candidates
+    logger.debug(
+        f"No valid date column found in {source_schema}.{table_name} "
+        f"from candidates: {date_column_names}"
+    )
+    return None
 
 
 # =============================================================================
