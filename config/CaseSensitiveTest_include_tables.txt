@@ -1,0 +1,3 @@
+dbo.UserProfiles
+dbo.ProductCatalog
+dbo.OrderDetails
