@@ -15,6 +15,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _quote_mssql_identifier(identifier: str) -> str:
+    """
+    Safely quote a SQL Server identifier to prevent SQL injection.
+
+    Escapes closing brackets by doubling them and wraps in brackets.
+
+    Args:
+        identifier: The identifier (table name, column name, etc.) to quote
+
+    Returns:
+        Safely quoted identifier for use in SQL Server queries
+    """
+    # Escape any closing brackets by doubling them
+    escaped = identifier.replace(']', ']]')
+    return f'[{escaped}]'
+
+
 class MigrationValidator:
     """Validate data migration from SQL Server to PostgreSQL."""
 
@@ -48,8 +65,10 @@ class MigrationValidator:
         Returns:
             Validation result dictionary
         """
-        # Get source row count
-        source_query = f"SELECT COUNT(*) FROM [{source_schema}].[{source_table}]"
+        # Get source row count - use safe identifier quoting to prevent SQL injection
+        quoted_schema = _quote_mssql_identifier(source_schema)
+        quoted_table = _quote_mssql_identifier(source_table)
+        source_query = f"SELECT COUNT(*) FROM {quoted_schema}.{quoted_table}"
         source_count = self.mssql_hook.get_first(source_query)[0] or 0
 
         # Get target row count - use safe identifier quoting
@@ -126,13 +145,15 @@ class MigrationValidator:
             columns = self.mssql_hook.get_records(columns_query, parameters=[source_schema, source_table])
             key_columns = [col[0] for col in columns[:5]]  # Use first 5 columns for comparison
 
-        # Build column lists
-        source_columns = ', '.join([f'[{col}]' for col in key_columns])
+        # Build column lists - use safe identifier quoting to prevent SQL injection
+        source_columns = ', '.join([_quote_mssql_identifier(col) for col in key_columns])
+        quoted_schema = _quote_mssql_identifier(source_schema)
+        quoted_table = _quote_mssql_identifier(source_table)
 
         # Get sample from source
         source_query = f"""
         SELECT TOP {sample_size} {source_columns}
-        FROM [{source_schema}].[{source_table}]
+        FROM {quoted_schema}.{quoted_table}
         ORDER BY (SELECT NULL)
         """
         source_sample = self.mssql_hook.get_records(source_query)
