@@ -19,50 +19,34 @@ from airflow.models import DagBag
 
 
 class TestDAGRestartabilityParameters:
-    """Test DAG restartability parameters are properly configured."""
+    """Test DAG parameters and automatic restartability configuration.
+
+    Note: As of PR #32, explicit resume parameters (resume_mode, reset_state,
+    retry_failed_only, force_refresh_tables) were removed. The DAG now handles
+    restartability automatically by detecting failures and zombie states.
+    """
 
     @pytest.fixture
     def dag_bag(self):
         """Create a DagBag for testing."""
         return DagBag(dag_folder="dags", include_examples=False)
 
-    def test_dag_has_restartability_params(self, dag_bag):
-        """Test that the DAG has all restartability parameters."""
+    def test_dag_has_expected_params(self, dag_bag):
+        """Test that the DAG has the current expected parameters."""
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
         assert dag is not None
 
         params = dag.params
-        restartability_params = [
-            "resume_mode",
-            "reset_state",
-            "retry_failed_only",
-            "force_refresh_tables",
+        expected_params = [
+            "source_conn_id",
+            "target_conn_id",
+            "chunk_size",
+            "include_tables",
+            "skip_schema_dag",
         ]
 
-        for param in restartability_params:
-            assert param in params, f"Missing restartability parameter: {param}"
-
-    def test_resume_mode_default(self, dag_bag):
-        """Test that resume_mode defaults to False."""
-        dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        # In Airflow 3.0, params are resolved to values directly
-        param = dag.params["resume_mode"]
-        default_value = param.value if hasattr(param, 'value') else param
-        assert default_value is False
-
-    def test_reset_state_default(self, dag_bag):
-        """Test that reset_state defaults to False."""
-        dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        param = dag.params["reset_state"]
-        default_value = param.value if hasattr(param, 'value') else param
-        assert default_value is False
-
-    def test_force_refresh_tables_default(self, dag_bag):
-        """Test that force_refresh_tables defaults to empty list."""
-        dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        param = dag.params["force_refresh_tables"]
-        default_value = param.value if hasattr(param, 'value') else param
-        assert default_value == []
+        for param in expected_params:
+            assert param in params, f"Missing expected parameter: {param}"
 
     def test_dag_has_initialize_migration_state_task(self, dag_bag):
         """Test that the DAG has the initialize_migration_state task."""
