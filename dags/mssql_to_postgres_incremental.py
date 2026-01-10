@@ -17,7 +17,7 @@ Requires:
 - Target tables already exist (run full migration first)
 - Tables must have primary keys for upsert operations
 
-State is tracked in public._migration_state table in target database.
+State is tracked in _migration._migration_state table in target database.
 """
 
 from airflow.decorators import dag, task
@@ -113,8 +113,8 @@ def mssql_to_postgres_incremental():
         """
         Ensure migration state table exists in target database.
 
-        State is stored in public._migration_state (fixed schema).
-        Note: This requires the 'public' schema to exist and be accessible.
+        State is stored in _migration._migration_state (dedicated schema).
+        The _migration schema has restricted access for security.
         The schema is intentionally fixed to preserve state across migrations
         regardless of target schema naming.
 

@@ -32,8 +32,17 @@ CREATE SCHEMA IF NOT EXISTS _migration;
 -- Revoke default public access for security
 REVOKE ALL ON SCHEMA _migration FROM PUBLIC;
 
--- Grant usage to current user (the Airflow connection user)
--- Note: The user running this DDL automatically has access as schema owner
+-- Grant explicit permissions to current user (the Airflow connection user)
+-- This ensures access even if schema was created by a different user
+GRANT USAGE ON SCHEMA _migration TO CURRENT_USER;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA _migration TO CURRENT_USER;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA _migration TO CURRENT_USER;
+
+-- Set default privileges for future objects in this schema
+ALTER DEFAULT PRIVILEGES IN SCHEMA _migration
+    GRANT ALL PRIVILEGES ON TABLES TO CURRENT_USER;
+ALTER DEFAULT PRIVILEGES IN SCHEMA _migration
+    GRANT ALL PRIVILEGES ON SEQUENCES TO CURRENT_USER;
 """
 
 # State table DDL (in _migration schema)
@@ -144,8 +153,12 @@ $$;
 """
 
 # Migration DDL to move existing state from public schema (if exists)
+# Uses dynamic column detection for safe migration across schema versions
 MIGRATE_FROM_PUBLIC_DDL = """
 DO $$
+DECLARE
+    common_columns TEXT;
+    migrated_count INTEGER;
 BEGIN
     -- Check if old table exists in public schema
     IF EXISTS (
@@ -154,15 +167,33 @@ BEGIN
     ) THEN
         -- Copy data from old table to new table (if new table is empty)
         IF NOT EXISTS (SELECT 1 FROM _migration._migration_state LIMIT 1) THEN
-            INSERT INTO _migration._migration_state
-            SELECT * FROM public._migration_state;
-            RAISE NOTICE 'Migrated data from public._migration_state to _migration._migration_state';
+            -- Get columns that exist in BOTH tables (safe for schema version differences)
+            SELECT STRING_AGG(c1.column_name, ', ' ORDER BY c1.ordinal_position)
+            INTO common_columns
+            FROM information_schema.columns c1
+            INNER JOIN information_schema.columns c2
+                ON c1.column_name = c2.column_name
+            WHERE c1.table_schema = 'public' AND c1.table_name = '_migration_state'
+              AND c2.table_schema = '_migration' AND c2.table_name = '_migration_state';
+
+            -- Execute dynamic INSERT with only common columns
+            IF common_columns IS NOT NULL THEN
+                EXECUTE format(
+                    'INSERT INTO _migration._migration_state (%s) SELECT %s FROM public._migration_state',
+                    common_columns, common_columns
+                );
+                GET DIAGNOSTICS migrated_count = ROW_COUNT;
+                RAISE NOTICE 'Migrated % rows from public._migration_state to _migration._migration_state', migrated_count;
+            END IF;
         END IF;
 
         -- Rename old table to indicate it's been migrated (don't drop to be safe)
         ALTER TABLE public._migration_state RENAME TO _migration_state_old_backup;
         RAISE NOTICE 'Renamed public._migration_state to public._migration_state_old_backup';
     END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'Failed to migrate data from public._migration_state: %', SQLERRM;
+    -- Continue anyway, don't fail the entire migration setup
 END;
 $$;
 """
