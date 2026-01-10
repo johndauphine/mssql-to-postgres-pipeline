@@ -32,17 +32,11 @@ CREATE SCHEMA IF NOT EXISTS _migration;
 -- Revoke default public access for security
 REVOKE ALL ON SCHEMA _migration FROM PUBLIC;
 
--- Grant explicit permissions to current user (the Airflow connection user)
--- This ensures access even if schema was created by a different user
+-- Grant minimal required permissions to current user (principle of least privilege)
+-- Only SELECT, INSERT, UPDATE needed for state management operations
 GRANT USAGE ON SCHEMA _migration TO CURRENT_USER;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA _migration TO CURRENT_USER;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA _migration TO CURRENT_USER;
-
--- Set default privileges for future objects in this schema
-ALTER DEFAULT PRIVILEGES IN SCHEMA _migration
-    GRANT ALL PRIVILEGES ON TABLES TO CURRENT_USER;
-ALTER DEFAULT PRIVILEGES IN SCHEMA _migration
-    GRANT ALL PRIVILEGES ON SEQUENCES TO CURRENT_USER;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA _migration TO CURRENT_USER;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA _migration TO CURRENT_USER;
 """
 
 # State table DDL (in _migration schema)
@@ -177,9 +171,11 @@ BEGIN
               AND c2.table_schema = '_migration' AND c2.table_name = '_migration_state';
 
             -- Execute dynamic INSERT with only common columns
+            -- ON CONFLICT handles edge cases like partial prior migration
             IF common_columns IS NOT NULL THEN
                 EXECUTE format(
-                    'INSERT INTO _migration._migration_state (%s) SELECT %s FROM public._migration_state',
+                    'INSERT INTO _migration._migration_state (%s) SELECT %s FROM public._migration_state ' ||
+                    'ON CONFLICT (table_name, source_schema, target_schema) DO NOTHING',
                     common_columns, common_columns
                 );
                 GET DIAGNOSTICS migrated_count = ROW_COUNT;
@@ -192,7 +188,15 @@ BEGIN
         RAISE NOTICE 'Renamed public._migration_state to public._migration_state_old_backup';
     END IF;
 EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'Failed to migrate data from public._migration_state: %', SQLERRM;
+    -- Check if old table still exists to help operators distinguish failure modes
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = '_migration_state'
+    ) THEN
+        RAISE WARNING 'Migration from public._migration_state failed; old table still exists. Manual intervention may be required. Error: %', SQLERRM;
+    ELSE
+        RAISE WARNING 'Migration from public._migration_state failed; old table no longer exists (may have been renamed). Error: %', SQLERRM;
+    END IF;
     -- Continue anyway, don't fail the entire migration setup
 END;
 $$;
