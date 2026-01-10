@@ -12,9 +12,11 @@ Uses the same Airflow connections as the migration DAGs:
 
 from airflow.decorators import dag, task
 from airflow.models.param import Param
+from airflow.hooks.base import BaseHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from pendulum import datetime
 from datetime import timedelta
+from typing import Tuple
 import logging
 
 from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
@@ -24,13 +26,40 @@ from mssql_pg_migration.table_config import (
     parse_include_tables,
     derive_target_schema,
     get_default_include_tables,
-    get_source_database,
-    get_instance_name,
+    get_alias_for_hostname,
 )
 from mssql_pg_migration.type_mapping import sanitize_identifier
 from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
+
+
+def get_connection_info(conn_id: str) -> Tuple[str, str]:
+    """
+    Get database name and instance alias from Airflow connection.
+
+    Retrieves the connection once and extracts both values to avoid
+    duplicate BaseHook.get_connection() calls.
+
+    Args:
+        conn_id: Airflow connection ID
+
+    Returns:
+        Tuple of (database_name, instance_alias)
+    """
+    conn = BaseHook.get_connection(conn_id)
+
+    database = conn.schema
+    if not database:
+        raise ValueError(
+            f"Cannot extract database name from connection '{conn_id}'. "
+            f"Ensure the connection has a database/schema configured."
+        )
+
+    host = conn.host or ''
+    instance_alias = get_alias_for_hostname(host)
+
+    return database, instance_alias
 
 
 @dag(
@@ -86,9 +115,8 @@ def validate_migration_env():
 
         logger.info(f"Validating {len(include_tables)} tables from schemas: {list(schema_tables.keys())}")
 
-        # Get source database and instance name from connection
-        source_db = get_source_database(source_conn_id)
-        instance_name = get_instance_name(source_conn_id)
+        # Get source database and instance name from connection (single lookup)
+        source_db, instance_name = get_connection_info(source_conn_id)
 
         # Create connection helpers using Airflow connections
         mssql_helper = OdbcConnectionHelper(source_conn_id)
@@ -98,11 +126,10 @@ def validate_migration_env():
         logger.info(f"Source database: {source_db}, instance: {instance_name}")
 
         # Validate tables
-        results = []
         passed = 0
         failed = 0
         missing = 0
-        total = 0
+        total_requested = len(include_tables)
 
         mssql_conn = None
         pg_conn = None
@@ -119,25 +146,19 @@ def validate_migration_env():
                 logger.info(f"Validating {len(tables)} tables: {source_schema} -> {target_schema}")
 
                 for table_name in sorted(tables):
-                    total += 1
-
-                    # Get source count
+                    # Get source count using actual COUNT(*) for accuracy
+                    # Note: Using dynamic SQL with QUOTENAME for safe identifier handling
                     try:
                         source_query = """
-                            SELECT COALESCE(SUM(p.rows), 0)
-                            FROM sys.tables t
-                            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                            LEFT JOIN sys.partitions p ON p.object_id = t.object_id
-                                AND p.index_id IN (0, 1)
-                            WHERE s.name = ? AND t.name = ?
-                            GROUP BY t.name
+                            DECLARE @sql NVARCHAR(500);
+                            SET @sql = N'SELECT COUNT(*) FROM ' + QUOTENAME(?) + N'.' + QUOTENAME(?);
+                            EXEC sp_executesql @sql;
                         """
                         mssql_cursor.execute(source_query, (source_schema, table_name))
                         result = mssql_cursor.fetchone()
                         source_count = result[0] if result else 0
                     except Exception as e:
                         logger.warning(f"Failed to count source table {source_schema}.{table_name}: {e}")
-                        source_count = None
                         missing += 1
                         continue
 
@@ -152,10 +173,10 @@ def validate_migration_env():
                         target_count = pg_cursor.fetchone()[0]
                     except Exception as e:
                         logger.warning(f"Failed to count target table {target_schema}.{target_table_name}: {e}")
-                        target_count = None
                         missing += 1
                         continue
 
+                    # Both counts retrieved successfully - compare them
                     if source_count == target_count:
                         status = "PASS"
                         passed += 1
@@ -163,7 +184,7 @@ def validate_migration_env():
                         status = "FAIL"
                         failed += 1
 
-                    diff = target_count - source_count if target_count is not None else 0
+                    diff = target_count - source_count
                     logger.info(
                         f"{status} {source_schema}.{table_name:25} -> {target_table_name:25} | "
                         f"Source: {source_count:>10,} | "
@@ -178,28 +199,30 @@ def validate_migration_env():
             if pg_conn:
                 pg_conn.close()
 
-        # Summary
-        success_rate = (passed / total * 100) if total > 0 else 0
+        # Summary - calculate success rate based on validated tables only
+        validated = passed + failed
+        success_rate = (passed / validated * 100) if validated > 0 else 0
 
         summary = (
             f"\n{'='*60}\n"
             f"VALIDATION SUMMARY\n"
             f"{'='*60}\n"
-            f"Tables Checked: {total}\n"
+            f"Tables Requested: {total_requested}\n"
+            f"Tables Validated: {validated}\n"
             f"Passed: {passed}\n"
             f"Failed: {failed}\n"
-            f"Missing: {missing}\n"
-            f"Success Rate: {success_rate:.1f}%\n"
+            f"Missing/Errors: {missing}\n"
+            f"Success Rate: {success_rate:.1f}% (of validated)\n"
             f"{'='*60}"
         )
         logger.info(summary)
 
         if missing > 0:
-            return f"Incomplete: {missing} tables missing"
+            return f"Incomplete: {missing}/{total_requested} tables could not be validated"
         elif failed > 0:
-            return f"Failed: {failed} tables have mismatches"
+            return f"Failed: {failed}/{validated} tables have row count mismatches"
         else:
-            return f"Success: All {total} tables match"
+            return f"Success: All {validated} tables match"
 
     # Execute
     validate_tables()
