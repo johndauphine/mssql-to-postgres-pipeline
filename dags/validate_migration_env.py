@@ -1,13 +1,16 @@
 """
 Migration Validation DAG
 
-This DAG validates SQL Server to PostgreSQL migration by comparing row counts.
-Tables must be explicitly specified in 'schema.table' format in include_tables.
-Target PostgreSQL schema is derived as: {instance}__{sourcedb}__{sourceschema} (lowercase)
+Validates SQL Server to PostgreSQL migration by comparing row counts.
+Uses only Airflow connections - no environment variables required.
 
-Uses the same Airflow connections as the migration DAGs:
-- source_conn_id: Airflow connection ID for SQL Server (default: mssql_source)
-- target_conn_id: Airflow connection ID for PostgreSQL (default: postgres_target)
+Table selection (priority order):
+1. Config file: config/{database}_include_tables.txt (database from connection)
+2. Explicit param: include_tables when triggering DAG
+
+Airflow connections:
+- source_conn_id: SQL Server connection (default: mssql_source)
+- target_conn_id: PostgreSQL connection (default: postgres_target)
 """
 
 from airflow.decorators import dag, task
@@ -25,7 +28,6 @@ from mssql_pg_migration.table_config import (
     validate_include_tables,
     parse_include_tables,
     derive_target_schema,
-    get_default_include_tables,
     get_alias_for_hostname,
     load_include_tables_from_config,
 )
@@ -79,9 +81,9 @@ def get_connection_info(conn_id: str) -> Tuple[str, str]:
         "source_conn_id": Param(default="mssql_source", type="string"),
         "target_conn_id": Param(default="postgres_target", type="string"),
         "include_tables": Param(
-            default=get_default_include_tables(),
+            default=[],
             description="Tables to include in 'schema.table' format (e.g., ['dbo.Users', 'dbo.Posts']). "
-                        "Defaults from INCLUDE_TABLES env var."
+                        "If empty, loads from config/{database}_include_tables.txt."
         ),
     },
     tags=["validation", "migration"],
@@ -104,12 +106,20 @@ def validate_migration_env():
         # Try loading from database-specific config file first
         include_tables = load_include_tables_from_config(source_conn_id)
 
-        # Fall back to param (which defaults from INCLUDE_TABLES env var)
+        # Fall back to explicit param
         if not include_tables:
             include_tables_raw = params.get("include_tables", [])
             include_tables = expand_include_tables_param(include_tables_raw)
 
-        # Validate include_tables
+        # Raise clear error if no tables configured
+        if not include_tables:
+            raise ValueError(
+                "No tables configured for validation. Either:\n"
+                "1. Create config/{database}_include_tables.txt with table names, or\n"
+                "2. Provide 'include_tables' param when triggering the DAG"
+            )
+
+        # Validate include_tables format
         validate_include_tables(include_tables)
 
         # Parse into {schema: [tables]} dict
