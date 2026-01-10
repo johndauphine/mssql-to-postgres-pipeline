@@ -8,6 +8,7 @@ handling table creation, constraints, and indexes.
 from typing import Dict, Any, List, Optional
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from mssql_pg_migration.type_mapping import map_column, map_table_schema
+from psycopg2 import sql
 import logging
 
 logger = logging.getLogger(__name__)
@@ -286,15 +287,20 @@ class DDLGenerator:
                         # Then setval to MAX(col) value
                         # The third argument 'true' means the next nextval will return MAX(col)+1
                         # Note: pg_get_serial_sequence requires quoted identifier format: "schema"."table"
+                        # Use parameterized queries to prevent SQL injection
                         quoted_table = f'"{target_schema}"."{table_name}"'
-                        reset_sql = f"""
+                        reset_sql = sql.SQL("""
                         SELECT setval(
-                            pg_get_serial_sequence('{quoted_table}', '{col_name}'),
-                            COALESCE((SELECT MAX("{col_name}") FROM "{target_schema}"."{table_name}"), 1),
+                            pg_get_serial_sequence(%s, %s),
+                            COALESCE((SELECT MAX({col}) FROM {schema}.{table}), 1),
                             true
                         )
-                        """
-                        cursor.execute(reset_sql)
+                        """).format(
+                            col=sql.Identifier(col_name),
+                            schema=sql.Identifier(target_schema),
+                            table=sql.Identifier(table_name)
+                        )
+                        cursor.execute(reset_sql, (quoted_table, col_name))
                         result = cursor.fetchone()
                         if result:
                             logger.info(f"P2.2: Reset sequence for {table_name}.{col_name} to {result[0]}")

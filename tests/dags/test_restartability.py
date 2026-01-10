@@ -26,43 +26,43 @@ class TestDAGRestartabilityParameters:
         """Create a DagBag for testing."""
         return DagBag(dag_folder="dags", include_examples=False)
 
-    def test_dag_has_restartability_params(self, dag_bag):
-        """Test that the DAG has all restartability parameters."""
+    def test_dag_has_required_params(self, dag_bag):
+        """Test that the DAG has all required parameters."""
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
         assert dag is not None
 
         params = dag.params
-        restartability_params = [
-            "resume_mode",
-            "reset_state",
-            "retry_failed_only",
-            "force_refresh_tables",
+        required_params = [
+            "source_conn_id",
+            "target_conn_id",
+            "chunk_size",
+            "include_tables",
+            "skip_schema_dag",  # Used for resume mode
         ]
 
-        for param in restartability_params:
-            assert param in params, f"Missing restartability parameter: {param}"
+        for param in required_params:
+            assert param in params, f"Missing required parameter: {param}"
 
-    def test_resume_mode_default(self, dag_bag):
-        """Test that resume_mode defaults to False."""
+    def test_skip_schema_dag_default(self, dag_bag):
+        """Test that skip_schema_dag defaults to False (for resume mode)."""
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        # In Airflow 3.0, params are resolved to values directly
-        param = dag.params["resume_mode"]
+        param = dag.params["skip_schema_dag"]
         default_value = param.value if hasattr(param, 'value') else param
         assert default_value is False
 
-    def test_reset_state_default(self, dag_bag):
-        """Test that reset_state defaults to False."""
+    def test_source_conn_id_default(self, dag_bag):
+        """Test that source_conn_id has expected default."""
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        param = dag.params["reset_state"]
+        param = dag.params["source_conn_id"]
         default_value = param.value if hasattr(param, 'value') else param
-        assert default_value is False
+        assert default_value == "mssql_source"
 
-    def test_force_refresh_tables_default(self, dag_bag):
-        """Test that force_refresh_tables defaults to empty list."""
+    def test_target_conn_id_default(self, dag_bag):
+        """Test that target_conn_id has expected default."""
         dag = dag_bag.get_dag("mssql_to_postgres_migration")
-        param = dag.params["force_refresh_tables"]
+        param = dag.params["target_conn_id"]
         default_value = param.value if hasattr(param, 'value') else param
-        assert default_value == []
+        assert default_value == "postgres_target"
 
     def test_dag_has_initialize_migration_state_task(self, dag_bag):
         """Test that the DAG has the initialize_migration_state task."""

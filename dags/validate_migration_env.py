@@ -91,12 +91,16 @@ def validate_migration_env():
 
         logger.info(f"Validating {len(include_tables)} tables from schemas: {list(schema_tables.keys())}")
 
-        # Get connection details from environment with defaults for testing
+        # Get connection details from environment - passwords are required
         mssql_host = os.environ.get('MSSQL_HOST', 'mssql-server')
         mssql_port = int(os.environ.get('MSSQL_PORT', '1433'))
         mssql_database = os.environ.get('MSSQL_DATABASE', 'StackOverflow2010')
         mssql_user = os.environ.get('MSSQL_USERNAME', 'sa')
-        mssql_password = os.environ.get('MSSQL_PASSWORD', 'YourStrong@Passw0rd')
+        mssql_password = os.environ.get('MSSQL_PASSWORD')
+
+        # Require password environment variables for security
+        if not mssql_password:
+            raise ValueError("MSSQL_PASSWORD environment variable is required")
 
         # Build ODBC connection string
         server = f"{mssql_host},{mssql_port}" if mssql_port != 1433 else mssql_host
@@ -109,12 +113,16 @@ def validate_migration_env():
             f"TrustServerCertificate=yes;"
         )
 
+        postgres_password = os.environ.get('POSTGRES_PASSWORD')
+        if not postgres_password:
+            raise ValueError("POSTGRES_PASSWORD environment variable is required")
+
         postgres_config = {
             'host': os.environ.get('POSTGRES_HOST', 'postgres-target'),
             'port': int(os.environ.get('POSTGRES_PORT', '5432')),
             'database': os.environ.get('POSTGRES_DATABASE', 'stackoverflow'),
             'user': os.environ.get('POSTGRES_USERNAME', 'postgres'),
-            'password': os.environ.get('POSTGRES_PASSWORD', 'PostgresPassword123'),
+            'password': postgres_password,
         }
 
         # Derive target schema from source instance and database name

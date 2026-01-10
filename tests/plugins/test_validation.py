@@ -7,10 +7,12 @@ and security of validation queries.
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch, call
+from contextlib import contextmanager
 from mssql_pg_migration.validation import (
     MigrationValidator,
     generate_migration_report,
     validate_migration,
+    _quote_mssql_identifier,
 )
 
 
@@ -49,10 +51,11 @@ class TestMigrationValidator:
         # Setup mocks
         mock_mssql_hook.get_first.return_value = (1000,)
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.return_value = (1000,)
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute validation
@@ -70,10 +73,11 @@ class TestMigrationValidator:
         # Setup mocks
         mock_mssql_hook.get_first.return_value = (1000,)
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.return_value = (950,)  # Missing 50 rows
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute validation
@@ -91,10 +95,11 @@ class TestMigrationValidator:
         # Setup mocks for empty tables
         mock_mssql_hook.get_first.return_value = (0,)
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.return_value = (0,)
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute validation
@@ -110,10 +115,11 @@ class TestMigrationValidator:
         # Setup mocks with NULL results
         mock_mssql_hook.get_first.return_value = (None,)
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.return_value = (None,)
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute validation
@@ -125,14 +131,15 @@ class TestMigrationValidator:
         assert result['target_count'] == 0
 
     def test_validate_row_count_uses_parameterization(self, validator, mock_mssql_hook, mock_postgres_hook):
-        """SECURITY: Verify that queries use parameterization, not string formatting."""
+        """SECURITY: Verify that queries use safe identifier quoting."""
         # Setup mocks
         mock_mssql_hook.get_first.return_value = (100,)
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.return_value = (100,)
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute validation with potentially malicious input
@@ -140,13 +147,11 @@ class TestMigrationValidator:
         malicious_table = "Users'; DELETE FROM Users; --"
 
         # This should NOT cause SQL injection because of bracket quoting
-        # But ideally should use parameterization
         result = validator.validate_row_count(
             malicious_schema, malicious_table, 'public', 'users'
         )
 
         # Verify the query was executed (didn't crash)
-        # In a real security test, we'd verify parameterization was used
         assert mock_mssql_hook.get_first.called
 
     def test_validate_tables_batch_all_pass(self, validator, mock_mssql_hook, mock_postgres_hook):
@@ -158,14 +163,15 @@ class TestMigrationValidator:
             (300,),  # Table 3
         ]
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.side_effect = [
             (100,),  # Table 1
             (200,),  # Table 2
             (300,),  # Table 3
         ]
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute batch validation
@@ -193,13 +199,14 @@ class TestMigrationValidator:
             (200,),  # Table 2 - FAIL (missing rows)
         ]
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchone.side_effect = [
             (100,),  # Table 1 - matches
             (150,),  # Table 2 - doesn't match
         ]
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute batch validation
@@ -227,14 +234,15 @@ class TestMigrationValidator:
             (3, 'Charlie', 'charlie@example.com'),
         ]
 
-        mock_pg_conn = Mock()
-        mock_pg_cursor = Mock()
+        mock_pg_cursor = MagicMock()
         mock_pg_cursor.fetchall.return_value = [
             (1, 'Alice', 'alice@example.com'),
             (2, 'Bob', 'bob@example.com'),
             (3, 'Charlie', 'charlie@example.com'),
         ]
+        mock_pg_conn = MagicMock()
         mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        mock_pg_conn.cursor.return_value.__exit__.return_value = None
         mock_postgres_hook.get_conn.return_value = mock_pg_conn
 
         # Execute sample validation
@@ -425,10 +433,11 @@ class TestEdgeCases:
              patch.object(validator.postgres_hook, 'get_conn') as mock_pg_conn:
 
             mock_mssql.return_value = (0,)
-            mock_cursor = Mock()
+            mock_cursor = MagicMock()
             mock_cursor.fetchone.return_value = (5,)  # Target has rows but source doesn't
-            mock_conn = Mock()
+            mock_conn = MagicMock()
             mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+            mock_conn.cursor.return_value.__exit__.return_value = None
             mock_pg_conn.return_value = mock_conn
 
             result = validator.validate_row_count('dbo', 'Test', 'public', 'test')
@@ -444,10 +453,11 @@ class TestEdgeCases:
 
             large_count = 10_000_000_000  # 10 billion rows
             mock_mssql.return_value = (large_count,)
-            mock_cursor = Mock()
+            mock_cursor = MagicMock()
             mock_cursor.fetchone.return_value = (large_count,)
-            mock_conn = Mock()
+            mock_conn = MagicMock()
             mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+            mock_conn.cursor.return_value.__exit__.return_value = None
             mock_pg_conn.return_value = mock_conn
 
             result = validator.validate_row_count('dbo', 'BigTable', 'public', 'bigtable')
@@ -475,10 +485,11 @@ class TestSecurity:
 
             # Setup mocks
             mock_mssql.return_value = (100,)
-            mock_cursor = Mock()
+            mock_cursor = MagicMock()
             mock_cursor.fetchone.return_value = (100,)
-            mock_conn = Mock()
+            mock_conn = MagicMock()
             mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+            mock_conn.cursor.return_value.__exit__.return_value = None
             mock_pg_conn.return_value = mock_conn
 
             # Attempt SQL injection via schema name
@@ -505,10 +516,11 @@ class TestSecurity:
         from psycopg2 import sql
 
         with patch.object(validator.postgres_hook, 'get_conn') as mock_pg_conn:
-            mock_cursor = Mock()
+            mock_cursor = MagicMock()
             mock_cursor.fetchone.return_value = (100,)
-            mock_conn = Mock()
+            mock_conn = MagicMock()
             mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+            mock_conn.cursor.return_value.__exit__.return_value = None
             mock_pg_conn.return_value = mock_conn
 
             with patch.object(validator.mssql_hook, 'get_first', return_value=(100,)):
@@ -520,6 +532,34 @@ class TestSecurity:
 
                 # The query should be a psycopg2.sql.Composed object, not a plain string
                 # This indicates proper parameterization is being used
+
+
+class TestQuoteMssqlIdentifier:
+    """Test the MSSQL identifier quoting function."""
+
+    def test_simple_identifier(self):
+        """Test quoting a simple identifier."""
+        assert _quote_mssql_identifier('Users') == '[Users]'
+
+    def test_identifier_with_closing_bracket(self):
+        """Test that closing brackets are escaped."""
+        assert _quote_mssql_identifier('Table]Name') == '[Table]]Name]'
+
+    def test_identifier_with_multiple_brackets(self):
+        """Test multiple closing brackets are all escaped."""
+        assert _quote_mssql_identifier('a]b]c') == '[a]]b]]c]'
+
+    def test_empty_identifier(self):
+        """Test empty identifier."""
+        assert _quote_mssql_identifier('') == '[]'
+
+    def test_sql_injection_attempt(self):
+        """Test that SQL injection attempts are safely quoted."""
+        malicious = "Users]; DROP TABLE Orders; --"
+        result = _quote_mssql_identifier(malicious)
+        # The closing bracket should be escaped
+        assert result == '[Users]]; DROP TABLE Orders; --]'
+        # This would be treated as a literal identifier name, not SQL
 
 
 if __name__ == "__main__":
