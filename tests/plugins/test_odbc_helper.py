@@ -6,7 +6,7 @@ error handling, and security of ODBC operations.
 """
 
 import pytest
-from unittest.mock import Mock, MagicMock, patch, call
+from unittest.mock import Mock, MagicMock, patch
 import pyodbc
 from mssql_pg_migration.odbc_helper import OdbcConnectionHelper
 

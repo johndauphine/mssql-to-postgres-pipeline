@@ -6,7 +6,7 @@ and security of validation queries.
 """
 
 import pytest
-from unittest.mock import Mock, MagicMock, patch, call
+from unittest.mock import Mock, MagicMock, patch
 from contextlib import contextmanager
 from mssql_pg_migration.validation import (
     MigrationValidator,
@@ -147,7 +147,7 @@ class TestMigrationValidator:
         malicious_table = "Users'; DELETE FROM Users; --"
 
         # This should NOT cause SQL injection because of bracket quoting
-        result = validator.validate_row_count(
+        validator.validate_row_count(
             malicious_schema, malicious_table, 'public', 'users'
         )
 
@@ -498,7 +498,7 @@ class TestSecurity:
 
             # Execute - should not crash or execute malicious SQL
             try:
-                result = validator.validate_row_count(
+                validator.validate_row_count(
                     malicious_schema,
                     malicious_table,
                     'public',

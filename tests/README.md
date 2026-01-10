@@ -277,7 +277,8 @@ jobs:
       - name: Run Tests
         run: docker exec airflow-scheduler pytest /opt/airflow/tests/ -v
       - name: Upload Coverage
-        uses: codecov/codecov-action@v2
+        # Pin to specific commit SHA for security (see: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions)
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
 ```
 
 ## References
