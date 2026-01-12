@@ -823,7 +823,7 @@ def mssql_to_postgres_migration():
             try:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        """SELECT id FROM _migration_state
+                        """SELECT id FROM _migration._migration_state
                            WHERE table_name = %s AND source_schema = %s AND target_schema = %s""",
                         (table_name, source_schema, target_schema)
                     )
